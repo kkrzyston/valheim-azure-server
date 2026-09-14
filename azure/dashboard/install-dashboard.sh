@@ -77,6 +77,25 @@ install -d -m 0755 /opt/hermodr
 /opt/hermodr/venv/bin/pip install --upgrade discord.py
 install -m 0755 valheim-bot.py /usr/local/sbin/valheim-bot.py
 install -m 0644 valheim-bot.service /etc/systemd/system/valheim-bot.service
+# Wiki knowledge base (PLAN-v6): its own venv, separate from Hermodr's, because
+# mwparserfromhell/requests (requirements-ingest.txt) have nothing to do with discord.py and mixing
+# the two would make a future dependency bump in either one risk breaking the other. The index
+# builder itself is stdlib-only (sqlite3/json/re) and runs under the system python3 above, same
+# split as the collector scripts vs. Hermodr.
+install -d -m 0755 /opt/valheim-wiki
+[ -x /opt/valheim-wiki/venv/bin/python ] || python3 -m venv /opt/valheim-wiki/venv
+/opt/valheim-wiki/venv/bin/pip install --upgrade pip >/dev/null
+/opt/valheim-wiki/venv/bin/pip install --upgrade -r requirements-ingest.txt
+install -m 0755 valheim-wiki-ingest.py valheim-wiki-index.py /usr/local/sbin/
+# Owned by valheim-bot: it is the only account either script (both run as valheim-bot -- see
+# valheim-wiki-refresh.service) ever writes wiki-records.jsonl or wiki.db into.
+install -d -m 0755 -o valheim-bot -g valheim-bot /var/lib/valheim-wiki
+# Installed but NOT enabled, same deliberate convention as valheim-bot.service above: a fresh
+# deploy has no corpus yet (wiki-records.jsonl/wiki.db do not exist), so the first run should be
+# an owner-supervised one by hand -- `systemctl start valheim-wiki-refresh.service` and watch the
+# journal -- not an unattended timer firing into a box nobody is looking at. Once that first run is
+# clean, `systemctl enable --now valheim-wiki-refresh.timer` turns on the weekly schedule.
+install -m 0644 valheim-wiki-refresh.service valheim-wiki-refresh.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals-daily.timer valheim-medals-web.timer
 # The executor ships DISARMED: valheim-restart-exec.service carries Environment=VR_DRY_RUN=1, so

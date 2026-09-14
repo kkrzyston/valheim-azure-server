@@ -1,0 +1,73 @@
+[Unit]
+Description=Valheim wiki knowledge base: refresh the corpus (ingest) and rebuild the search index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Two steps, deliberately NOT dash-prefixed: if the ingest step fails, the index-build step must
+# not run at all, so a bad or half-written wiki-records.jsonl is never read into a rebuilt wiki.db.
+# This relies on an exit-code contract with valheim-wiki-ingest.py (PLAN-v6 W1) that is not yet
+# nailed down in code: PLAN-v6 says a per-page parse failure is "logged ... and the run's exit code
+# reflects how many were skipped" for the ordinary case, and separately "if more than 5% of pages
+# fail, exit non-zero and write nothing" for the hard-failure case. Read literally, that means a
+# GOOD run with a couple of benign, logged skips could still exit non-zero -- which would make
+# systemd skip the reindex below even though a perfectly good wiki-records.jsonl was just written.
+# W4 cannot fix this from here (valheim-wiki-ingest.py is W1's file and does not exist yet); this
+# unit assumes the standard convention instead: exit 0 whenever wiki-records.jsonl was written
+# (skips logged to the journal are fine), non-zero ONLY on the >5%/wrote-nothing hard failure.
+# CONFIRM THIS against the real script once W1 lands. If it turns out exit codes double as a skip
+# counter even on success, add `SuccessExitStatus=` here listing the acceptable non-zero codes (or
+# have W1 move the skip count into a log line/metric instead) -- do not dash-prefix ExecStart to
+# paper over it, since that would also hide a real hard failure from `systemctl status`/journal.
+ExecStart=/opt/valheim-wiki/venv/bin/python /usr/local/sbin/valheim-wiki-ingest.py
+# Stdlib only (sqlite3/json/re per PLAN-v6 W2), so this runs under the system interpreter, not the
+# ingest venv -- same split as the collector scripts vs. Hermodr's own venv below.
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-wiki-index.py
+Nice=10
+# The ordinary walk is ~2,200 pages (1,179 Weird Gloop + Fandom's delta) fetched serially with
+# maxlag=5 and backoff on 429/503, plus downloading and decompressing Fandom's ~1.16 MB dump and
+# parsing every page with mwparserfromhell. That can comfortably run past Type=oneshot's default
+# 90 s TimeoutStartSec (see valheim-restart-exec.service for the same reasoning) -- give it room.
+TimeoutStartSec=3600
+
+# Runs as the same unprivileged, nologin system account as Hermodr (see valheim-bot.service) --
+# there is no reason for a wiki-fetching batch job to run as root either, and it writes only its
+# own corpus directory.
+User=valheim-bot
+Group=valheim-bot
+
+# Hardening. Mirrors valheim-bot.service (same account, same "unprivileged process making outbound
+# HTTPS calls" shape) rather than valheim-restartd.service: restartd's PrivateNetwork=yes +
+# IPAddressDeny=any is the wrong template here on purpose -- this process's entire job is fetching
+# from weirdgloop.org, fandom.com and S3 over the public internet, and that pairing would make
+# every request fail with no route to host (see valheim-restartd.service's own warning comment
+# about what breaks if its network-denial directives are copied onto a unit that needs a network).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The only path this process may write to: the wiki corpus (wiki-records.jsonl and wiki.db, the
+# latter via the index builder's own tmp-file-then-os.replace() swap per PLAN-v6 W2, so a reader
+# -- Hermodr's search() -- never sees a half-built index).
+ReadWritePaths=/var/lib/valheim-wiki
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @module @raw-io @reboot @swap @mount
+# AF_INET/AF_INET6 for the wiki/S3 fetches, AF_UNIX for local name resolution -- same three as
+# valheim-bot.service, which already proved this is the minimal set an outbound-HTTPS process on
+# this box needs.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryMax=512M
+TasksMax=64
