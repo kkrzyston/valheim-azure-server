@@ -20,9 +20,11 @@ __pycache__/
 # are tracked on purpose and must keep every credential value empty:
 #   - any *.env.example file (this repo's root .env.example, and any companion under azure/)
 #   - azure/dashboard/valheim-alert.env, the tracked template installed to /etc/valheim-alert.env
+#   - azure/dashboard/valheim-bot.env, the tracked template installed to /etc/valheim-bot.env
 *.env*
 !*.env.example
 !azure/dashboard/valheim-alert.env
+!azure/dashboard/valheim-bot.env
 
 # Valheim world-save binary files. These hold live world state (and, via player-tied ZDOs,
 # player data) -- never something to check into source control, and this repo ships no
@@ -39,3 +41,7 @@ __pycache__/
 # replace-world.sh). Meaningless without the world files they were generated against, which
 # aren't shipped either -- regenerate your own rather than committing one.
 *.sha256
+
+# Your own deployment's literal secret values, for scripts/scan-secrets.sh.
+# Never commit this file.
+.secret-patterns

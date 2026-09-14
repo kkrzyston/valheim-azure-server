@@ -72,9 +72,10 @@
   .tide .head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
   h2 { margin: 0 0 14px; font-family: var(--display); font-weight: 700; font-size: 26px; letter-spacing: .01em; }
   .tide h2 { margin: 0; }
-  .tide .range { display: flex; gap: 4px; }
-  .tide .range button { font: inherit; font-size: 16px; color: var(--ash); background: none; border: 1px solid transparent; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
-  .tide .range button[aria-pressed="true"] { color: var(--parchment); border-color: var(--seam); background: var(--timber); }
+  .range { display: flex; gap: 4px; }
+  .range button { font: inherit; font-size: 16px; color: var(--ash); background: none; border: 1px solid transparent; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
+  .range button:hover { color: var(--parchment); }
+  .range button[aria-pressed="true"] { color: var(--parchment); border-color: var(--seam); background: var(--timber); }
   .tide canvas { width: 100%; height: 190px; display: block; }
   .tide .note { color: var(--ash); font-size: 16px; margin: 8px 0 0; }
   .tide .pingwrap { margin-top: 26px; }
@@ -1719,7 +1720,9 @@
   function rsProgHtml(cur) {
     const done = RS_DONE.has(cur.state);
     const why = RS_REASONS[cur.reason] || cur.reason || 'no reason given';
-    const who = cur.nickname ? `${esc(cur.nickname)} asked` : 'Someone asked';
+    // Phrased so the name is never the first word: an unnamed request reads as a description,
+    // not as a Viking called "Someone". The executor and the Discord embed say the same.
+    const who = cur.nickname ? `Asked by ${esc(cur.nickname)}` : 'Asked by someone who left no name';
     const appr = cur.approver && cur.approver.display ? ` Approved by ${esc(cur.approver.display)}.` : '';
     const cd = cur.state === 'counting_down' && cur.restart_at
       ? `<div class="cd" data-at="${Number(cur.restart_at)}">${mmss(cur.restart_at - Date.now() / 1000)}</div>`
@@ -1728,11 +1731,16 @@
       ? `<div class="k">${cur.players_at_request.count} Viking${cur.players_at_request.count === 1 ? '' : 's'} ${Array.isArray(cur.players_at_request.names) && cur.players_at_request.names.length ? '(' + list(cur.players_at_request.names.map(esc)) + ') ' : ''}${done ? 'were' : 'are'} in the world.</div>`
       : '';
     const link = cur.message_url ? ` <a href="${esc(cur.message_url)}" rel="noopener">See it in Discord</a>` : '';
+    // Optional and additive: absent (older requests, or before the backend ships) renders nothing
+    // at all -- no empty element, no stray punctuation, no shift.
+    const uw = cur.unwedged
+      ? '<div class="k">The hall was stuck fast — the machine had given up on the server after one failure too many, so it had to be prised open before the restart could go ahead.</div>'
+      : '';
     return `<div class="rsprog${done ? ' done' : ''}">
       <div class="big">${esc(RS_STATES[cur.state] || cur.state || 'In hand.')}</div>
       ${cd}
       <div class="k">${who} because ${esc(why)}, ${ago(cur.created_at)}.${appr}${link}</div>
-      ${pl}</div>`;
+      ${pl}${uw}</div>`;
   }
 
   function rsNeedAck() { return !!(status && status.players && status.players.count > 0); }
@@ -1784,7 +1792,8 @@
       const st = esc(RS_STATES[r.state] || r.state || 'unknown');
       const by = r.approver && r.approver.display ? ` <span class="dim">Approved by ${esc(r.approver.display)}.</span>` : '';
       const dt = r.downtime_s != null ? ` <span class="dim">Down for ${fmtDur(r.downtime_s)}.</span>` : '';
-      return `<li><time>${r.at ? when(r.at) : '—'}</time><div><b>${esc(RS_REASONS[r.reason] || r.reason || 'no reason given')}</b> — ${st}${by}${dt}</div></li>`;
+      const uw = r.unwedged ? ' <span class="dim">The hall was stuck fast and had to be prised open first.</span>' : '';
+      return `<li><time>${r.at ? when(r.at) : '—'}</time><div><b>${esc(RS_REASONS[r.reason] || r.reason || 'no reason given')}</b> — ${st}${by}${dt}${uw}</div></li>`;
     }).join('');
     paintCountdown();
   }
@@ -1820,6 +1829,9 @@
     if (!restart || !restart.csrf) { rsSay('The page has no valid token to send. Give it a moment and try again.', 'bad'); return; }
     const ack = !!($('rsack') && $('rsack').checked);
     if (rsNeedAck() && !ack) { rsSay('Tick the box first — people are in the world.', 'bad'); return; }
+    // All four keys are always sent, but a blank field goes as "" and never as an invented name:
+    // the log has to be able to tell "gave no name" apart from "typed a name". Non-empty input is
+    // trimmed to the charset and length the server accepts; empty is allowed straight through.
     const nickname = ($('rsnick').value || '').replace(/[^A-Za-z0-9 _.\-]/g, '').slice(0, 24).trim();
     rsBusy = true; rsGate(); rsSay('Sending…');
     let res = null, body = null;
@@ -1847,7 +1859,8 @@
       rsSay(why ? `Not taken: ${why}` : 'Not taken — either a request is already in hand or the server was restarted too recently.', 'bad');
       await refreshRestart();
     } else if (res.status === 429) {
-      rsSay('Too many requests in too short a time. Wait a few minutes and ask again.', 'bad');
+      rsSay(why ? `Too many requests in too short a time: ${why}` : 'Too many requests in too short a time. Wait a few minutes and ask again.', 'bad');
+      await refreshRestart();
     } else if (res.status === 403) {
       rsSay('The page\'s token was refused, usually because it went stale. Reload the page and ask again.', 'bad');
       await refreshRestart();
@@ -1912,9 +1925,17 @@
     const changed = next !== view;
     view = next;
     for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.dataset.view !== view;
+    let active = null;
     for (const a of document.querySelectorAll('#navlist a')) {
-      if (a.dataset.route === ROUTE_OF[view]) a.setAttribute('aria-current', 'page');
+      if (a.dataset.route === ROUTE_OF[view]) { a.setAttribute('aria-current', 'page'); active = a; }
       else a.removeAttribute('aria-current');
+    }
+    // Under 520 px the boards scroll sideways; drag the lit one into view. Horizontal only, by
+    // hand -- scrollIntoView would also yank the page vertically.
+    if (active) {
+      const ul = $('navlist'), lr = active.getBoundingClientRect(), ur = ul.getBoundingClientRect();
+      if (lr.left < ur.left) ul.scrollLeft += lr.left - ur.left - 8;
+      else if (lr.right > ur.right) ul.scrollLeft += lr.right - ur.right + 8;
     }
     renderCurrentView();
     if (changed && announce) $('viewsay').textContent = NAME_OF[view] + '.';
@@ -1979,7 +2000,10 @@
     try { localStorage.setItem(HKEY, hallTab); } catch {}
     safe(renderHall);
   });
-  $('rssend').addEventListener('click', () => { rsSubmit(); });
+  // Whatever happens, the button must come back: a stuck rsBusy would lock the form for good.
+  $('rssend').addEventListener('click', () => {
+    rsSubmit().catch((e) => { console.error(e); rsBusy = false; safe(rsGate); rsSay('Something went wrong on this page. Nothing was filed. Reload and try again.', 'bad'); });
+  });
   $('copy').addEventListener('click', async (e) => {
     const addr = status && status.server && status.server.address;
     if (!addr) return;

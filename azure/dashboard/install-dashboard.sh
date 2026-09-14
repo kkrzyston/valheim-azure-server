@@ -30,6 +30,9 @@ printf 'ok\n' > /var/www/valheim/ping.txt; chmod 644 /var/www/valheim/ping.txt
 install -m 0755 valheim-status-collect.py /usr/local/sbin/valheim-status-collect.py
 install -m 0755 valheim-alert.py /usr/local/sbin/valheim-alert.py
 test -f /etc/valheim-alert.env || install -m 0600 valheim-alert.env /etc/valheim-alert.env
+# Hermodr reads its own env now that it runs as valheim-bot, so the bot process never holds the
+# Discord WEBHOOK credential that alert/medals/digest still use. Never overwritten once present.
+test -f /etc/valheim-bot.env || install -o root -g valheim-bot -m 0640 valheim-bot.env /etc/valheim-bot.env
 command -v tcpdump >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y tcpdump
 install -m 0644 valheim-status.service valheim-status.timer /etc/systemd/system/
 # Let the caddy user reach /home/valheim/backups (the snapshots listing) without opening
@@ -38,6 +41,23 @@ command -v setfacl >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y a
 install -d -m 0755 -o valheim -g valheim /home/valheim/backups
 setfacl -m u:caddy:x /home/valheim
 setfacl -m u:caddy:rx /home/valheim/backups
+# --- service users and the restart spool (PLAN-v5) -------------------------------------------
+# Two unprivileged system accounts. Both keep a nologin shell: security-check.sh audits accounts
+# that have a login shell, and these must never appear there.
+id valheim-bot        >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin valheim-bot
+id valheim-restartd   >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin valheim-restartd
+
+# The spool IS the security model: one writer and one reader per directory, enforced by ownership.
+# 1730 is rwx-wx--T -- the writer may create a file by name but can never list or read the
+# directory back, and the sticky bit switches on the kernel's fs.protected_symlinks guard.
+install -d -m 0755 -o root -g root             /var/lib/valheim-restart
+install -d -m 1730 -o root -g valheim-restartd /var/lib/valheim-restart/requests
+install -d -m 0750 -o root -g valheim-bot      /var/lib/valheim-restart/inbox
+install -d -m 1730 -o root -g valheim-bot      /var/lib/valheim-restart/verdicts
+install -d -m 0700 -o root -g root             /var/lib/valheim-restart/archive
+install -d -m 0700 -o root -g root             /var/lib/valheim-restart/quarantine
+# gate.json and secret.csrf are created by the executor on its first tick, with the right modes.
+
 HASH=$(caddy hash-password --plaintext "$PW")
 OWNER_HASH=$(caddy hash-password --plaintext "$OWNER_PW")
 sed -e "s#__HASH__#$HASH#" -e "s#__OWNER_HASH__#$OWNER_HASH#" -e "s#__DASHBOARD_HOST__#$DASHBOARD_HOST#" Caddyfile > /etc/caddy/Caddyfile
@@ -49,6 +69,11 @@ install -m 0755 valheim-medals.py /usr/local/sbin/valheim-medals.py
 install -m 0644 valheim-offsite.service valheim-offsite.timer /etc/systemd/system/
 install -m 0644 valheim-digest.service valheim-digest.timer /etc/systemd/system/
 install -m 0644 valheim-medals-daily.service valheim-medals-daily.timer /etc/systemd/system/
+install -m 0644 valheim-medals-web.service valheim-medals-web.timer /etc/systemd/system/
+# The restart feature. valheim-restart-exec.path is installed but deliberately NOT enabled --
+# see the warning in its header; the 15 s timer is the guarantee, the path unit is convenience.
+install -m 0755 valheim-restartd.py valheim-restart-exec.py /usr/local/sbin/
+install -m 0644 valheim-restartd.service valheim-restart-exec.service \n                valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
 install -m 0644 manifest.webmanifest icon.svg icon-192.png icon-512.png /var/www/valheim/
 # Hermodr (Discord Q&A bot) -- its own venv so discord.py never touches the system Python used by
 # the collector/alert/medals scripts above. Installed but NOT started: it needs DISCORD_BOT_TOKEN
@@ -62,7 +87,13 @@ install -d -m 0755 /opt/hermodr
 install -m 0755 valheim-bot.py /usr/local/sbin/valheim-bot.py
 install -m 0644 valheim-bot.service /etc/systemd/system/valheim-bot.service
 systemctl daemon-reload
-systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals-daily.timer
+systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals-daily.timer valheim-medals-web.timer
+# The executor ships DISARMED: valheim-restart-exec.service carries Environment=VR_DRY_RUN=1, so
+# it runs every check and posts to Discord but calls no systemctl. Remove that line and
+# daemon-reload to arm it, after a rehearsal day. The timer also creates gate.json and
+# secret.csrf on its first tick, which is why it starts before restartd.
+systemctl enable --now valheim-restart-exec.timer
+systemctl enable --now valheim-restartd.service
 systemctl enable --now valheim-status.timer
 systemctl start valheim-status.service
 systemctl enable --now caddy

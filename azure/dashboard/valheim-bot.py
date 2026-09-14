@@ -782,39 +782,72 @@ def _write_exclusive(dirpath, filename, obj):
     return True
 
 
-def write_verdict_exclusive(request_id, decision, approver_id, approver_display):
-    """decision is "approved" or "denied" -- the request state machine's own vocabulary
-    (PLAN-v5's "Request state machine"). The executor (root, the sole reader of verdicts/) is
-    the only thing that ever acts on this file."""
+def write_verdict_exclusive(request_id, verdict, approver_id, approver_display, *,
+                             guild_id=None, channel_id=None, interaction_id=None,
+                             message_id=None, role_id=None, role_present=None, note=None):
+    """verdict is exactly "approve" or "deny". PLAN-v5 specified the inbox/ and
+    restart-state.json schemas but never this file's shape, so this bot and valheim-restart-exec.py
+    (task R3) each picked a name independently; R3's executor is the sole reader of verdicts/, so
+    its shape is the one that matters and this matches it exactly:
+
+        {"schema": 1, "id": "<uuid4>", "verdict": "approve"|"deny", "at": <float>,
+         "approver": {"display": "...", "discord_id": "..."}, "note": "<=200 chars, optional"}
+
+    schema/id/verdict/at/approver.display are load-bearing -- get any of those wrong and the
+    executor quarantines the file and the request stays pending forever (this happened once
+    already: this function used to write "decision" instead of "verdict" and never set "schema").
+    approver.discord_id is read by the executor for its audit log only; approver.display is what
+    it shows anyone (e.g. restart-state.json's "approver": {"display"}). discord_id is sent as a
+    string -- a Discord snowflake can exceed other languages' safe-integer range.
+
+    Everything past "note" (guild_id, channel_id, interaction_id, message_id, role_id,
+    role_present) is audit-trail only; the executor ignores unknown keys but keeps them in its
+    log. role_present records that the role check passed *at decision time*, in case
+    RESTART_APPROVER_ROLE_ID is ever reconfigured later and someone wants to know what the rule
+    was when this particular decision was made -- by the time we get here it is always True,
+    since is_authorized_approver() already gated on it."""
     obj = {
+        "schema": 1,
         "id": request_id,
-        "kind": "verdict",
-        "decision": decision,
-        "approver": {"id": approver_id, "display": approver_display},
-        "decided_at": int(time.time()),
+        "verdict": verdict,
+        "at": time.time(),
+        "approver": {"display": approver_display, "discord_id": str(approver_id)},
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+        "interaction_id": interaction_id,
+        "message_id": message_id,
+        "role_id": role_id,
+        "role_present": role_present,
     }
+    if note:
+        obj["note"] = note[:200]
     return _write_exclusive(VERDICTS_DIR, f"{request_id}.json", obj)
 
 
 def write_announce_exclusive(request_id, message_id):
     """A second, separate create-only file (never the verdict file itself) recording that we
-    posted this request to Discord, and which message holds its buttons.
+    Filename is "<id>.announce" -- deliberately WITHOUT a .json suffix. The executor lists
+    verdicts/ with endswith(".json"), so a ".announce.json" name used to match that filter, fail
+    the executor's "name == id + '.json'" check, and get quarantined with an alarming "malformed
+    verdict" log line on every single request. Dropping the suffix makes the executor's own
+    listing skip this file entirely; the contents are still JSON, only the filename changed.
 
-    Why this exists: we cannot read verdicts/ back (see _write_exclusive's docstring), so once we
-    write this, WE cannot learn message_id again from our own memory of it after a restart. The
-    executor -- root, the sole reader of verdicts/ AND the sole writer of inbox/ -- is the piece
-    that must notice this marker and merge {"message_id": ...} into the corresponding
-    inbox/<id>.json. Once that lands, this bot (which DOES have read access to inbox/) sees the
-    message_id on its next poll or after a restart and knows the request was already announced,
-    instead of posting a duplicate. This is a cross-task dependency on valheim-restart-exec.py
-    (task R3) -- flagged in this task's report; until R3 implements the merge, a bot restart
-    between "posted" and "decided" risks one duplicate Discord post (a UX nuisance, bounded by
-    _announced_this_run within a single process and by the executor's own poll interval across
-    restarts). It can never risk a duplicate *decision*: that stays guarded by
-    write_verdict_exclusive's O_EXCL regardless of whether this merge ever happens."""
+    Why this file exists at all: we cannot read verdicts/ back (see _write_exclusive's
+    docstring), so once we write this, WE cannot learn message_id again from our own memory of it
+    after a restart. task R3 has decided NOT to implement merging this back into inbox/<id>.json
+    (it would add complexity to the security-critical executor for a cosmetic problem) -- so this
+    marker's only remaining job is (a) guarding against a genuine double-post race within this
+    process (see _announced_this_run below, which is what actually prevents a repost after a
+    restart, not this file) and (b) being available for a human to inspect by hand if a request's
+    Discord history looks confusing. Concretely, this means: a bot restart while a request is
+    still awaiting_approval WILL cause exactly one duplicate Discord post (a cosmetic nuisance,
+    bounded to one extra message, never a retry loop or repeated log line -- see
+    process_inbox_once()); it can NEVER cause a duplicate *decision*, since that stays
+    independently guarded by write_verdict_exclusive's own O_EXCL regardless of how many messages
+    exist for a given request id."""
     obj = {"id": request_id, "kind": "announced", "message_id": message_id,
            "announced_at": int(time.time())}
-    return _write_exclusive(VERDICTS_DIR, f"{request_id}.announce.json", obj)
+    return _write_exclusive(VERDICTS_DIR, f"{request_id}.announce", obj)
 
 
 def is_authorized_approver(interaction):
@@ -871,13 +904,30 @@ def build_approval_view(request_id):
     return view
 
 
+def requester_phrase(nickname):
+    """Markdown for "who asked", used only at the front of build_restart_embed()'s description.
+
+    Task R3 relaxed the nickname rule: a requester who leaves the name field blank is now
+    recorded honestly as "" in inbox/<id>.json's claim, rather than the executor fabricating a
+    placeholder -- the audit trail needs to tell "gave no name" apart from "typed a name", and
+    that distinction is the executor's to keep, not ours to erase by inventing a name here.
+
+    So: a real name is bolded, exactly like before ("**Brunhilde** asked..."). An empty one is
+    NOT wrapped in a pair of bold markers with nothing between them -- that dangling-bold-marker
+    rendering is exactly the bug this function exists to avoid -- and reads as a lower-case
+    description rather than a name ("someone who left no name asked..."), matching the page's and
+    the executor's own wording for this same case so all three surfaces describe it the same way."""
+    name = sanitize_output(str(nickname or "")).strip()
+    return f"**{name}**" if name else "someone who left no name"
+
+
 def build_restart_embed(entry):
     """The embed is the entire disclosure to the hall: who asked, why, who was online, and both
     of PLAN-v5's honest limits stated plainly, because the approver may otherwise assume more
     certainty than the system actually has."""
     import discord
     reason = REASON_LABELS.get(entry.get("reason"), "unspecified")
-    nickname = sanitize_output(entry.get("nickname") or "someone") or "someone"
+    who_asked = requester_phrase(entry.get("nickname"))
     par = entry.get("players_at_request") or {}
     names = [sanitize_output(str(n)) for n in (par.get("names") or [])]
     who = ", ".join(names) if names else "no one"
@@ -886,7 +936,7 @@ def build_restart_embed(entry):
     embed = discord.Embed(
         title="Restart requested",
         description=(
-            f"**{nickname}** asked the dashboard to restart the server. Reason: {reason}.\n\n"
+            f"{who_asked} asked the dashboard to restart the server. Reason: {reason}.\n\n"
             "The requester is **not authenticated** -- the dashboard's join password is shared "
             "with everyone in the hall, so this could be anyone who has it. Approving this is "
             "*accountable*, not two-person control: whoever clicks Approve owns this restart.\n\n"
@@ -981,10 +1031,12 @@ async def handle_approval_interaction(interaction, decision, request_id, limiter
     if not is_authorized_approver(interaction):
         await safe_ephemeral(interaction, "You're not authorized to approve or deny restarts.")
         return
-    verdict = limiter.check(interaction.user.id)
-    if verdict == "silent":
+    # Named rl_status, not "verdict", to keep this unrelated to the approve/deny verdict below --
+    # RateLimiter.check() returns "ok"/"warn"/"silent", a different vocabulary entirely.
+    rl_status = limiter.check(interaction.user.id)
+    if rl_status == "silent":
         return
-    if verdict == "warn":
+    if rl_status == "warn":
         await safe_ephemeral(interaction, "Slow down -- one click at a time.")
         return
 
@@ -995,9 +1047,17 @@ async def handle_approval_interaction(interaction, decision, request_id, limiter
         await safe_ephemeral(interaction, msg)
         return
 
-    decided = "approved" if decision == "approve" else "denied"
+    # decision is already exactly "approve" or "deny" (CUSTOM_ID_RE's capture group) -- that is
+    # also the exact string valheim-restart-exec.py's schema requires, so it is passed straight
+    # through to write_verdict_exclusive with no remapping.
     display_name = sanitize_output(str(getattr(interaction.user, "display_name", interaction.user)))[:64]
-    won = write_verdict_exclusive(request_id, decided, interaction.user.id, display_name)
+    message = getattr(interaction, "message", None)
+    won = write_verdict_exclusive(
+        request_id, decision, interaction.user.id, display_name,
+        guild_id=interaction.guild_id, channel_id=interaction.channel_id,
+        interaction_id=interaction.id, message_id=(message.id if message else None),
+        role_id=APPROVER_ROLE_ID, role_present=True,
+    )
     if not won:
         # O_EXCL lost the race: someone else's decision (very likely from the other button, or a
         # duplicate click) got there first. We cannot read verdicts/ to find out who (see
@@ -1009,12 +1069,13 @@ async def handle_approval_interaction(interaction, decision, request_id, limiter
         await safe_ephemeral(interaction, msg)
         return
 
-    log(f"restart request {request_id} {decided} by {interaction.user.id} ({display_name})")
+    past_tense = "approved" if decision == "approve" else "denied"
+    log(f"restart request {request_id} {past_tense} by {interaction.user.id} ({display_name})")
     try:
         await interaction.response.edit_message(view=None)
     except Exception as exc:
         log(f"decision recorded for {request_id} but could not strip its buttons: {exc!r}", "warning")
-        await safe_ephemeral(interaction, f"Recorded: {decided}.")
+        await safe_ephemeral(interaction, f"Recorded: {past_tense}.")
 
 
 # ---------------------------------------------------------------- Discord gateway

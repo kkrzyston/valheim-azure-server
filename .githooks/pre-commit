@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Blocks a commit that would introduce a secret. Install once per clone:
+#     git config core.hooksPath .githooks
+# Emergency override (think hard first -- a pushed secret cannot be un-pushed):
+#     SKIP_SECRET_SCAN=1 git commit ...
+set -uo pipefail
+if [ "${SKIP_SECRET_SCAN:-0}" = "1" ]; then
+  echo "pre-commit: secret scan SKIPPED via SKIP_SECRET_SCAN=1" >&2
+  exit 0
+fi
+root=$(git rev-parse --show-toplevel)
+s="$root/scripts/scan-secrets.sh"
+if [ ! -x "$s" ]; then
+  echo "pre-commit: scripts/scan-secrets.sh missing or not executable - refusing the commit." >&2
+  echo "            (failing closed: a missing scanner is not a clean tree)" >&2
+  exit 1
+fi
+if ! bash "$s" --staged; then
+  echo "" >&2
+  echo "pre-commit: commit BLOCKED by the secret scan above." >&2
+  exit 1
+fi
+exit 0

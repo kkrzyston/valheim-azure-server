@@ -1,0 +1,33 @@
+[Unit]
+Description=Wake the Valheim restart caretaker the moment a request or a verdict appears
+Documentation=file:/usr/local/sbin/valheim-restart-exec.py
+#
+# THIS UNIT IS DELIBERATELY NOT ENABLED BY install-dashboard.sh. Do not enable it casually.
+#
+# It is pure convenience: it only removes the up-to-15-second wait between a player pressing the
+# button (or an approval landing) and the caretaker noticing. valheim-restart-exec.timer is the
+# guarantee, and everything works correctly without this unit.
+#
+# The reason for caution: the caretaker itself writes into the directories watched below (it
+# rewrites a request file at every phase), so PathChanged can in principle re-trigger the service
+# in a loop. That loop is bounded and harmless -- a tick with nothing to do takes milliseconds, the
+# 30-minute / 3-per-day / one-in-flight rails live in the request files rather than in how often
+# this runs, and StartLimitIntervalSec=0 on the service stops a burst from parking it in `failed` --
+# but it is wasted CPU on a small VM and it has never been observed on this box. Enable it only
+# after the timer has been watched for a day (`systemctl list-timers`, `journalctl -t
+# valheim-restart`), and watch the service's start count for a while afterwards.
+
+[Path]
+# PathChanged, not DirectoryNotEmpty: a terminal request file stays in requests/ for seven days
+# before it is archived, so DirectoryNotEmpty would be true almost permanently and would re-trigger
+# the service forever. PathChanged fires on the directory's own mtime, i.e. when a file is created,
+# renamed or removed.
+PathChanged=/var/lib/valheim-restart/requests
+PathChanged=/var/lib/valheim-restart/verdicts
+Unit=valheim-restart-exec.service
+# Do not invent the spool directories: their ownership and the 1730 modes are the installer's job,
+# and a directory systemd created would have the wrong ones.
+MakeDirectory=no
+
+[Install]
+WantedBy=multi-user.target

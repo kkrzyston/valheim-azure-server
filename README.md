@@ -23,6 +23,9 @@ group.
 - **Hermóðr**, a Discord bot that answers questions about the server (who's online, boss
   progress, per-player stats, how a given medal is calculated) using an LLM, scoped to a
   single allow-listed channel and authenticated to Azure with no stored API key.
+- A **Discord restart-approval flow** (`valheim-restartd.py`, `valheim-restart-exec.py`, and
+  their systemd units) that lets the Discord community approve a server restart from chat,
+  gated to a specific guild and an approver role. The bot no longer runs as root.
 - **Daily off-site world backups** to Azure Blob Storage, independent of the local snapshot
   directory on the VM, with a 30-day retention lifecycle.
 - An **auto-updater** that checks Steam for a new build every 30 minutes and only restarts
@@ -81,6 +84,8 @@ flowchart TD
         Medals["valheim-medals*.timer<br/>(achievements)"]
         Offsite["valheim-offsite.timer<br/>(daily world backup)"]
         Bot["valheim-bot.service<br/>(Hermóðr)"]
+        Restartd["valheim-restartd.py<br/>(restart approval)"]
+        RestartExec["valheim-restart-exec.py<br/>(restart executor)"]
         Caddy["Caddy<br/>(HTTPS + basic auth)"]
         StatusJSON[("status.json /<br/>history.json")]
     end
@@ -92,6 +97,9 @@ flowchart TD
     Digest --> StatusJSON
     Medals --> StatusJSON
     Bot -- "reads" --> StatusJSON
+    Bot -- "restart request" --> Restartd
+    Restartd -- "approved" --> RestartExec
+    RestartExec -- "restarts" --> Game
 
     Caddy -- "HTTPS + basic auth" --> Browser(["Browser"])
     Alert --> Discord[("Discord webhook")]
@@ -204,6 +212,19 @@ deploy:
 You'll also want accounts/access for whichever of the optional pieces you use: an Azure
 subscription, a Discord server (for alerts and Hermóðr), and — only for Hermóðr — an Azure AI
 Foundry model deployment.
+
+## Contributing
+
+Contributions are welcome. Before your first commit, enable the repo's secret-scan hook so a
+real credential can never slip into a commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full guide: why this matters, where real
+configuration values actually live, how to work on the dashboard locally, and the PR
+workflow.
 
 ## License
 

@@ -1,0 +1,81 @@
+[Unit]
+Description=Valheim dashboard: accept restart requests from Caddy over a unix socket
+Documentation=file:/usr/local/sbin/valheim-restartd.py
+# No After=network-online.target on purpose: this service has no network at all (see below) and
+# waiting for one would only delay it. It needs nothing but its spool directory to exist.
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-restartd.py
+# Every RESTARTD_* variable has a working default baked into the script (see its own top-of-file
+# config block) -- this only matters if you relocate the spool or rename the socket group. Same
+# "advanced, optional" file the MEDALS_*/HERMODR_LOG overrides already live in; loaded by systemd
+# (PID 1) before this unit's own sandboxing (ProtectSystem=strict etc., below) ever applies.
+EnvironmentFile=-/etc/valheim-alert.env
+Restart=always
+RestartSec=2
+
+# The socket must end up 0660 valheim-restartd:caddy so that Caddy -- and nothing else on the box,
+# in particular not the `valheim` account that runs the internet-facing game process -- can speak
+# to it. systemd's RuntimeDirectory= always uses this unit's own User/Group, so we keep
+# Group=valheim-restartd (the 0640 secret.csrf and the 1730 requests/ directory are group-owned by
+# it) and add caddy as a supplementary group purely so the daemon is allowed to chgrp its own
+# socket and runtime directory to caddy at startup.
+User=valheim-restartd
+Group=valheim-restartd
+SupplementaryGroups=caddy
+RuntimeDirectory=valheim-restartd
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# ---------------------------------------------------------------------------------------------
+# !!! PrivateNetwork=yes WORKS ONLY BECAUSE THIS DAEMON SPEAKS OVER A UNIX SOCKET. !!!
+# It gets its own empty network namespace: no loopback route to anything, no way to reach Discord,
+# Steam, the Azure metadata endpoint, or the game port, even if this process is fully compromised.
+# If anyone ever "simplifies" this to listen on a TCP port (even 127.0.0.1), PrivateNetwork=yes and
+# RestrictAddressFamilies=AF_UNIX must be removed for it to work at all -- and removing them
+# silently hands the internet-facing tier full network access back. Do not do that. The socket is
+# also what keeps the listener unreachable by every other local account.
+# ---------------------------------------------------------------------------------------------
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @clock @cpu-emulation @module @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+# The only writable path is the spool it creates request files in (mode 1730: create-by-name, no
+# listing, no reading). Everything else it touches is read-only.
+ReadWritePaths=/var/lib/valheim-restart/requests
+ReadOnlyPaths=/var/lib/valheim-restart/secret.csrf /var/lib/valheim-restart/gate.json
+
+MemoryMax=64M
+TasksMax=16
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target
