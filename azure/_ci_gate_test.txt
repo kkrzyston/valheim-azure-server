@@ -1,0 +1,2 @@
+# temporary CI gate test - delete this branch
+DASHBOARD_HOST=valheim-testlabel.westus2.cloudapp.azure.com
