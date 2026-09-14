@@ -608,14 +608,38 @@ def read_join_info():
     return info
 
 
-def join_reply():
+def join_reply(english=False):
     """Fixed template. Never goes near the model. Old Norse prose by default, like everything
     else Hermodr says -- but the address/password stay verbatim in their own code fences (literal
     values, never translated), and the in-game menu labels stay in English inside backticks
     because a player has to match those exact strings on their own screen; to_futhark() already
     skips every backticked span, so nothing here needs any special-casing beyond the backticks
-    themselves."""
+    themselves.
+
+    Pass english=True (only when ENGLISH_RE also matched the question -- see on_message's JOIN_RE
+    branch) to get the original plain-English template back instead, with no runic line. This
+    fixed-template path bypasses call_ai_sync() entirely (that is the whole point of answering
+    join/password questions from disk, never the model), so ENGLISH_RE's escape hatch has to be
+    checked again here -- it cannot rely on call_ai_sync() having already checked it. Getting this
+    wrong means a new player who cannot read runes and explicitly asks for English on the one
+    question they most need to act on gets runes anyway; read_join_info() is called exactly once
+    either way, and only the presentation strings differ between the two branches below."""
     i = read_join_info()
+
+    if english:
+        if not i.get("address") and not i.get("password"):
+            return "I cannot read the join details just now -- ask whoever keeps the server."
+        lines = ["**Getting onto Vancouver Island**",
+                 "In Valheim: *Start Game* -> pick your character -> *Join Game* -> *Join IP*"]
+        if i.get("address"):
+            lines.append("Address: `%s`" % i["address"])
+        if i.get("password"):
+            lines.append("Password: `%s`" % i["password"])
+        if not i.get("crossplay"):
+            lines.append("_Crossplay is off, so join by IP -- the server will not appear in the "
+                         "Steam browser. Keep this within the hall._")
+        return "\n".join(lines)
+
     if not i.get("address") and not i.get("password"):
         return norse_reply(
             "Ek fæ ekki lesit inngönguskilríkin núna -- spyr þann sem heldr þjóninum."
@@ -1363,11 +1387,16 @@ def run_bot():
                 log(f"failed to send empty-question reply: {exc!r}", "warning")
             return
 
-        # join/password questions are answered from disk, before the model is consulted
+        # join/password questions are answered from disk, before the model is consulted -- this
+        # bypasses call_ai_sync() entirely, so the English escape hatch (ENGLISH_RE) is checked
+        # again here rather than relying on call_ai_sync() to have done it.
         if JOIN_RE.search(question):
+            join_english = bool(ENGLISH_RE.search(question))
             try:
-                await message.reply(join_reply(), allowed_mentions=discord.AllowedMentions.none())
-                log("answered a join question for user %s (no AI call)" % message.author.id)
+                await message.reply(join_reply(english=join_english),
+                                     allowed_mentions=discord.AllowedMentions.none())
+                log("answered a join question for user %s (no AI call, %s)" % (
+                    message.author.id, "english" if join_english else "old norse"))
             except Exception as exc:
                 log("failed to send join reply: %r" % exc, "error")
             return
@@ -1426,6 +1455,7 @@ def cmd_selftest():
         ("rate-limit notice", RATE_LIMIT_REPLY),
         ("AI-failure notice", AI_FAILURE_REPLY),
         ("join_reply()", join_reply()),
+        ("join_reply(english=True)", join_reply(english=True)),
     ):
         print(f"[{label}]")
         print(text)
@@ -1456,6 +1486,19 @@ def cmd_selftest():
         matched = bool(ENGLISH_RE.search(phrase))
         print(f"{'PASS' if not matched else 'FAIL'} (should NOT match): {phrase!r}")
         all_ok = all_ok and not matched
+
+    print("\n--- join + English interaction (both regexes must fire on the SAME message) ---")
+    # A join/password question is answered by join_reply(), a fixed template that bypasses
+    # call_ai_sync() entirely -- so ENGLISH_RE has to be (and now is, see on_message's JOIN_RE
+    # branch) checked again at that branch specifically, not just inside call_ai_sync(). Asserting
+    # the two regexes in isolation would not have caught the original bug (each matched fine on
+    # its own); the message that has to route to English is one BOTH regexes fire on together.
+    join_and_english_phrase = "how do i join, in english please"
+    join_matched = bool(JOIN_RE.search(join_and_english_phrase))
+    english_matched = bool(ENGLISH_RE.search(join_and_english_phrase))
+    print(f"{'PASS' if join_matched else 'FAIL'} JOIN_RE matches:    {join_and_english_phrase!r}")
+    print(f"{'PASS' if english_matched else 'FAIL'} ENGLISH_RE matches: {join_and_english_phrase!r}")
+    all_ok = all_ok and join_matched and english_matched
 
     print("\n--- to_futhark() carve-outs (must survive byte-for-byte) ---")
     carveouts = [
