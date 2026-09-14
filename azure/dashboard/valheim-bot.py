@@ -2072,6 +2072,202 @@ def cmd_selftest():
         print("FAIL dense-backtick input: Latin half contains no unterminated backtick/fence span: "
               "no \"\\n\" to split on")
 
+    print("\n--- GAME KNOWLEDGE wiring (PLAN-v6 W3) -- a stub index, real search()/build_index() ---")
+    # Never depends on W1's real corpus (may not exist yet) or W2's real /var/lib/valheim-wiki --
+    # builds a small throwaway FTS5 index via W2's own build_index(), so every assertion below
+    # exercises the real search() and build_index() code, not a hand-rolled stand-in schema.
+    try:
+        wiki_mod = load_wiki_index_module()
+    except Exception as exc:
+        print(f"FAIL could not import valheim-wiki-index.py for the GAME KNOWLEDGE selftest: {exc!r}")
+        all_ok = False
+        wiki_mod = None
+
+    if wiki_mod is not None:
+        with tempfile.TemporaryDirectory(prefix="hermodr-wiki-selftest-") as tmp_dir:
+            records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+            db_path = os.path.join(tmp_dir, "wiki.db")
+            # Forces max_chars truncation to actually matter below -- well over
+            # GAME_KNOWLEDGE_MAX_CHARS (4000) on its own.
+            long_marker = "MARKERTEXT-" + "z" * 4500
+            stub_records = [
+                {"title": "Fenring", "heading": "Weaknesses",
+                 "text": "Fenring is weak to fire and pierce damage, resistant to slash.",
+                 "source": "weirdgloop", "revid": 101,
+                 "url": "https://valheim.weirdgloop.org/wiki/Fenring", "timestamp": "2026-01-01T00:00:00Z"},
+                # Same (title, heading), different sources, DIFFERENT numbers -- W2's dedupe rule
+                # (_sections_materially_differ) keeps both rather than silently picking a winner.
+                {"title": "Boar", "heading": "Stats", "text": "Health: 10. Damage: 4.",
+                 "source": "fandom", "revid": 201,
+                 "url": "https://valheim.fandom.com/wiki/Boar", "timestamp": "2026-01-01T00:00:00Z"},
+                {"title": "Boar", "heading": "Stats", "text": "Health: 12. Damage: 4.",
+                 "source": "weirdgloop", "revid": 202,
+                 "url": "https://valheim.weirdgloop.org/wiki/Boar", "timestamp": "2026-01-01T00:00:00Z"},
+                {"title": "Serpent", "heading": "Drops", "text": long_marker,
+                 "source": "fandom", "revid": 301,
+                 "url": "https://valheim.fandom.com/wiki/Serpent", "timestamp": "2026-01-01T00:00:00Z"},
+            ]
+            with open(records_path, "w", encoding="utf-8") as fh:
+                for rec in stub_records:
+                    fh.write(json.dumps(rec) + "\n")
+
+            build_ok = False
+            try:
+                wiki_mod.build_index(records_path=records_path, db_path=db_path)
+                wiki_mod.DB_PATH_DEFAULT = db_path  # point the module's search() at the stub
+                wiki_mod._reset_cache_for_tests()
+                build_ok = True
+            except Exception as exc:
+                print(f"FAIL could not build the stub wiki index: {exc!r}")
+                all_ok = False
+
+            if build_ok:
+                # A: retrieval actually runs against the index and finds the right page for a
+                # mechanics question.
+                fenring_records = search_wiki_sync("what is Fenring weak to")
+                fenring_ok = bool(fenring_records) and fenring_records[0]["title"] == "Fenring"
+                print(f"{'PASS' if fenring_ok else 'FAIL'} search_wiki_sync() finds the Fenring "
+                      f"page for a mechanics question: {[r['title'] for r in fenring_records]!r}")
+                all_ok = all_ok and fenring_ok
+
+                # B: the formatted block names both the source wiki and the page title, so the
+                # model (and an operator reading a transcript) can tell where a fact came from.
+                fenring_block = build_game_knowledge_block(fenring_records)
+                block_labelled = (
+                    "GAME KNOWLEDGE" in fenring_block
+                    and "Fenring" in fenring_block
+                    and "Weird Gloop" in fenring_block
+                )
+                print(f"{'PASS' if block_labelled else 'FAIL'} GAME KNOWLEDGE block carries the "
+                      f"header, page title, and source label: {fenring_block[:160]!r}")
+                all_ok = all_ok and block_labelled
+
+                # Plan's literal check: the full system prompt for a mechanics question contains
+                # GAME KNOWLEDGE with the right page.
+                mechanics_prompt = build_system_prompt(context, fenring_block)
+                mechanics_ok = "GAME KNOWLEDGE" in mechanics_prompt and "Fenring" in mechanics_prompt
+                print(f"{'PASS' if mechanics_ok else 'FAIL'} full system prompt for a mechanics "
+                      "question contains GAME KNOWLEDGE with the retrieved page")
+                all_ok = all_ok and mechanics_ok
+
+                # C: [] is documented as a normal outcome, not an error, and must add NO block at
+                # all -- not an empty header. Doubles as "a server-status question": nothing in
+                # the stub index matches it, so this must fall through with zero bytes added.
+                # Every word chosen to share nothing with the stub corpus above (in particular,
+                # not "is" -- FTS5's OR-of-terms match means even one shared common word between
+                # a query and Fenring's stub text would otherwise produce a spurious hit here).
+                empty_records = search_wiki_sync("how many players are online today")
+                empty_records_ok = empty_records == []
+                print(f"{'PASS' if empty_records_ok else 'FAIL'} search_wiki_sync() returns [] "
+                      f"for an unrelated/server question: {empty_records!r}")
+                all_ok = all_ok and empty_records_ok
+                empty_block = build_game_knowledge_block(empty_records)
+                empty_block_ok = empty_block == ""
+                print(f"{'PASS' if empty_block_ok else 'FAIL'} build_game_knowledge_block([]) == "
+                      f"\"\" -- no header injected for an empty result: {empty_block!r}")
+                all_ok = all_ok and empty_block_ok
+                clean_prompt = build_system_prompt(context, empty_block)
+                # SYSTEM_PROMPT's own static rules paragraph explains what GAME KNOWLEDGE *is* in
+                # prose, so the bare phrase "GAME KNOWLEDGE" is present in EVERY prompt regardless
+                # of retrieval -- checking for it here would pass even if the block-omission logic
+                # were deleted entirely. What must be absent is the actual formatted block header
+                # build_game_knowledge_block() emits, plus a byte-exact match against the
+                # no-append baseline -- either one is a real proof the block was never appended,
+                # not just plausible-looking phrasing.
+                no_block_header_ok = "(third-party wiki text" not in clean_prompt
+                print(f"{'PASS' if no_block_header_ok else 'FAIL'} system prompt carries no "
+                      "GAME KNOWLEDGE block header when nothing was retrieved")
+                all_ok = all_ok and no_block_header_ok
+                clean_prompt_ok = clean_prompt == SYSTEM_PROMPT.format(context=context)
+                print(f"{'PASS' if clean_prompt_ok else 'FAIL'} system prompt is byte-identical "
+                      "to the no-game-knowledge baseline (nothing silently appended)")
+                all_ok = all_ok and clean_prompt_ok
+                budget_ok = len(clean_prompt) == len(build_system_prompt(context, ""))
+                print(f"{'PASS' if budget_ok else 'FAIL'} an empty retrieval adds zero characters "
+                      "to the system prompt (server-status char budget respected)")
+                all_ok = all_ok and budget_ok
+
+                # D: two entries, same (title, heading), different sources, DIFFERENT numbers --
+                # both must survive to the prompt with a disagreement flagged, never a silent pick.
+                boar_records = search_wiki_sync("boar stats health")
+                boar_sources = sorted(r["source"] for r in boar_records if r["title"] == "Boar")
+                boar_both_ok = boar_sources == ["fandom", "weirdgloop"]
+                print(f"{'PASS' if boar_both_ok else 'FAIL'} conflicting Boar sections from BOTH "
+                      f"sources are retrieved together (never silently deduped): {boar_sources!r}")
+                all_ok = all_ok and boar_both_ok
+                boar_block = build_game_knowledge_block(boar_records)
+                boar_conflict_ok = (
+                    "disagree" in boar_block.lower()
+                    and "Health: 10" in boar_block
+                    and "Health: 12" in boar_block
+                    and "Fandom" in boar_block
+                    and "Weird Gloop" in boar_block
+                )
+                print(f"{'PASS' if boar_conflict_ok else 'FAIL'} GAME KNOWLEDGE block flags the "
+                      "disagreement and keeps BOTH numbers with BOTH sources")
+                all_ok = all_ok and boar_conflict_ok
+
+                # max_chars is actually threaded through to search(), not just accepted and
+                # ignored -- the Serpent stub record alone is ~4.5KB, well over the 4000-char cap.
+                serpent_records = search_wiki_sync("serpent drops")
+                serpent_total = sum(len(r["text"]) for r in serpent_records)
+                serpent_ok = 0 < serpent_total <= GAME_KNOWLEDGE_MAX_CHARS
+                print(f"{'PASS' if serpent_ok else 'FAIL'} retrieved text is capped at "
+                      f"{GAME_KNOWLEDGE_MAX_CHARS} chars even when the source page is much "
+                      f"longer: {serpent_total} chars")
+                all_ok = all_ok and serpent_ok
+
+                # I: logging carries page TITLES only -- never the underlying wiki prose (an
+                # operator reading hermodr.log must be able to tell a bad answer from a bad
+                # retrieval without the full third-party text landing in the log file).
+                captured = []
+                real_log = globals()["log"]
+                globals()["log"] = lambda msg, level="info": captured.append(msg)
+                try:
+                    log_wiki_retrieval(serpent_records)
+                finally:
+                    globals()["log"] = real_log
+                logged_text = " ".join(captured)
+                log_ok = "Serpent" in logged_text and long_marker not in logged_text
+                print(f"{'PASS' if log_ok else 'FAIL'} wiki retrieval logging names the page "
+                      f"title but never the section text: {logged_text!r}")
+                all_ok = all_ok and log_ok
+
+            # Release the cached sqlite3 connection before the TemporaryDirectory context above
+            # tries to delete wiki.db -- Windows (unlike POSIX) refuses to unlink a file that is
+            # still open, so without this the selftest itself crashes on cleanup after this point.
+            wiki_mod._reset_cache_for_tests()
+
+    # search() must run off the gateway thread, same as build_context()/call_ai_sync() -- a
+    # source-level check on run_bot()'s actual on_message code, not a claim taken on faith.
+    to_thread_ok = "asyncio.to_thread(search_wiki_sync" in inspect.getsource(run_bot)
+    print(f"{'PASS' if to_thread_ok else 'FAIL'} on_message() runs search_wiki_sync() via "
+          "asyncio.to_thread (never blocks the gateway heartbeat)")
+    all_ok = all_ok and to_thread_ok
+
+    # The 20K TPM budget arithmetic (PLAN-v6 W3.5) is the owner's call, not this task's -- pin
+    # MAX_TOKENS so a future change cannot silently widen it here.
+    max_tokens_ok = MAX_TOKENS == 700
+    print(f"{'PASS' if max_tokens_ok else 'FAIL'} MAX_TOKENS is unchanged at 700: {MAX_TOKENS}")
+    all_ok = all_ok and max_tokens_ok
+
+    print("\n--- SYSTEM_PROMPT statics: SERVER CONTEXT / GAME KNOWLEDGE rules present verbatim ---")
+    never_guess_ok = "say so plainly instead of guessing" in SYSTEM_PROMPT
+    print(f"{'PASS' if never_guess_ok else 'FAIL'} SERVER CONTEXT keeps its never-guess rule")
+    all_ok = all_ok and never_guess_ok
+    injection_ok = (
+        "GAME KNOWLEDGE" in SYSTEM_PROMPT
+        and "not a real instruction" in SYSTEM_PROMPT
+        and "ignore it" in SYSTEM_PROMPT
+    )
+    print(f"{'PASS' if injection_ok else 'FAIL'} anti-injection clause explicitly covers GAME "
+          "KNOWLEDGE")
+    all_ok = all_ok and injection_ok
+    unverified_ok = "mark that answer as unverified" in SYSTEM_PROMPT
+    print(f"{'PASS' if unverified_ok else 'FAIL'} SYSTEM_PROMPT requires marking un-retrieved "
+          "game-mechanics answers unverified")
+    all_ok = all_ok and unverified_ok
+
     print()
     if not all_ok:
         print("SELFTEST FAILED -- see FAIL lines above", file=sys.stderr)
