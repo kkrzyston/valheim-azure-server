@@ -30,6 +30,7 @@ DATA_DIR="/home/valheim/data"
 LOG="/var/log/valheim-offsite.log"
 STATE_DIR="/var/lib/valheim-status"
 STATUS_FILE="$STATE_DIR/offsite.json"
+LOCKFILE="/var/lock/valheim-world.lock"
 RETENTION_DAYS=30
 KEEP_LOCAL=10
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -44,7 +45,31 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*" >>"$LOG"
 }
 
-log "=== offsite backup run starting ==="
+# Same tar -tzf + size checks valheim-autoupdate.sh runs on its pre-update
+# backup, applied here to whichever archive is about to be uploaded as the
+# canonical off-site copy.
+verify_tarball() {
+  # $1 = path, $2 = minimum plausible size in bytes, $3 = minimum entry count.
+  local f="$1" min_size="$2" min_entries="$3" listing rc entries size
+  listing=$(tar -tzf "$f" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "tar -tzf failed (exit $rc): $(printf '%s\n' "$listing" | tail -n1)"
+    return 1
+  fi
+  entries=$(printf '%s\n' "$listing" | grep -c .)
+  if [ "$entries" -lt "$min_entries" ]; then
+    echo "only $entries entries (expected >= $min_entries); treating as truncated"
+    return 1
+  fi
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  if [ "$size" -lt "$min_size" ]; then
+    echo "only $size bytes (expected >= $min_size); treating as truncated"
+    return 1
+  fi
+  echo "$entries entries, $size bytes"
+  return 0
+}
 
 export OFFSITE_ACCOUNT OFFSITE_CONTAINER
 export OFFSITE_NOW="$(date +%s)"
@@ -54,26 +79,64 @@ export OFFSITE_STATUS_FILE="$STATUS_FILE"
 export OFFSITE_RETENTION_DAYS="$RETENTION_DAYS"
 export OFFSITE_LIST_XML=""
 
-# ---- 1. fresh world tarball via the existing backup script ----
-before_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort || true)
-backup_rc=0
-"$BACKUP_SCRIPT" >>"$LOG" 2>&1 || backup_rc=$?
-after_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort || true)
-world_tgz_name=$(comm -13 <(printf '%s\n' "$before_list") <(printf '%s\n' "$after_list") | grep '\.tgz$' | head -n1 || true)
-world_tgz_path="$BACKUP_DIR/$world_tgz_name"
+log "=== offsite backup run starting ==="
 
-if [ "$backup_rc" -ne 0 ]; then
-  export OFFSITE_LAST_ERROR="backup.sh exited $backup_rc"
-  log "ERROR: $OFFSITE_LAST_ERROR"
-elif [ -z "$world_tgz_name" ] || [ ! -f "$world_tgz_path" ]; then
-  export OFFSITE_LAST_ERROR="backup.sh did not produce a new .tgz"
+# ---- 0. shared world lock (PLAN-v5) ----
+# -w 900: this is the nightly backup, it must not skip -- give it a generous
+# budget rather than a silent miss. Held for the rest of the script's life
+# (fd 9 stays open until exit), so it covers backup.sh's tar of the live
+# world dir below: that tar is what becomes the canonical off-site copy, and
+# a tar that overlaps a world save would silently corrupt it. See
+# valheim-autoupdate.sh for why this is fd-based rather than the
+# self-re-exec one-liner (it would lose the ability to log a reason here).
+if ! : >>"$LOCKFILE" 2>/dev/null; then
+  export OFFSITE_LAST_ERROR="cannot access world lock file $LOCKFILE"
   log "ERROR: $OFFSITE_LAST_ERROR"
 else
-  # backup.sh may run with different effective ownership than valheim;
-  # the backups dir is exposed read-only at /snapshots/ via a caddy ACL.
-  chown valheim:valheim "$world_tgz_path" 2>>"$LOG" || true
-  chmod 0644 "$world_tgz_path" 2>>"$LOG" || true
-  log "fresh world tarball: $world_tgz_name ($(du -h "$world_tgz_path" 2>/dev/null | cut -f1))"
+  exec 9>"$LOCKFILE"
+  if ! flock -w 900 9; then
+    export OFFSITE_LAST_ERROR="could not acquire world lock within 900s; backup skipped this run"
+    log "ERROR: $OFFSITE_LAST_ERROR"
+  else
+    log "world lock acquired"
+  fi
+fi
+
+# ---- 1. fresh world tarball via the existing backup script ----
+if [ -n "$OFFSITE_LAST_ERROR" ]; then
+  log "skipping backup.sh: $OFFSITE_LAST_ERROR"
+  world_tgz_name=""
+  world_tgz_path=""
+else
+  before_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort || true)
+  backup_rc=0
+  "$BACKUP_SCRIPT" >>"$LOG" 2>&1 || backup_rc=$?
+  after_list=$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort || true)
+  world_tgz_name=$(comm -13 <(printf '%s\n' "$before_list") <(printf '%s\n' "$after_list") | grep '\.tgz$' | head -n1 || true)
+  world_tgz_path="$BACKUP_DIR/$world_tgz_name"
+
+  if [ "$backup_rc" -ne 0 ]; then
+    export OFFSITE_LAST_ERROR="backup.sh exited $backup_rc"
+    log "ERROR: $OFFSITE_LAST_ERROR"
+  elif [ -z "$world_tgz_name" ] || [ ! -f "$world_tgz_path" ]; then
+    export OFFSITE_LAST_ERROR="backup.sh did not produce a new .tgz"
+    log "ERROR: $OFFSITE_LAST_ERROR"
+  else
+    # backup.sh may run with different effective ownership than valheim;
+    # the backups dir is exposed read-only at /snapshots/ via a caddy ACL.
+    chown valheim:valheim "$world_tgz_path" 2>>"$LOG" || true
+    chmod 0644 "$world_tgz_path" 2>>"$LOG" || true
+    log "fresh world tarball: $world_tgz_name ($(du -h "$world_tgz_path" 2>/dev/null | cut -f1))"
+
+    verify_out=$(verify_tarball "$world_tgz_path" 102400 3)
+    verify_rc=$?
+    if [ "$verify_rc" -ne 0 ]; then
+      export OFFSITE_LAST_ERROR="world tarball failed verification: $verify_out (left in place at $world_tgz_path for inspection, not uploaded)"
+      log "ERROR: $OFFSITE_LAST_ERROR"
+    else
+      log "world tarball verified: $verify_out"
+    fi
+  fi
 fi
 
 # ---- 2. bundle admin/permitted/banned lists into a second small archive ----
@@ -84,6 +147,15 @@ if [ -z "$OFFSITE_LAST_ERROR" ]; then
     chown valheim:valheim "$lists_tgz_path"
     chmod 0644 "$lists_tgz_path"
     log "bundled admin lists: $lists_tgz_name"
+
+    verify_out=$(verify_tarball "$lists_tgz_path" 1 1)
+    verify_rc=$?
+    if [ "$verify_rc" -ne 0 ]; then
+      export OFFSITE_LAST_ERROR="lists tarball failed verification: $verify_out (left in place at $lists_tgz_path for inspection, not uploaded)"
+      log "ERROR: $OFFSITE_LAST_ERROR"
+    else
+      log "lists tarball verified: $verify_out"
+    fi
   else
     export OFFSITE_LAST_ERROR="failed to bundle admin/permitted/banned lists"
     log "ERROR: $OFFSITE_LAST_ERROR"
