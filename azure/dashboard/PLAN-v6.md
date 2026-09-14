@@ -81,7 +81,8 @@ only (agree it up front, below). W4 and W5 depend on nothing and may run in para
 So W2 and W3 can be built in parallel, this signature is fixed before either starts:
 
 ```python
-# valheim_wiki_index.py
+# valheim-wiki-index.py  -- hyphenated, matching valheim-medals.py; loaded via importlib.util
+# the way load_medals_module() already does, since it is not an importable module name.
 def search(query: str, k: int = 3, max_chars: int = 4000) -> list[dict]:
     """Return up to k section records, highest-ranked first, whose combined `text`
     fields total <= max_chars. Each record:
