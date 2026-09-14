@@ -368,36 +368,99 @@ _RELATION_KEYWORDS = {
 }
 
 # Matches a keyword from the table above, an optional "to" and/or ":" separator (covering both
-# "weak to fire" and "weakness: fire" phrasings), then captures the short answer that follows up
-# to the next clause boundary (the char class deliberately excludes ".", so "...fire.\nresistant"
-# stops the capture at "fire" rather than swallowing the next sentence).
+# "weak to fire" and "weakness: fire" phrasings), then captures up to 80 raw characters of
+# whatever follows -- an outer safety cap only; _extract_relations() below does the real work of
+# deciding how much of that raw text is actually part of the answer (the char class deliberately
+# excludes ".", so "...fire.\nresistant" stops the raw capture at "fire" rather than swallowing
+# the next sentence, but a comma or a bare "and" does NOT stop it here -- see below for why that
+# still has to be handled after the fact, not by tightening this regex further).
 _RELATION_VALUE_RE = re.compile(
     r"\b(" + "|".join(
         sorted((re.escape(k) for k in _RELATION_KEYWORDS), key=len, reverse=True)
     ) + r")\b"
     r"\s*(?:to)?\s*:?\s*"
-    r"([a-z][a-z0-9 ,/&'-]*)",
+    r"([a-z][a-z0-9 ,/&'-]{0,79})",
     re.IGNORECASE,
 )
+
+# A relation VALUE is a short entity or a short list of them ("fire", "frost, poison") -- never
+# an arbitrary run of prose. These words end the value the instant they appear, because they
+# signal a NEW clause starting, not more of the answer: FANBOYS conjunctions, relative pronouns,
+# and common linking verbs (which show up constantly in the clause an editor tacks on after the
+# fact, e.g. ", and IS tameable"). This is what actually fixed the false positive below -- the
+# regex's raw capture above still swallows straight through a bare comma or "and" (that is what
+# lets a real comma-separated list like "frost, poison" through), so without this second pass
+# every trailing clause an independent edit adds after a recognized keyword would silently
+# become part of the "value" and manufacture a disagreement out of two sections that assert the
+# exact same fact.
+_CLAUSE_BOUNDARY_RE = re.compile(
+    r"\b(?:and|but|nor|or|so|yet|because|which|that|while|although|though|"
+    r"is|are|was|were|has|have|had)\b|;",
+    re.IGNORECASE,
+)
+
+# The other half of "short entity or short list, not prose": even after clause-boundary
+# truncation, a candidate item must still look like a name, not a fragment. Longer than this many
+# words/characters, or a single leftover function word, and it is discarded rather than guessed
+# at -- per _sections_materially_differ()'s "fail toward keeping both" rule, an item this function
+# declines to recognize simply does not participate in the comparison; it never gets asserted as
+# either "the same" or "different".
+_RELATION_MAX_WORDS_PER_ITEM = 3
+_RELATION_MAX_ITEM_CHARS = 30
+_RELATION_ITEM_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "and", "or", "but",
+    "to", "of", "in", "on", "at", "for", "with", "it", "its", "this", "that",
+})
 
 
 def _extract_relations(normalized_text):
     """Pull {relation: set(values)} pairs -- e.g. {"weakness": {"fire"}, "resistance": {"frost",
     "poison"}} -- out of wiki prose, however it phrases them: a label ("weakness: fire") or
-    inline ("weak to fire"), a single value or a comma/and/slash/&-separated list.
+    inline ("weak to fire"), a single value or a comma/slash/&-separated list.
 
-    Best-effort and deliberately loose: this is only ever used to find REASONS to keep both
-    copies in _sections_materially_differ(), never to decide anything is safe to collapse on its
-    own, so an over-eager match here costs at most one harmless extra duplicate, never a hidden
-    contradiction."""
+    Demonstrated false positive this function used to produce (found by a reviewer, before the
+    clause-boundary and per-item bounds below existed): "...found in the Meadows biome." vs
+    "...found in the Meadows biome, and is tameable." -- a second wiki editor merely adding a
+    clause after the same fact. The old unbounded capture read straight through the comma and
+    "and" and returned {"in the meadows biome"} vs {"in the meadows biome", "is tameable"} --
+    two DIFFERENT sets, reported as a material disagreement, even though neither text disagrees
+    with the other about anything. Weird Gloop is an independently-edited fork of Fandom, so "one
+    copy has an extra clause the other doesn't" is the NORMAL difference between them, not the
+    exceptional one -- a rule that fires on this fires on a large fraction of real pages, and
+    enough false alarms teaches a reader to ignore the true ones, which is the failure this
+    function exists to prevent, not the one it was built to catch (see C3's docstring above).
+
+    Best-effort and deliberately loose in the OTHER direction still: this is only ever used to
+    find REASONS to keep both copies in _sections_materially_differ(), never to decide anything
+    is safe to collapse on its own, so an over-eager match here still costs at most one harmless
+    extra duplicate, never a hidden contradiction -- the bounds below trade away some of that
+    over-eagerness specifically because it was producing FALSE conflicts, not because false
+    conflicts and hidden contradictions are equally bad (they are not: see _sections_materially_
+    differ()'s docstring for why this whole rule fails toward "different" on any doubt)."""
     relations = {}
     for m in _RELATION_VALUE_RE.finditer(normalized_text):
         canonical = _RELATION_KEYWORDS[m.group(1).lower()]
-        items = {
-            item.strip(" .")
-            for item in re.split(r",|\band\b|/|&", m.group(2).lower())
-            if item.strip(" .")
-        }
+        raw_value = m.group(2)
+        boundary = _CLAUSE_BOUNDARY_RE.search(raw_value)
+        if boundary is not None:
+            raw_value = raw_value[: boundary.start()]
+        raw_value = raw_value.strip(" ,.")
+        if not raw_value:
+            continue
+
+        items = set()
+        for candidate in re.split(r"\s*,\s*|\s*/\s*|\s*&\s*", raw_value):
+            candidate = candidate.strip(" .")
+            if not candidate:
+                continue
+            words = candidate.split()
+            if not words or len(words) > _RELATION_MAX_WORDS_PER_ITEM:
+                continue  # too long to be a short entity/list item -- not a relation at all
+            if len(candidate) > _RELATION_MAX_ITEM_CHARS:
+                continue
+            if len(words) == 1 and words[0] in _RELATION_ITEM_STOPWORDS:
+                continue  # a stray leftover function word, not a named answer
+            items.add(candidate)
         if items:
             relations.setdefault(canonical, set()).update(items)
     return relations
@@ -617,7 +680,12 @@ def cmd_selftest():
     all_ok = True
 
     print("--- _sections_materially_differ(): the C3 dedupe-rule fix ---")
+    # Two separate failure modes, two separate locks -- a rule that only ever answers "differ"
+    # would pass a suite that only tests the FALSE-NEGATIVE direction (a real conflict hidden),
+    # so the FALSE-POSITIVE direction (a non-conflict reported) gets its own cases below, not
+    # just a comment saying it was checked by hand.
     cases = [
+        # -- false-negative direction: a real disagreement must still be caught --
         ("non-numeric disagreement (required minimum case)",
          "weak to fire", "weak to frost", True),
         ("identical text", "Fenring is weak to fire.", "Fenring is weak to fire.", False),
@@ -630,6 +698,16 @@ def cmd_selftest():
          "old numeric-only rule missing)",
          "...weakness: fire\nresistant to: frost, poison...",
          "...weakness: frost\nresistant to: fire, poison...", True),
+        # -- false-positive direction: an added clause is NOT a disagreement (a second reviewer
+        # demonstrated _extract_relations() reporting one anyway, before clause-boundary and
+        # per-item bounds were added -- see _extract_relations()'s docstring for the full case) --
+        ("an added trailing clause after a recognized keyword is not a value swap",
+         "The Boar is a creature found in the Meadows biome.",
+         "The Boar is a creature found in the Meadows biome, and is tameable.", False),
+        ("an incidental, keyword-free wording change (e.g. a renamed CSS class in the "
+         "underlying markup) must never be reported as a fact disagreement",
+         "Rendered with a tooltip using the icon-boar-alpha style.",
+         "Rendered with a tooltip using the icon-boar-beta style.", False),
     ]
     for desc, text_a, text_b, expected in cases:
         got = _sections_materially_differ(text_a, text_b)
