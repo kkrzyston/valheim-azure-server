@@ -302,6 +302,206 @@ class WikiClient:
         )
 
 
+# ---------------------------------------------------------------- mwparserfromhell rendering
+# Everything in this section takes parsed mwparserfromhell Wikicode, never a raw string -- the
+# one regex in the whole section (_WHITESPACE_RE) only collapses whitespace in already-rendered
+# plain text, never reads a template parameter or a number out of wikitext. See PLAN-v6.md's
+# warning that regex-over-wikitext is "the single failure mode most likely to make this whole
+# feature quietly useless" (it silently yields the template CALL where you expect a number).
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+_MENTION_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
+# A Private Use Area code point stands in for <br> while strip_code() runs, because strip_code()'s
+# own collapse=True (the default, and there is no good reason to turn it off) eats plain "; " --
+# confirmed empirically while building this script: replacing a <br> tag with the literal string
+# "; " survives code.replace() but strip_code() then collapses it right back down to a single
+# space, silently undoing the separator and running list-style infobox values together with no
+# punctuation at all (e.g. Leather Armor's "materials 2 = 6 [[Deer hide]]<br>5 [[Bone fragments]]"
+# rendering as "6 Deer hide 5 Bone fragments" instead of "...hide; 5 Bone..."). A PUA character is
+# never legitimate wikitext content, so this is a safe, unambiguous marker that strip_code() has
+# no punctuation-collapsing rule for.
+_BR_PLACEHOLDER = ""
+_BR_RUN_RE = re.compile(_BR_PLACEHOLDER + r"+")
+_STRAY_SEPARATOR_RE = re.compile(r"^\s*;\s*|\s*;\s*$", re.MULTILINE)
+
+
+def clean_wikicode(code) -> str:
+    """Render a parsed mwparserfromhell Wikicode fragment (a whole page, one section, or one
+    infobox parameter's value) down to plain prose, per PLAN-v6.md step 6's sanitize list:
+    HTML comments, <ref> tags, file/image links, and category links are removed outright (not
+    just their brackets -- mwparserfromhell's own strip_code() leaves a File: link's caption text
+    and a bare Category:Foo behind as visible prose, which is wrong for our purposes); <br> tags
+    become "; " so infobox list-style values (e.g. Boar's `drops` field, several wikilinks joined
+    by <br/>) stay readable instead of running together with no separator; ordinary wikilinks
+    reduce to their display text and templates are dropped by strip_code()'s own default behavior
+    (confirmed against real Fandom wikitext while building this script -- see this task's report).
+    Finally, whitespace collapses and any literal @everyone/@here is defused, mirroring
+    valheim-bot.py's own EVERYONE_RE backstop even though this text never reaches that bot's
+    system prompt as anything but clearly-labelled reference data (see PLAN-v6.md "The two rules
+    that make this safe").
+
+    Never raises on malformed input: mwparserfromhell's own parse is forgiving, and the loops here
+    only ever remove or replace nodes the parser already found -- there is no path that reads a
+    node this function did not itself enumerate."""
+    for tag in list(code.filter_tags(recursive=True)):
+        tag_name = str(tag.tag).strip().lower()
+        if tag_name == "ref":
+            try:
+                code.remove(tag)
+            except ValueError:
+                pass  # already removed as part of a larger node (e.g. an enclosing template)
+        elif tag_name in ("br", "br/"):
+            try:
+                code.replace(tag, _BR_PLACEHOLDER)
+            except ValueError:
+                pass
+
+    for link in list(code.filter_wikilinks(recursive=True)):
+        title = str(link.title).strip().lower()
+        if title.startswith(("file:", "image:", "category:")):
+            try:
+                code.remove(link)
+            except ValueError:
+                pass
+
+    text = code.strip_code(normalize=True, collapse=True)
+    text = _BR_RUN_RE.sub("; ", text)  # see _BR_PLACEHOLDER's comment above
+    text = _STRAY_SEPARATOR_RE.sub("", text)  # a <br> at the very start/end of a value/line
+    text = _MENTION_RE.sub(r"\1", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _BLANK_LINES_RE.sub("\n\n", text)
+    return text.strip()
+
+
+def render_infobox(template, tab_label: Optional[str] = None) -> str:
+    """Render one infobox template's parameters as readable `key: value` prose lines -- PLAN-v6.md
+    step 4: "the model reads prose, not wikitext." `template` is an mwparserfromhell Template node
+    whose name starts with "infobox" (see INFOBOX_NAME_PREFIX). `tab_label` is the tab this
+    infobox came from when it was nested inside {{InfoboxTabber}} (e.g. "Head" for Leather Armor's
+    helmet tab) -- PLAN-v6.md step 4's own example is "Protector Armor, Cast Helmet" staying
+    distinguishable, which this satisfies by heading the block with both the set/page title (the
+    infobox's own `title` param, falling back to the page context if absent) and the tab label.
+
+    Every parameter is emitted verbatim as `name: value`, including star-suffixed names like
+    "health 0star" and "damage 1star" (Boar-style creatures put per-level stats directly in the
+    parameter name rather than nesting a tab per level) -- this script does not attempt to
+    re-derive a friendlier key name, since the raw wiki parameter name is already the kind of
+    short, stable, greppable label a search index and a model both handle fine, and inventing a
+    renaming table is exactly the kind of scope this plan does not ask for."""
+    own_title = None
+    if template.has("title"):
+        own_title = clean_wikicode(template.get("title").value).strip() or None
+    header_bits = [b for b in (own_title, tab_label) if b]
+    header = "INFOBOX: " + " -- ".join(header_bits) if header_bits else "INFOBOX"
+
+    lines = [header]
+    for param in template.params:
+        name = str(param.name).strip()
+        if not name or name == "title":
+            continue  # already used in the header above
+        value = clean_wikicode(param.value).strip()
+        if not value:
+            continue  # PLAN-v6.md's example infoboxes leave many optional fields blank
+        lines.append(f"{name}: {value}")
+    return "\n".join(lines)
+
+
+def render_infobox_blocks(code) -> list:
+    """Find every infobox in `code` (an mwparserfromhell Wikicode for a whole page) and render
+    each to prose via render_infobox(), handling PLAN-v6.md step 4's two shapes:
+
+      1. A plain top-level `{{infobox ...}}` (e.g. Boar's `{{infobox creature}}`) -- one block,
+         no tab label.
+      2. `{{InfoboxTabber|Label1|{{infobox ...}}|Label2|{{infobox ...}}|...}}` (e.g. Leather
+         Armor's four armor pieces) -- InfoboxTabber's own params are positional label/content
+         pairs (confirmed against real Fandom wikitext: params "1","2","3","4" hold "Head",
+         the helmet's {{infobox armor}}, "Chest", the tunic's {{infobox armor}}, ...); each
+         content slot is re-parsed for its nested infobox template(s) and rendered with its
+         label from the immediately preceding positional slot.
+
+    Only TOP-LEVEL templates are considered for case 1 (mwparserfromhell's filter_templates(...,
+    recursive=False) already excludes anything nested inside another template), so an infobox
+    handled via case 2 is never also emitted, unlabelled, via case 1 -- recursive=False on the
+    outer scan means InfoboxTabber's own nested infoboxes never show up there at all. Returns a
+    list of rendered prose blocks in document order; empty if the page has no infobox."""
+    blocks = []
+    for template in code.filter_templates(recursive=False):
+        name = str(template.name).strip().lower()
+        if name == INFOBOX_TABBER_NAME:
+            params = template.params
+            for i in range(0, len(params) - 1, 2):
+                label = clean_wikicode(params[i].value).strip()
+                nested_code = mwparserfromhell.parse(str(params[i + 1].value))
+                for nested in nested_code.filter_templates(recursive=False):
+                    nested_name = str(nested.name).strip().lower()
+                    if nested_name.startswith(INFOBOX_NAME_PREFIX):
+                        blocks.append(render_infobox(nested, tab_label=label or None))
+        elif name.startswith(INFOBOX_NAME_PREFIX):
+            blocks.append(render_infobox(template))
+    return blocks
+
+
+def heading_and_body(section):
+    """Split one mwparserfromhell get_sections() result into (heading_text, body_wikicode).
+    heading_text is "" for the lead section (the part of the page before its first heading).
+
+    get_sections(include_headings=True) puts the Heading node itself as one of the section's own
+    nodes, so calling clean_wikicode() on the whole section -- as an early version of this script
+    did -- renders the heading's own words as the FIRST line of the section's body text too (e.g.
+    a "Gore" heading over one paragraph produced body text starting "Gore\\nSwings its head..."),
+    and worse, a heading whose only content is a template strip_code() drops entirely (Boar's
+    "Drops"/"Spawning" sections are 100% `{{drop table}}`/`{{spawn table}}` calls) then renders as
+    body text that is JUST the heading word repeated -- a record whose "text" field says "Drops"
+    and nothing else, which is worse than no record at all. This function removes the heading
+    node from the body before rendering it, so such a section's body text is correctly empty and
+    page_to_sections() drops the record rather than keeping a content-free one."""
+    headings = section.filter_headings()
+    if not headings:
+        return "", section
+    heading_node = headings[0]
+    heading_text = clean_wikicode(mwparserfromhell.parse(str(heading_node.title))).strip()
+    remaining_wikitext = "".join(str(n) for n in section.nodes if n is not heading_node)
+    return heading_text, mwparserfromhell.parse(remaining_wikitext)
+
+
+def page_to_sections(title: str, wikitext: str) -> list:
+    """Parse one page's wikitext into (heading, text) pairs, per PLAN-v6.md steps 4-5. The lead
+    section (heading "") carries the page's infobox rendering (if any) prepended to its prose,
+    since an infobox conceptually belongs with the page's opening description, not under whatever
+    heading happens to come textually first. Every other heading's section is its own (heading,
+    text) pair with no infobox content (render_infobox_blocks() only looks at TOP-LEVEL templates,
+    and by definition no infobox appears outside the lead in any real Valheim wiki page).
+
+    Sections whose rendered text is empty after sanitizing (e.g. a "Gallery" heading whose only
+    content was <gallery> image markup) are dropped -- an empty record is not reference material
+    for anything, and W2's search() has nothing to rank it against.
+
+    Raises whatever mwparserfromhell.parse()/get_sections() raises on genuinely malformed input;
+    callers (see ingest_pages()) are responsible for turning that into a logged skip, per this
+    script's failure policy -- this function itself makes no attempt to recover from a bad parse,
+    so a caller can tell "this page parsed to nothing" (empty list, not a failure) apart from
+    "this page could not be parsed at all" (an exception)."""
+    code = mwparserfromhell.parse(wikitext)
+    infobox_prose = "\n\n".join(render_infobox_blocks(code))
+
+    sections = code.get_sections(flat=True, include_lead=True, include_headings=True)
+    out = []
+    seen_lead = False
+    for section in sections:
+        heading, body_code = heading_and_body(section)
+        text = clean_wikicode(body_code)
+        if heading == "" and not seen_lead:
+            seen_lead = True
+            text = "\n\n".join(p for p in (infobox_prose, text) if p)
+        if text:
+            out.append((heading, text))
+    if not seen_lead and infobox_prose:
+        # A page whose entire body is templates (get_sections found no lead prose at all) still
+        # needs its infobox surfaced somewhere rather than silently dropped.
+        out.insert(0, ("", infobox_prose))
+    return out
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
