@@ -89,6 +89,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -1306,7 +1307,19 @@ def selftest() -> int:
     so this runs instantly and offline and so a future change that breaks one of these specific
     behaviors fails here immediately -- see this task's report for how each assertion was watched
     to actually fail (by temporarily reverting the corresponding rendering change) before being
-    confirmed passing again; an assertion never watched to fail is not a lock."""
+    confirmed passing again; an assertion never watched to fail is not a lock.
+
+    Review-fix coverage added afterward, same rule (each watched to fail first): a bare/autolinked
+    URL is stripped (H3); a header colspan degrades to generic labels instead of mis-attributing a
+    real number (H4); the navbox-exclusion fixture carries real parameters so deleting the "*nav"
+    exclusion actually fails the check (was previously vacuous -- see #4 in this task's report);
+    walk_allpages() routes missing/invalid/no-revisions/no-content drops through RunStats and logs
+    each at WARNING (H2), using a fake client so this needs no network; WikiClient.get() raises on
+    a non-maxlag MediaWiki API error instead of returning it silently (C1); and run()'s failure
+    policy is exercised end-to-end through the --offline seam with a FABRICATED args namespace (no
+    shelling out) -- a zero-page run leaves an existing corpus byte-unchanged and exits non-zero
+    (this is C1's actual bug), a >5%-unparsable fixture hard-fails and writes nothing, and a
+    just-under-5% fixture still exits 0 and writes every good page."""
     checks = []
 
     def check(name, condition):
@@ -1346,13 +1359,28 @@ def selftest() -> int:
     )
 
     # 3. An excluded (navbox/hatnote) template disappears cleanly; real prose is untouched.
-    navbox_page = "== Notes ==\nReal prose stays. {{TestThingNav}} {{For|a disambiguation note|Other Page}}\n"
+    #
+    # Tests review fix (#4): the original fixture was `{{TestThingNav}}` -- ZERO parameters -- so
+    # render_generic_template() would ALSO return "" for it regardless of whether the "*nav"-
+    # suffix exclusion in render_template() existed at all (render_generic_template() only emits
+    # a body when it has at least one param to show; see its own "if len(lines) > 1" check).
+    # Deleting the exclusion branch entirely left this assertion green. The fixture now carries
+    # real positional params ("Boars", "Wolves") that render_generic_template() WOULD surface if
+    # the "*nav" exclusion were ever removed (both are 5+ chars, so neither is skipped by that
+    # function's bare-short-positional heuristic either) -- see this task's report for this
+    # check watched to fail with the exclusion branch commented out, and pass again restored.
+    navbox_page = (
+        "== Notes ==\nReal prose stays. {{TestThingNav|Boars|Wolves}} "
+        "{{For|a disambiguation note|Other Page}}\n"
+    )
     navbox_sections = dict(page_to_sections("Test Navbox Page", navbox_page))
     notes_text = navbox_sections.get("Notes", "")
     check(
-        "excluded navbox/hatnote template leaves no trace, real prose survives",
+        "excluded navbox/hatnote template (with real params) leaves no trace, real prose survives",
         "Real prose stays" in notes_text
         and "TestThingNav" not in notes_text
+        and "Boars" not in notes_text
+        and "Wolves" not in notes_text
         and "disambiguation note" not in notes_text,
     )
 
@@ -1391,6 +1419,223 @@ def selftest() -> int:
         "rendering the same page twice produces identical output",
         page_to_sections("Test Beast", creature_page) == page_to_sections("Test Beast", creature_page),
     )
+
+    # 7. H3: a bare/autolinked URL is stripped; a bracketed link's own display text survives.
+    url_page = (
+        "== Links ==\nSee [http://x.example/y click here] and also http://another.example for "
+        "more.\n"
+    )
+    url_sections = dict(page_to_sections("Test URL Page", url_page))
+    links_text = url_sections.get("Links", "")
+    check(
+        "bare/autolinked URL is stripped from the corpus; a bracketed link's display text survives",
+        "click here" in links_text
+        and "http://another.example" not in links_text
+        and "another.example" not in links_text,
+    )
+
+    # 8. H4: a header colspan must not let a coincidental column-count match mis-attribute a
+    # label. There are only 2 physical <th> cells ("Fire", "Frost") and 2 physical <td> cells
+    # (25%, 50%) -- counts match -- but "Frost" is declared colspan="2", i.e. it visually spans
+    # BOTH data cells, so "Fire: 25%" (the old positional zip) is simply wrong: 25% is Frost's
+    # own first value, not Fire's.
+    colspan_page = (
+        "== Resist ==\n"
+        '{| class="wikitable"\n'
+        '! Fire !! colspan="2" | Frost\n'
+        "|-\n"
+        "| 25% || 50%\n"
+        "|}\n"
+    )
+    colspan_sections = dict(page_to_sections("Test Colspan Page", colspan_page))
+    resist_text = colspan_sections.get("Resist", "")
+    check(
+        "a header colspan degrades to generic Column-N labels instead of mis-attributing 'Fire: 25%'",
+        "Column 1: 25%" in resist_text and "Column 2: 50%" in resist_text
+        and "Fire: 25%" not in resist_text,
+    )
+
+    # 9-10. H2: walk_allpages() must route missing/invalid/no-revisions/no-content drops through
+    # RunStats -- and log each at WARNING with its title -- instead of a silent, unaccounted
+    # `continue`. A fake client stands in for WikiClient so this needs no network at all.
+    class _FakeAllpagesClient:
+        def __init__(self, pages):
+            self._pages = pages
+
+        def get(self, params):
+            return {"query": {"pages": self._pages}}  # no "continue" key -- one batch, then stop
+
+    class _ListLogHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    fake_pages = [
+        {"title": "Missing Page", "missing": True},
+        {"title": "Invalid Page", "invalid": True},
+        {"title": "No Revisions Page", "revisions": []},
+        {"title": "No Content Page", "revisions": [{"revid": 1, "timestamp": "2026-01-01T00:00:00Z"}]},
+        {
+            "title": "Good Page",
+            "revisions": [
+                {"revid": 2, "timestamp": "2026-01-01T00:00:00Z", "content": "Some prose."}
+            ],
+        },
+    ]
+    walk_stats = RunStats()
+    log_handler = _ListLogHandler()
+    _LOG.addHandler(log_handler)
+    try:
+        walk_results = list(walk_allpages(_FakeAllpagesClient(fake_pages), "fandom", walk_stats))
+    finally:
+        _LOG.removeHandler(log_handler)
+
+    check(
+        "walk_allpages() yields only the page with real content",
+        len(walk_results) == 1 and walk_results[0].title == "Good Page",
+    )
+    expected_dropped_titles = {
+        "Missing Page", "Invalid Page", "No Revisions Page", "No Content Page",
+    }
+    warned_titles = {
+        rec.args[0] for rec in log_handler.records
+        if rec.levelno == logging.WARNING and rec.args
+    }
+    check(
+        "walk_allpages() routes missing/invalid/no-revisions/no-content drops through RunStats "
+        "(counted in attempted/skipped) AND logs each at WARNING with its title",
+        walk_stats.attempted == 4
+        and walk_stats.skipped == 4
+        and set(walk_stats.skipped_titles) == expected_dropped_titles
+        and expected_dropped_titles <= warned_titles,
+    )
+
+    # 11. C1's "also fix that": a non-maxlag MediaWiki API error (HTTP 200 with an
+    # {"error": {...}} body) must raise, not come back looking like an ordinary empty-ish
+    # response that walk_allpages() would silently read as zero pages.
+    class _FakeErrorResponse:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"error": {"code": "readapidenied", "info": "You need read permission"}}
+
+    class _FakeErrorSession:
+        headers = {}
+
+        def get(self, url, params=None, timeout=None, stream=False):
+            return _FakeErrorResponse()
+
+    error_client = WikiClient("http://fake.example/api.php", "selftest-agent/1.0")
+    error_client._session = _FakeErrorSession()  # swap in the fake after __init__ wired a real one
+    raised_on_api_error = False
+    try:
+        error_client.get({"action": "query"})
+    except RuntimeError:
+        raised_on_api_error = True
+    check(
+        "WikiClient.get() raises on a non-maxlag MediaWiki API error instead of returning it silently",
+        raised_on_api_error,
+    )
+
+    # 12-14. C1: run()'s failure policy, exercised through the existing --offline seam with a
+    # FABRICATED args namespace (no shelling out, no real argparse.parse_args() call) -- this is
+    # what actually reproduces C1's real bug (a run that fetches nothing) and proves the fix, per
+    # this task's requirement that --offline "was built for this and never wired into a test."
+    def _fabricate_args(out_path, offline_dir, limit=None):
+        return argparse.Namespace(
+            out=out_path, limit=limit, offline=offline_dir, dump_path=None, contact=None,
+        )
+
+    def _write_fandom_fixture(fixture_dir, pages):
+        os.makedirs(fixture_dir, exist_ok=True)
+        with open(os.path.join(fixture_dir, "fandom.json"), "w", encoding="utf-8") as fh:
+            json.dump(pages, fh)
+
+    def _make_pages(total, bad_count):
+        # Titles starting "BadPage" are made to fail parsing by the monkeypatch below; the rest
+        # are ordinary one-line pages that page_to_sections() renders to exactly one record each.
+        return [
+            {
+                "title": (f"BadPage {i}" if i < bad_count else f"Good Page {i}"),
+                "wikitext": "Some prose here.",
+                "revid": i,
+                "timestamp": "2026-01-01T00:00:00Z",
+            }
+            for i in range(total)
+        ]
+
+    _original_page_to_sections = page_to_sections
+
+    def _page_to_sections_failing_on_badpage(title, wikitext):
+        # mwparserfromhell's own parse is, confirmed while building this task, forgiving of
+        # almost any input (even None/int coerce to a string rather than raising) -- there is no
+        # realistic wikitext string that reliably fails to parse. This monkeypatch of the
+        # module-level page_to_sections is what lets these tests deterministically fail a NAMED
+        # subset of fixture pages instead, exercising raw_pages_to_records()'s except/record_skip
+        # path exactly as a real parse failure would.
+        if title.startswith("BadPage"):
+            raise ValueError("synthetic parse failure injected by selftest")
+        return _original_page_to_sections(title, wikitext)
+
+    with tempfile.TemporaryDirectory(prefix="wiki-ingest-selftest-") as tmpdir:
+        # (a) C1's actual bug: an empty offline fixture dir (zero pages attempted anywhere, from
+        # either source) must leave a pre-existing --out file BYTE-UNCHANGED and exit non-zero --
+        # not silently os.replace() an empty corpus over it.
+        empty_dir = os.path.join(tmpdir, "empty_fixtures")
+        os.makedirs(empty_dir, exist_ok=True)
+        out_a = os.path.join(tmpdir, "a.jsonl")
+        original_bytes = b"PRE-EXISTING CORPUS -- must not be touched\n"
+        with open(out_a, "wb") as fh:
+            fh.write(original_bytes)
+        rc_a = run(_fabricate_args(out_a, empty_dir))
+        with open(out_a, "rb") as fh:
+            after_bytes = fh.read()
+        check(
+            "C1: a zero-page offline run exits non-zero and leaves an existing corpus byte-unchanged",
+            rc_a != 0 and after_bytes == original_bytes,
+        )
+
+        # (b) >5% unparsable pages: hard failure, writes nothing (pre-existing 5% threshold,
+        # unaffected by the new evidence floor since --offline pages clear it trivially at 10).
+        over_dir = os.path.join(tmpdir, "over_threshold")
+        _write_fandom_fixture(over_dir, _make_pages(total=10, bad_count=1))  # 1/10 = 10% > 5%
+        out_b = os.path.join(tmpdir, "b.jsonl")
+        globals()["page_to_sections"] = _page_to_sections_failing_on_badpage
+        try:
+            rc_b = run(_fabricate_args(out_b, over_dir))
+        finally:
+            globals()["page_to_sections"] = _original_page_to_sections
+        check(
+            ">5% unparsable pages hard-fails (exit non-zero) and writes nothing",
+            rc_b != 0 and not os.path.exists(out_b),
+        )
+
+        # (c) just under 5% unparsable: exits 0, writes every good page, and the skip is logged
+        # (not silently dropped) -- the ordinary, non-failure case must keep working.
+        under_total, under_bad = 21, 1  # 1/21 = 4.76% < 5%
+        under_dir = os.path.join(tmpdir, "under_threshold")
+        _write_fandom_fixture(under_dir, _make_pages(total=under_total, bad_count=under_bad))
+        out_c = os.path.join(tmpdir, "c.jsonl")
+        globals()["page_to_sections"] = _page_to_sections_failing_on_badpage
+        try:
+            rc_c = run(_fabricate_args(out_c, under_dir))
+        finally:
+            globals()["page_to_sections"] = _original_page_to_sections
+        wrote_all_good_pages = False
+        if os.path.exists(out_c):
+            with open(out_c, "r", encoding="utf-8") as fh:
+                wrote_all_good_pages = sum(1 for _ in fh) == (under_total - under_bad)
+        check(
+            "just-under-5% skip ratio exits 0 and writes every good page (skip logged, not dropped)",
+            rc_c == 0 and wrote_all_good_pages,
+        )
 
     ok = True
     for name, passed in checks:
