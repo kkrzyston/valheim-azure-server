@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """valheim-wiki-ingest.py -- offline ingestion of the Valheim Fandom and Weird Gloop wikis into
 wiki-records.jsonl, the flat per-heading corpus task W2's index build reads. See PLAN-v6.md
-(section "W1 -- Ingestion") for the authoritative spec; this docstring covers usage, not rationale.
+(sections "W1 -- Ingestion" and "W6 -- Close the dropped-template gap") for the authoritative
+spec; this docstring covers usage, not rationale.
 
 Run this in its OWN venv (requirements-ingest.txt), never inside the bot's runtime -- PLAN-v6.md's
 "Hard rules for every agent" is explicit that valheim-bot.py stays stdlib-only, and this script's
@@ -14,8 +15,13 @@ WHAT THIS DOES, IN ORDER (see PLAN-v6.md W1 for the numbered steps this mirrors)
                        live revision is newer than what the dump had for that exact title.
   3. Weird Gloop   -- the same batched allpages walk, covering all of its ns0 pages.
   4. Parse every page's wikitext with mwparserfromhell (never regex) and split it into per-heading
-     sections, rendering infobox templates -- including ones nested inside {{InfoboxTabber}} --
-     into readable "key: value" prose lines.
+     sections, rendering every DATA-BEARING template into readable "key: value" prose lines (not
+     just ones named "infobox*" -- W6 generalized this after finding that {{drop table}},
+     {{spawn table}}, {{loot table}} and inline {{Item link}} recipe/drop mentions were being
+     silently dropped; see render_template()'s dispatch and the EXCLUDED_TEMPLATE_NAMES /
+     ITEM_LINK_TEMPLATE_NAMES / ROW_TABLE_TEMPLATES constants for the survey backing each
+     category), and rendering every wikitable into one self-describing line per row so a number
+     never separates from the column label it belongs to (render_wikitable()).
   5. Sanitize each section's text (strip refs/comments/file-and-category links/@everyone/@here,
      collapse whitespace).
   6. Emit wiki-records.jsonl, one JSON object per line, sorted by (title, heading, source) so a
@@ -139,6 +145,50 @@ FAILURE_THRESHOLD = 0.05  # >5% of attempted pages failing to parse => hard fail
 # key/value data of its own. Matched by prefix, case-insensitively, on the template's own name.
 INFOBOX_NAME_PREFIX = "infobox"
 INFOBOX_TABBER_NAME = "infoboxtabber"
+
+# ---------------------------------------------------------------- template classification (W6)
+# W1 rendered ONLY templates whose name started with "infobox"; everything else fell through to
+# strip_code(), which drops a template's content outright. This is the survey-backed
+# classification that replaces that prefix check -- see this task's report for the full survey
+# (19 real pages across creatures/items/food/crafting stations/biomes on both wikis, every
+# top-level template counted). The three buckets below are checked in this order by
+# render_template(): excluded (render as nothing) > item-link (one inline "Name" or "Name xN") >
+# row-table wrapper (one line per nested row) > infobox/InfoboxTabber (existing render_infobox()) >
+# generic (fall back to the same "key: value" prose treatment infoboxes get, so an unrecognized
+# data template still surfaces its parameters instead of vanishing).
+#
+# EXCLUDED: presentational only -- navboxes, hatnotes, and the maintenance-banner families
+# PLAN-v6.md names explicitly. Survey-CONFIRMED by fetching each template's own source (all five
+# are either a Lua hatnote module or a #REDIRECT to a "*Nav" navbox template): "for", "creatures",
+# "biomes", "weapons", "armor". The "*nav" suffix rule below generalizes to every navbox found in
+# the survey (buildingnav, foodsnav, toolsnav, weaponsnav) AND to navboxes never sampled (a
+# "*Nav" name is Fandom's own naming convention for this template family, not a guess specific to
+# Valheim). "stub"/"cleanup"/"work in progress"/"wip"/"disambig" are NOT survey-confirmed (none of
+# the 19 sampled pages carried one) but are added defensively because PLAN-v6.md names this exact
+# category by name as noise to exclude; if that turns out wrong, deleting a line here is cheap.
+EXCLUDED_TEMPLATE_NAMES = frozenset({
+    "for", "creatures", "biomes", "weapons", "armor",  # survey-confirmed navbox/hatnote redirects
+    "stub", "cleanup", "work in progress", "wip", "disambig", "disambiguation",  # plan-named, not sampled
+})
+EXCLUDED_TEMPLATE_SUFFIXES = ("nav",)  # e.g. buildingnav, foodsnav, toolsnav, weaponsnav (all 4 in survey)
+
+# Survey-confirmed: 47 occurrences across 12/19 pages (by far the most common non-infobox
+# template), used both standalone in bullet lists ("* {{Item link|Entrails|4}}") and inside
+# wikitable cells (Forge's recipe-cost table). Renders inline as "Name" or "Name xN" -- see
+# render_item_link().
+ITEM_LINK_TEMPLATE_NAMES = frozenset({"item link"})
+
+# Survey-confirmed: the dominant "creature drops" / "spawn conditions" / "biome loot chance"
+# shape, found on every creature and biome page sampled (6 "drop table", 5 "spawn table", 4 "loot
+# table" -- 15 of 19 pages carried at least one). All three share one wikitext shape:
+# `{{X table|{{X row|k=v|...}}{{X row|k=v|...}}}}` -- a wrapper template with a single unnamed
+# param whose value is several sibling "X row" calls concatenated with only whitespace between
+# them, each row a flat set of named params. See render_row_table().
+ROW_TABLE_TEMPLATES = {
+    "drop table": "drop row",
+    "spawn table": "spawn row",
+    "loot table": "loot row",
+}
 
 _LOG = logging.getLogger("valheim-wiki-ingest")
 
@@ -333,26 +383,49 @@ _MENTION_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
 _BR_PLACEHOLDER = ""
 _BR_RUN_RE = re.compile(_BR_PLACEHOLDER + r"+")
 _STRAY_SEPARATOR_RE = re.compile(r"^\s*;\s*|\s*;\s*$", re.MULTILINE)
+# Some source wikitext already puts its own ", " before a <br> as the author's own list
+# separator (confirmed on Resistance's "Source for players" table: "[[X]] (Y),<br>[[Z]] (W)") --
+# combined with the <br>-> "; " substitution above, that doubles up into "Y),; Z" instead of the
+# intended "Y); Z". This collapses any run of 2+ adjacent comma/semicolon separators (with
+# whitespace between them) down to one "; ", regardless of which one is the placeholder-derived
+# semicolon and which is the source's own comma.
+_DOUBLE_SEPARATOR_RE = re.compile(r"[,;]\s*[,;]\s*")
 
 
 def clean_wikicode(code) -> str:
-    """Render a parsed mwparserfromhell Wikicode fragment (a whole page, one section, or one
-    infobox parameter's value) down to plain prose, per PLAN-v6.md step 6's sanitize list:
-    HTML comments, <ref> tags, file/image links, and category links are removed outright (not
-    just their brackets -- mwparserfromhell's own strip_code() leaves a File: link's caption text
-    and a bare Category:Foo behind as visible prose, which is wrong for our purposes); <br> tags
-    become "; " so infobox list-style values (e.g. Boar's `drops` field, several wikilinks joined
-    by <br/>) stay readable instead of running together with no separator; ordinary wikilinks
-    reduce to their display text and templates are dropped by strip_code()'s own default behavior
-    (confirmed against real Fandom wikitext while building this script -- see this task's report).
-    Finally, whitespace collapses and any literal @everyone/@here is defused, mirroring
-    valheim-bot.py's own EVERYONE_RE backstop even though this text never reaches that bot's
-    system prompt as anything but clearly-labelled reference data (see PLAN-v6.md "The two rules
-    that make this safe").
+    """Render a parsed mwparserfromhell Wikicode fragment (a whole page, one section, one
+    infobox/template parameter's value, or one wikitable cell -- this function is used
+    recursively at every one of those levels) down to plain prose, per PLAN-v6.md step 6's
+    sanitize list PLUS the W6 template/table rendering it composes with:
+
+      - <ref> tags and HTML comments are removed outright.
+      - <br> tags become "; " (via a placeholder, see _BR_PLACEHOLDER's comment) so list-style
+        values stay readable instead of running together with no separator.
+      - File/Image/Category wikilinks are removed outright (not just their brackets --
+        strip_code() alone leaves a File: link's caption text and a bare "Category:Foo" behind as
+        visible prose); every other wikilink reduces to its display text.
+      - Every wikitable (a `table` Tag node -- mwparserfromhell has no dedicated Table node class,
+        see render_wikitable()'s docstring) is replaced with its rendered "one self-describing
+        line per row" prose BEFORE strip_code() runs, so a table never reaches strip_code() as
+        raw markup for it to flatten into an unlabelled run of cells.
+      - Every TOP-LEVEL template (recursive=False -- nested templates, e.g. a "drop row" inside
+        its "drop table" wrapper or an "Item link" inside a wikitable cell, are handled by the
+        recursive clean_wikicode() calls render_template() and render_wikitable() make on their
+        own nested content, not by this outer scan) is replaced with render_template()'s result
+        BEFORE strip_code() runs, per W6: strip_code() on its own drops a template's content
+        entirely, which is exactly the bug this task exists to fix.
+      - Finally, whitespace collapses and any literal @everyone/@here is defused, mirroring
+        valheim-bot.py's own EVERYONE_RE backstop even though this text never reaches that bot's
+        system prompt as anything but clearly-labelled reference data (see PLAN-v6.md "The two
+        rules that make this safe").
 
     Never raises on malformed input: mwparserfromhell's own parse is forgiving, and the loops here
     only ever remove or replace nodes the parser already found -- there is no path that reads a
-    node this function did not itself enumerate."""
+    node this function did not itself enumerate. A replace()/remove() call whose target node was
+    already consumed as part of a larger replacement earlier in the same pass raises ValueError,
+    which every loop below catches and ignores rather than letting propagate -- see
+    raw_pages_to_records() for why an actual parse failure (not this) still needs to surface as an
+    exception rather than being swallowed here too."""
     for tag in list(code.filter_tags(recursive=True)):
         tag_name = str(tag.tag).strip().lower()
         if tag_name == "ref":
@@ -365,6 +438,11 @@ def clean_wikicode(code) -> str:
                 code.replace(tag, _BR_PLACEHOLDER)
             except ValueError:
                 pass
+        elif tag_name == "table":
+            try:
+                code.replace(tag, render_wikitable(tag))
+            except ValueError:
+                pass  # a table nested inside another table's cell -- already rendered by then
 
     for link in list(code.filter_wikilinks(recursive=True)):
         title = str(link.title).strip().lower()
@@ -374,8 +452,15 @@ def clean_wikicode(code) -> str:
             except ValueError:
                 pass
 
+    for template in list(code.filter_templates(recursive=False)):
+        try:
+            code.replace(template, render_template(template))
+        except ValueError:
+            pass  # already consumed as part of a larger replacement earlier in this same pass
+
     text = code.strip_code(normalize=True, collapse=True)
     text = _BR_RUN_RE.sub("; ", text)  # see _BR_PLACEHOLDER's comment above
+    text = _DOUBLE_SEPARATOR_RE.sub("; ", text)  # e.g. source's own ",<br>" doubling up with the above
     text = _STRAY_SEPARATOR_RE.sub("", text)  # a <br> at the very start/end of a value/line
     text = _MENTION_RE.sub(r"\1", text)
     text = _WHITESPACE_RE.sub(" ", text)
@@ -416,39 +501,189 @@ def render_infobox(template, tab_label: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-def render_infobox_blocks(code) -> list:
-    """Find every infobox in `code` (an mwparserfromhell Wikicode for a whole page) and render
-    each to prose via render_infobox(), handling PLAN-v6.md step 4's two shapes:
-
-      1. A plain top-level `{{infobox ...}}` (e.g. Boar's `{{infobox creature}}`) -- one block,
-         no tab label.
-      2. `{{InfoboxTabber|Label1|{{infobox ...}}|Label2|{{infobox ...}}|...}}` (e.g. Leather
-         Armor's four armor pieces) -- InfoboxTabber's own params are positional label/content
-         pairs (confirmed against real Fandom wikitext: params "1","2","3","4" hold "Head",
-         the helmet's {{infobox armor}}, "Chest", the tunic's {{infobox armor}}, ...); each
-         content slot is re-parsed for its nested infobox template(s) and rendered with its
-         label from the immediately preceding positional slot.
-
-    Only TOP-LEVEL templates are considered for case 1 (mwparserfromhell's filter_templates(...,
-    recursive=False) already excludes anything nested inside another template), so an infobox
-    handled via case 2 is never also emitted, unlabelled, via case 1 -- recursive=False on the
-    outer scan means InfoboxTabber's own nested infoboxes never show up there at all. Returns a
-    list of rendered prose blocks in document order; empty if the page has no infobox."""
+def render_infobox_tabber(template) -> str:
+    """Render `{{InfoboxTabber|Label1|{{infobox ...}}|Label2|{{infobox ...}}|...}}` (e.g. Leather
+    Armor's four armor pieces). InfoboxTabber's own params are positional label/content pairs
+    (confirmed against real Fandom wikitext: params "1","2","3","4" hold "Head", the helmet's
+    {{infobox armor}}, "Chest", the tunic's {{infobox armor}}, ...); each content slot is
+    re-parsed for its nested infobox template(s) and rendered via render_infobox() with its label
+    from the immediately preceding positional slot, so e.g. "Leather helmet -- Head" and "Leather
+    tunic -- Chest" stay distinguishable per PLAN-v6.md's own example ("Protector Armor, Cast
+    Helmet")."""
     blocks = []
-    for template in code.filter_templates(recursive=False):
-        name = str(template.name).strip().lower()
-        if name == INFOBOX_TABBER_NAME:
-            params = template.params
-            for i in range(0, len(params) - 1, 2):
-                label = clean_wikicode(params[i].value).strip()
-                nested_code = mwparserfromhell.parse(str(params[i + 1].value))
-                for nested in nested_code.filter_templates(recursive=False):
-                    nested_name = str(nested.name).strip().lower()
-                    if nested_name.startswith(INFOBOX_NAME_PREFIX):
-                        blocks.append(render_infobox(nested, tab_label=label or None))
-        elif name.startswith(INFOBOX_NAME_PREFIX):
-            blocks.append(render_infobox(template))
-    return blocks
+    params = template.params
+    for i in range(0, len(params) - 1, 2):
+        label = clean_wikicode(params[i].value).strip()
+        nested_code = mwparserfromhell.parse(str(params[i + 1].value))
+        for nested in nested_code.filter_templates(recursive=False):
+            nested_name = str(nested.name).strip().lower()
+            if nested_name.startswith(INFOBOX_NAME_PREFIX):
+                blocks.append(render_infobox(nested, tab_label=label or None))
+    return "\n\n".join(blocks)
+
+
+def render_item_link(template) -> str:
+    """{{Item link|Name}} or {{Item link|Name|amount}} (amount may also be the named param
+    `amount`/`qty` rather than positional) -- survey-confirmed the most common non-infobox
+    template on Valheim wiki pages (47 occurrences across 12 of 19 sampled pages), used both
+    standalone in bullet-list recipes ("* {{Item link|Entrails|4}}") and inside wikitable cells
+    (Forge's recipe-cost table). Renders as "Name" or "Name xN". Extra DISPLAY-only params
+    (`size=`, `nolink=`, seen on Leather Armor's wikitable icons) are ignored -- they only affect
+    the wiki's own icon/link styling, never mechanics, and are told apart from a positional amount
+    by name: a positional amount's mwparserfromhell param name is the literal digit "2" (its
+    position), while a named display param's name is a word."""
+    params = template.params
+    if not params:
+        return ""
+    name = clean_wikicode(params[0].value).strip()
+    amount = None
+    if template.has("amount"):
+        amount = clean_wikicode(template.get("amount").value).strip()
+    elif template.has("qty"):
+        amount = clean_wikicode(template.get("qty").value).strip()
+    elif len(params) > 1 and str(params[1].name).strip() == "2":
+        candidate = clean_wikicode(params[1].value).strip()
+        if candidate:
+            amount = candidate
+    return f"{name} x{amount}" if amount else name
+
+
+def render_row_table(template, row_template_name: str) -> str:
+    """Render a `{{X table|{{X row|k=v|...}}{{X row|k=v|...}}}}` wrapper -- survey-confirmed the
+    dominant "creature drops" / "spawn conditions" / "biome loot chance" shape (drop table/spawn
+    table/loot table, see ROW_TABLE_TEMPLATES; found on 15 of 19 sampled pages) -- as one line per
+    row, each row's own params rendered as "key: value, key: value" so a model reads a
+    self-contained fact per line (e.g. "item: Boar trophy, 0star: 15%, 1star: 15%, 2star: 15%")
+    instead of the nested blob strip_code() would otherwise erase completely. This is what puts a
+    creature's drops in its own record, attached to that creature, per PLAN-v6.md's W6 check.
+
+    `template`'s unnamed param value is a concatenation of several sibling `row_template_name`
+    calls with only whitespace between them (confirmed identical across drop table/spawn
+    table/loot table on real pages) -- re-parsed fresh as its own Wikicode so filter_templates()
+    can enumerate them; anything inside that value which is NOT a `row_template_name` call is
+    ignored rather than guessed at (lenient, not silently wrong)."""
+    label = str(template.name).strip().title()
+    lines = []
+    for param in template.params:
+        nested_code = mwparserfromhell.parse(str(param.value))
+        for row in nested_code.filter_templates(recursive=False):
+            if str(row.name).strip().lower() != row_template_name:
+                continue
+            bits = []
+            for p in row.params:
+                pname = str(p.name).strip()
+                pval = clean_wikicode(p.value).strip()
+                if pname and pval:
+                    bits.append(f"{pname}: {pval}")
+            if bits:
+                lines.append("- " + ", ".join(bits))
+    return label + ":\n" + "\n".join(lines) if lines else ""
+
+
+def render_generic_template(template) -> str:
+    """Fallback for any data-bearing template that is not one of the specifically-recognized
+    shapes above -- PLAN-v6.md W6's "render data-bearing templates generally rather than by an
+    infobox name prefix." Same "key: value" prose treatment render_infobox() already gives
+    infoboxes, so a template this script has not seen before still surfaces its parameters
+    (readable, if not beautifully labelled) instead of vanishing the way strip_code() alone would
+    drop it. A purely positional param whose value contains no other templates/links and is a
+    bare short token (e.g. {{cols|2|...}}'s leading "2", a column-count layout hint) is skipped --
+    that heuristic accepts the small risk of dropping a genuinely meaningful bare number in
+    exchange for not littering every generic-rendered template with layout noise; a param whose
+    value has any real content (prose, a link, a nested template) is never skipped by it."""
+    lines = [str(template.name).strip() + ":"]
+    for param in template.params:
+        name = str(param.name).strip()
+        value_code = param.value
+        is_positional = name.isdigit()
+        has_structure = bool(
+            value_code.filter_templates(recursive=False) or value_code.filter_wikilinks(recursive=False)
+        )
+        raw_len = len(str(value_code).strip())
+        if is_positional and not has_structure and raw_len <= 4:
+            continue  # bare short positional value, e.g. a layout hint -- see docstring
+        value = clean_wikicode(value_code).strip()
+        if value:
+            lines.append(f"{name}: {value}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def render_template(template) -> str:
+    """Dispatch for every TOP-LEVEL template clean_wikicode() finds (see its own docstring for why
+    this is recursive=False and how nested templates still get handled). Checked in this order:
+    excluded (presentational, render as nothing) -> item-link (one inline mention) -> row-table
+    wrapper (drop/spawn/loot table) -> infobox/InfoboxTabber -> generic key:value fallback. See
+    the EXCLUDED_TEMPLATE_NAMES/ITEM_LINK_TEMPLATE_NAMES/ROW_TABLE_TEMPLATES comments above this
+    module's constants for the survey backing each bucket."""
+    name = str(template.name).strip()
+    key = name.lower()
+    if key in EXCLUDED_TEMPLATE_NAMES or key.endswith(EXCLUDED_TEMPLATE_SUFFIXES):
+        return ""
+    if key in ITEM_LINK_TEMPLATE_NAMES:
+        return render_item_link(template)
+    if key in ROW_TABLE_TEMPLATES:
+        return render_row_table(template, ROW_TABLE_TEMPLATES[key])
+    if key == INFOBOX_TABBER_NAME:
+        return render_infobox_tabber(template)
+    if key.startswith(INFOBOX_NAME_PREFIX):
+        return render_infobox(template)
+    return render_generic_template(template)
+
+
+def render_wikitable(table_tag) -> str:
+    """Render one wikitable into one self-describing line per data row: "Header1: cell1,
+    Header2: cell2, ...". PLAN-v6.md W6: "a number without its label is worse than no number,
+    because it still reads as authoritative" -- this is what keeps e.g. Resistance's "200%"
+    attached to the damage type it applies to instead of floating free in run-on text.
+
+    mwparserfromhell has NO dedicated Table node class (confirmed while building this script,
+    version 0.7.2): a `{| ... |}` wikitable parses as a single Tag node with `tag == "table"`,
+    and its rows/cells parse as further Tag nodes (`tr`, `th`, `td`) nested inside it -- so
+    `table_tag` here is a Tag, walked via its own `.contents`, not a specialized table API.
+
+    Header labels come from the run of top-level `th` cells before any `tr` (the common shape:
+    a table's header row is often written without a leading `|-`, so those `th` cells sit as
+    direct siblings of the `tr` rows rather than inside one) -- confirmed against Resistance's own
+    "Source for players" table and Forge's recipe-cost table. A LATER `tr` made up entirely of
+    `th` cells is treated as a header row too (a table can redefine its columns partway through),
+    replacing the current header set for rows after it.
+
+    Column alignment is POSITIONAL (header index N labels data-cell index N) and does NOT account
+    for colspan/rowspan -- a cell's own colspan/rowspan attribute is not inspected. KNOWN, STATED
+    GAP (PLAN-v6.md W6 explicitly allows this): most Valheim wiki data tables (resistances, food
+    stats, drop tables rendered as tables) are simple colspan-free grids in practice, and exact
+    colspan/rowspan-aware alignment is a materially larger effort for a corpus that already gets
+    the common case's numbers correctly labelled. When a row's cell count does not match the
+    current header count, generic "Column N: value" labels are used instead of mis-attributing a
+    header to the wrong cell -- a wrong label would be worse than a generic one."""
+    headers = []
+    lines = []
+    for child in table_tag.contents.filter_tags(recursive=False):
+        tag_name = str(child.tag).strip().lower()
+        if tag_name == "th":
+            label = clean_wikicode(child.contents).strip()
+            if label:
+                headers.append(label)
+            continue
+        if tag_name != "tr":
+            continue  # e.g. "caption" -- not a data row, nothing to attach a label to
+        cells = [
+            c for c in child.contents.filter_tags(recursive=False)
+            if str(c.tag).strip().lower() in ("td", "th")
+        ]
+        if cells and all(str(c.tag).strip().lower() == "th" for c in cells):
+            headers = [clean_wikicode(c.contents).strip() for c in cells]
+            continue
+        values = [clean_wikicode(c.contents).strip() for c in cells]
+        if not any(values):
+            continue
+        if headers and len(headers) == len(values):
+            bits = [f"{h}: {v}" for h, v in zip(headers, values) if v]
+        else:
+            bits = [f"Column {i + 1}: {v}" for i, v in enumerate(values) if v]
+        if bits:
+            lines.append("- " + ", ".join(bits))
+    return "\n".join(lines)
 
 
 def heading_and_body(section):
@@ -475,40 +710,33 @@ def heading_and_body(section):
 
 
 def page_to_sections(title: str, wikitext: str) -> list:
-    """Parse one page's wikitext into (heading, text) pairs, per PLAN-v6.md steps 4-5. The lead
-    section (heading "") carries the page's infobox rendering (if any) prepended to its prose,
-    since an infobox conceptually belongs with the page's opening description, not under whatever
-    heading happens to come textually first. Every other heading's section is its own (heading,
-    text) pair with no infobox content (render_infobox_blocks() only looks at TOP-LEVEL templates,
-    and by definition no infobox appears outside the lead in any real Valheim wiki page).
+    """Parse one page's wikitext into (heading, text) pairs, per PLAN-v6.md steps 4-5. Every
+    section -- including the lead (heading "") -- is rendered by the same clean_wikicode() call,
+    which (as of W6) renders infoboxes, InfoboxTabber, drop/spawn/loot tables, Item link mentions
+    and wikitables all IN PLACE, wherever they actually sit in the page's own wikitext, rather
+    than the lead section needing special handling to collect and prepend an infobox rendering
+    separately (W1's original design): a page's infobox is, in every real Valheim wiki page
+    sampled, the very first thing in the lead anyway, so rendering it in place already produces
+    the same "infobox first" reading order as the old explicit-prepend did, with one fewer
+    special case.
 
     Sections whose rendered text is empty after sanitizing (e.g. a "Gallery" heading whose only
     content was <gallery> image markup) are dropped -- an empty record is not reference material
     for anything, and W2's search() has nothing to rank it against.
 
     Raises whatever mwparserfromhell.parse()/get_sections() raises on genuinely malformed input;
-    callers (see ingest_pages()) are responsible for turning that into a logged skip, per this
-    script's failure policy -- this function itself makes no attempt to recover from a bad parse,
-    so a caller can tell "this page parsed to nothing" (empty list, not a failure) apart from
-    "this page could not be parsed at all" (an exception)."""
+    callers (see raw_pages_to_records()) are responsible for turning that into a logged skip, per
+    this script's failure policy -- this function itself makes no attempt to recover from a bad
+    parse, so a caller can tell "this page parsed to nothing" (empty list, not a failure) apart
+    from "this page could not be parsed at all" (an exception)."""
     code = mwparserfromhell.parse(wikitext)
-    infobox_prose = "\n\n".join(render_infobox_blocks(code))
-
     sections = code.get_sections(flat=True, include_lead=True, include_headings=True)
     out = []
-    seen_lead = False
     for section in sections:
         heading, body_code = heading_and_body(section)
         text = clean_wikicode(body_code)
-        if heading == "" and not seen_lead:
-            seen_lead = True
-            text = "\n\n".join(p for p in (infobox_prose, text) if p)
         if text:
             out.append((heading, text))
-    if not seen_lead and infobox_prose:
-        # A page whose entire body is templates (get_sections found no lead prose at all) still
-        # needs its infobox surfaced somewhere rather than silently dropped.
-        out.insert(0, ("", infobox_prose))
     return out
 
 
