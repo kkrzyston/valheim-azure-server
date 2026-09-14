@@ -569,6 +569,108 @@ def join_reply():
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- Old Norse -> Elder Futhark
+# The model is instructed (SYSTEM_PROMPT's LANGUAGE block) to answer in Old Norse using plain
+# Latin letters ONLY -- it never types a rune. to_futhark() is the pure, deterministic transform
+# that turns that Latin-letter Old Norse into the Elder Futhark line shown above it. Keeping this
+# out of the model keeps the runes consistent (no per-reply drift in which rune stands for what)
+# and keeps token cost off the deployment's 20K TPM ceiling -- runes are never part of the prompt
+# or the completion, only a post-processing step applied to text the model already returned.
+#
+# Elder Futhark has 24 runes and cannot represent everything Latin-orthography Old Norse can, so
+# a handful of normalizations collapse before mapping (vowel length is not distinguished; ð and þ
+# share one rune; c/q collapse to k; v to w; x expands to k+s; the "th" digraph some non-native
+# typing falls back to also becomes þ). Every other character -- punctuation, digits, markdown,
+# anything with no rune -- passes through completely unchanged.
+FUTHARK_RUNES = {
+    "f": "ᚠ", "u": "ᚢ", "þ": "ᚦ", "a": "ᚨ", "r": "ᚱ", "k": "ᚲ",
+    "g": "ᚷ", "w": "ᚹ", "h": "ᚺ", "n": "ᚾ", "i": "ᛁ", "j": "ᛃ",
+    "ï": "ᛇ", "p": "ᛈ", "z": "ᛉ", "s": "ᛊ", "t": "ᛏ", "b": "ᛒ",
+    "e": "ᛖ", "m": "ᛗ", "l": "ᛚ", "ŋ": "ᛜ", "d": "ᛞ", "o": "ᛟ",
+}
+
+# Vowel-length and letter-inventory normalization applied BEFORE the rune lookup above -- Elder
+# Futhark has no separate letters for any of these, so they all collapse onto a base-24 letter.
+# ("x" -> "ks" is handled as a string substitution before this table, since it is one-to-many.)
+_FUTHARK_NORM = {
+    "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ý": "u",
+    "æ": "a", "ø": "o", "ǫ": "o", "ö": "o", "y": "u",
+    "ð": "þ", "c": "k", "q": "k", "v": "w",
+}
+
+# Carve-outs: spans that MUST reach the output byte-for-byte, never rune-mapped, because either
+# runes cannot represent them (numbers, IPs, timestamps, Discord's own mention syntax) or runing
+# them would destroy the one piece of information the reply carries (a code span the model was
+# told to wrap a literal value or exact on-screen string in -- see SYSTEM_PROMPT and join_reply()).
+# Tried in this order at each position:
+#   1. a fenced code block (```...```, DOTALL so it can span lines)
+#   2. an inline code span (`...`)
+#   3. a URL (http:// or https://)
+#   4. a Discord mention/channel reference (<@123>, <@!123>, <@&123>, <#123>)
+#   5. any maximal run of non-space characters that contains at least one digit -- this is what
+#      catches IPs, ports, dates, and timestamps like "17:42" without needing its own pattern for
+#      each shape, since all of those are, syntactically, "a token with a digit in it."
+# Plain markdown syntax (*, _, **, #, >, "- " bullets) needs no entry here: those characters have
+# no rune mapping at all, so the per-character loop below already leaves them untouched.
+_FUTHARK_PROTECTED_RE = re.compile(
+    r"```.*?```"
+    r"|`[^`]*`"
+    r"|https?://\S+"
+    r"|<[@#][!&]?\d+>"
+    r"|\S*\d\S*",
+    re.DOTALL,
+)
+
+
+def _futhark_segment(segment):
+    """Transliterate one already-unprotected chunk of text. Case-insensitive (runes have no
+    case); anything left over after normalization that still has no rune mapping -- punctuation,
+    whitespace, an unanticipated character -- passes through unchanged rather than being dropped
+    or raising, per the spec for this function."""
+    s = segment.lower()
+    s = re.sub(r"ck", "k", s)
+    s = re.sub(r"th", "þ", s)
+    s = s.replace("x", "ks")
+    out = []
+    for ch in s:
+        mapped = _FUTHARK_NORM.get(ch, ch)
+        out.append(FUTHARK_RUNES.get(mapped, ch))
+    return "".join(out)
+
+
+def to_futhark(text):
+    """Pure, no I/O, no deps. Runs the carve-out regex over `text` first and leaves every
+    protected span exactly as written; everything in between is transliterated a character at a
+    time by _futhark_segment(). See _FUTHARK_PROTECTED_RE's comment for what is protected and
+    why."""
+    out = []
+    pos = 0
+    for m in _FUTHARK_PROTECTED_RE.finditer(text):
+        if m.start() > pos:
+            out.append(_futhark_segment(text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    if pos < len(text):
+        out.append(_futhark_segment(text[pos:]))
+    return "".join(out)
+
+
+def norse_reply(old_norse_text):
+    """The on-screen shape for every reply: the Elder Futhark line first, then the same sentence
+    in Old Norse Latin orthography beneath it -- see this task's brief for the exact shape. Used
+    for both the model path (call_ai_sync's Old Norse answers) and the fixed canned strings
+    below; never used when the English escape hatch (ENGLISH_RE) is active for a reply."""
+    return to_futhark(old_norse_text) + "\n" + old_norse_text
+
+
+# ---------------------------------------------------------------- fixed Old Norse replies
+# These never touch the model -- see each call site. Short, idiomatic-effort Old Norse, rendered
+# through norse_reply() like everything else.
+EMPTY_QUESTION_REPLY = norse_reply("Spyr mik einhvers -- um höllina, víking, eða heiðr.")
+RATE_LIMIT_REPLY = norse_reply("Hægar -- ein spurning á 10 sekúndum, hámark á hverri stund.")
+AI_FAILURE_REPLY = norse_reply("Brunnrinn þvarr -- náði ekki til véfréttar núna. Reyn aftur brátt.")
+
+
 def sanitize_output(text):
     """Backstop: allowed_mentions=none() already stops Discord from acting on a mention, but the
     model will eventually type the literal text anyway, so strip it too."""
