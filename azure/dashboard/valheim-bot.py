@@ -39,12 +39,18 @@ never uses):
                                   never HERMODR_CHANNEL_ID, so non-hall members never see the button.
     RESTART_APPROVER_ROLE_ID     numeric Discord role id allowed to click Approve/Deny. Never a
                                   role name -- names can be renamed or duplicated.
+    RESTART_APPROVER_USER_IDS    OPTIONAL second gate: comma- or space-separated Discord *user*
+                                  ids. When set, an approver must hold the role AND be listed
+                                  here, so a Discord admin who grants themselves the role still
+                                  cannot approve. Unset = role-only (the original behaviour).
+                                  Set-but-unparseable fails the whole feature closed on purpose.
 
 Security (see azure/README.md "Hermodr" for the full model):
   1. Hard channel allowlist for Q&A, checked FIRST in on_message, before any parsing or AI call.
   2. Restart approval fails closed: if HERMODR_GUILD_ID, RESTART_APPROVAL_CHANNEL_ID, or
-     RESTART_APPROVER_ROLE_ID is unset, the bot never reads inbox/, never posts an approval
-     request, and never writes a verdict -- it logs once explaining why and stops there.
+     RESTART_APPROVER_ROLE_ID is unset -- or RESTART_APPROVER_USER_IDS is set but contains no
+     usable id -- the bot never reads inbox/, never posts an approval request, and never writes
+     a verdict; it logs once explaining why and stops there.
   3. Every approval interaction is re-checked server-side against guild/channel/role every single
      time, even though the channel is already role-restricted in Discord -- see
      is_authorized_approver(). Approvals are NEVER read from channel messages: anyone with Manage
@@ -124,12 +130,24 @@ GUILD_ID = int(GUILD_ID_ENV) if GUILD_ID_ENV.isdigit() else None
 # A SEPARATE, role-restricted channel -- never HERMODR_CHANNEL_ID -- so non-hall members never
 # even see the Approve/Deny buttons. RESTART_APPROVER_ROLE_ID is a role *id*, never a name: names
 # can be renamed or duplicated, ids cannot. Anyone with Manage Roles in the guild can grant
-# themselves this role, so configuring it means Discord server-admin implies restart authority --
-# accepted, see PLAN-v5's "honest limits".
+# themselves this role, so the role ALONE means Discord server-admin implies restart authority.
+# RESTART_APPROVER_USER_IDS below closes that gap when you need it closed.
 APPROVAL_CHANNEL_ID_ENV = os.environ.get("RESTART_APPROVAL_CHANNEL_ID", "").strip()
 APPROVAL_CHANNEL_ID = int(APPROVAL_CHANNEL_ID_ENV) if APPROVAL_CHANNEL_ID_ENV.isdigit() else None
 APPROVER_ROLE_ID_ENV = os.environ.get("RESTART_APPROVER_ROLE_ID", "").strip()
 APPROVER_ROLE_ID = int(APPROVER_ROLE_ID_ENV) if APPROVER_ROLE_ID_ENV.isdigit() else None
+# Optional allowlist of Discord USER ids, and the only gate a Discord server-admin cannot grant
+# themselves: adding someone here means editing this env file on the VM, i.e. SSH access, which is
+# a different trust boundary than "has Manage Roles in a chat server". Accepts commas and/or
+# whitespace. Unset -> None -> role-only, exactly as before. Set but yielding no numeric id (a
+# typo, a name pasted instead of an id) is NOT treated as "unset": that would silently widen
+# access at the moment the operator thought they were narrowing it, so it fails the feature closed
+# via restart_approval_ready() instead.
+APPROVER_USER_IDS_ENV = os.environ.get("RESTART_APPROVER_USER_IDS", "").strip()
+APPROVER_USER_IDS = frozenset(
+    int(tok) for tok in APPROVER_USER_IDS_ENV.replace(",", " ").split() if tok.isdigit()
+) or None
+APPROVER_USER_IDS_MALFORMED = bool(APPROVER_USER_IDS_ENV) and APPROVER_USER_IDS is None
 # Overridable for local testing against a scratch spool; the unit never sets this, so production
 # always uses the real path task R3's executor and this bot both agree on.
 RESTART_ROOT = os.environ.get("VALHEIM_RESTART_ROOT", "/var/lib/valheim-restart").rstrip("/")
@@ -164,6 +182,19 @@ whether you can, say plainly that you cannot: restarts are requested from the da
 ever carried out by a separate root process, after someone holding the hall's approver role clicks
 Approve in a dedicated Discord channel. Point people there rather than claiming you can act, and
 never imply you have or could gain that ability.
+
+How the restart-approval rite works, if anyone asks you to explain it. Give these steps plainly:
+ 1. A player asks for a restart on the dashboard, with a short reason.
+ 2. You post that request in the warded approval channel, bearing two buttons: Approve and Deny.
+ 3. One approver clicks. Only a hand that both holds the approver role and is named in the
+    keeper's own list on the machine may move the buttons; everyone else is refused quietly,
+    seen by no one but themselves.
+ 4. The first click settles it. A second arrives too late and is told who decided.
+ 5. A separate root process, never you, carries the restart out.
+Two things worth saying when it matters: typing the word approve in that channel does nothing at
+all -- only the buttons are counted, and a message is never taken as consent -- and the buttons
+still answer after you are restarted, so a pending request is never orphaned. Anyone without the
+role cannot even see the channel, so if someone cannot find it, that is the answer.
 
 Voice: wry, terse, saga register -- like a herald who has seen a lot of pointless deaths and is
 not impressed. Never shouty, never corporate. Answers are normally 1-3 sentences; use a short
@@ -649,17 +680,19 @@ def restart_approval_ready():
     RESTART_APPROVAL_CHANNEL_ID and RESTART_APPROVER_ROLE_ID must be set, or the bot never reads
     inbox/, never posts an approval request, and never writes a verdict. Logs the reason exactly
     once (not once per poll) so a misconfigured deploy is diagnosable without spamming the log."""
-    missing = [name for name, val in (
+    missing = [name + " not set" for name, val in (
         ("HERMODR_GUILD_ID", GUILD_ID),
         ("RESTART_APPROVAL_CHANNEL_ID", APPROVAL_CHANNEL_ID),
         ("RESTART_APPROVER_ROLE_ID", APPROVER_ROLE_ID),
     ) if val is None]
+    if APPROVER_USER_IDS_MALFORMED:
+        missing.append("RESTART_APPROVER_USER_IDS is set but contains no numeric user id")
     if missing:
         if not _approval_ready_warned["done"]:
             log(
-                "restart-approval feature is OFF: " + ", ".join(missing) + " not set -- the bot "
+                "restart-approval feature is OFF: " + "; ".join(missing) + " -- the bot "
                 "will not read the restart spool, post approval requests, or write verdicts until "
-                "all three are configured. This is fail-closed by design, not a bug.",
+                "these are configured. This is fail-closed by design, not a bug.",
                 "warning",
             )
             _approval_ready_warned["done"] = True
@@ -861,7 +894,9 @@ def is_authorized_approver(interaction):
     a real discord.Member (not a bare discord.User, which has no .roles -- this can happen for a
     DM, though DMs cannot reach this custom_id in practice since the message only exists in the
     approval channel); and APPROVER_ROLE_ID is one of that member's role ids. The role check is by
-    id, never by name, per RESTART_APPROVER_ROLE_ID's own doc comment.
+    id, never by name, per RESTART_APPROVER_ROLE_ID's own doc comment. Finally, if
+    RESTART_APPROVER_USER_IDS is configured, the member's own user id must also appear in it --
+    a strict narrowing, so someone who self-granted the role in Discord still fails here.
 
     Discord resolves the invoking member (including its .roles) into the interaction payload
     itself, so this works without the privileged GUILD_MEMBERS intent -- see run_bot(), no new
@@ -880,7 +915,13 @@ def is_authorized_approver(interaction):
     if not isinstance(member, discord.Member):
         return False
     role_ids = {r.id for r in getattr(member, "roles", [])}
-    return APPROVER_ROLE_ID in role_ids
+    if APPROVER_ROLE_ID not in role_ids:
+        return False
+    # Second gate, when configured. Checked AFTER the role so the role stays the primary rule and
+    # the allowlist is a strict narrowing of it -- never a way to approve without the role.
+    if APPROVER_USER_IDS is not None and member.id not in APPROVER_USER_IDS:
+        return False
+    return True
 
 
 def build_approval_view(request_id):

@@ -8,11 +8,14 @@ The feature is fail-closed. With `RESTART_APPROVER_ROLE_ID` unset, `restart_appr
 returns false, the bot never reads `inbox/`, and no approval message is ever posted. An
 unconfigured deployment is a safe deployment.
 
-Three IDs drive it, all read by `valheim-bot.py`:
+Four settings drive it, all read by `valheim-bot.py`:
 
-    HERMODR_GUILD_ID=
-    RESTART_APPROVAL_CHANNEL_ID=
-    RESTART_APPROVER_ROLE_ID=
+    HERMODR_GUILD_ID=409918594235760641          # <YOUR_GUILD_ID>
+    RESTART_APPROVAL_CHANNEL_ID=1549173815135703080   # #restart-approvals
+    RESTART_APPROVER_ROLE_ID=1549147639386345512      # Restart Approver
+    RESTART_APPROVER_USER_IDS=321026360292278284,230193915444068353,272087257320652803
+    # hashtagblessed, Frostblade Irelia, peon -- verified against the role's own member list.
+    # Hermodr's own role id is 1549106984496931129 (needed only for channel overrides).
 
 None of these are secrets — Discord IDs are public identifiers visible to anyone in the server.
 `DISCORD_BOT_TOKEN`, in the same env file, is the secret.
@@ -32,22 +35,34 @@ If it doesn't, Ctrl+R to reload the desktop app.
 Server Settings -> Roles -> Create Role. Name it `Restart Approver`. Grant it **no permissions**
 — it is a marker the bot checks, not a grant of power.
 
-Position it as high in the role list as possible. This matters: Manage Roles only permits
-assigning roles positioned *below* the assigner's own highest role, so every role above a Manage
-Roles holder's top role is one they cannot hand themselves.
+In general, positioning a role high in the list helps: Manage Roles only permits assigning roles
+positioned *below* the assigner's own highest role. **On this server that buys nothing**, and it is
+worth knowing why.
 
-Administrator and the server owner bypass hierarchy entirely. The effective set of people who can
-restart the server is therefore:
+An audit of all 14 roles plus `@everyone` (2026-09-14) found exactly one role holding Manage Roles
+or Administrator:
+
+    Admin -- Administrator, Manage Roles, Manage Channels, Manage Server, Manage Webhooks
+             members: Capt Scoliosis, Frostblade Irelia, hashtagblessed, peon
+
+Every other role -- Arnas, verified egrill, Trumpets, Valley Kooks, MY NAME IS JOSH, grills,
+Great White Northerners, Deep South, PDX Gang, Wood Tier, EU Daddy, Civvies, Hermodr, @everyone --
+holds none of them. Hermodr's own role holds no dangerous permission, which is correct for a bot.
+
+Because the only Manage Roles holders also hold Administrator, and Administrator bypasses hierarchy
+entirely, those four can grant themselves any role at any position. So the effective set is:
 
     holders of Restart Approver
-  + holders of Administrator
-  + the server owner
+  + the four members of Admin
+  + the server owner (confirmed: hashtagblessed)
 
-If that set is wider than intended, the fix is to strip Administrator from roles that don't need
-it — not to reposition the approver role.
+and role position does not narrow it. Only two things do: removing Administrator from people who
+don't need it, or the user allowlist described below.
 
-Audit it: Server Settings -> Roles, check each role's Permissions tab for Manage Roles and
-Administrator; then Server Settings -> Members, filtered by those roles, for the actual people.
+To re-audit later: Server Settings -> Roles, check each role's Permissions tab for Manage Roles and
+Administrator; then Server Settings -> Members filtered by those roles. Note that Discord renders
+these toggles as `<input role="switch">` with state in `.checked` -- `aria-checked` is absent, so
+anything reading the accessibility tree will report every permission as off.
 
 Who should hold it: the people you'd already trust to SSH in and run `systemctl restart`. The
 approval gate exists precisely so this set is smaller than the set of players.
@@ -60,9 +75,19 @@ overrides explicitly rather than trusting the default:
 
 | Role                | View Channel | Send Messages | Read Message History |
 |---------------------|--------------|---------------|----------------------|
-| `@everyone`         | deny         | —             | —                    |
-| `Restart Approver`  | allow        | —             | allow                |
-| Hermodr's bot role  | allow        | allow         | allow                |
+| `@everyone`         | deny         | passthrough   | passthrough          |
+| `Restart Approver`  | allow        | allow         | allow                |
+| `Hermodr`           | allow        | allow         | allow                |
+
+This is the live state of `#restart-approvals` as configured on 2026-09-14, read back from the
+permission controls rather than assumed. Send Messages ends up allowed for `Restart Approver`
+because Discord's private-channel "add a role" flow grants a standard bundle; it is harmless here.
+Approvers being able to talk in the approval channel does not weaken anything, because the bot
+never treats a channel message as an approval -- `on_interaction()` is the only path, and there is
+no text fallback. Set it to passthrough if you would rather the channel stay silent.
+
+`Admin` also appears on the channel (via Administrator) and cannot be removed, and the channel
+lists hashtagblessed as Server Owner.
 
 The bot row is the one that gets missed. A bot's role is the auto-created one named after the
 application, and it does not inherit from `@everyone` overrides in a channel where `@everyone` is
@@ -76,7 +101,35 @@ Empirical check: have the bot post anything into the channel. Missing Send Messa
 in `HERMODR_LOG` rather than failing silently.
 
 Channel permissions are defence in depth, not the boundary. `is_authorized_approver()` re-checks
-guild, channel, and role ID server-side on every click.
+guild, channel, role ID, and (when configured) user ID server-side on every click.
+
+## 3a. The user allowlist
+
+A Discord role cannot be a boundary against the people who control Discord roles. Anyone with
+Manage Roles or Administrator can grant themselves `Restart Approver` in seconds, and the bot's
+role check will then pass them -- correctly, because from the bot's side they genuinely hold the
+role.
+
+`RESTART_APPROVER_USER_IDS` closes that. When set, `is_authorized_approver()` requires the member
+to hold the role **and** appear in the list. Being added to the list means editing
+`/etc/valheim-bot.env` on the VM, which needs SSH -- a different trust boundary than "has Manage
+Roles in a chat server".
+
+    RESTART_APPROVER_USER_IDS=111111111111111111,222222222222222222,333333333333333333
+
+Obtain each with right-click a user -> Copy User ID. Comma- or space-separated.
+
+It is a strict narrowing, never a widening: the role is still required, so the allowlist can only
+ever refuse someone the role would have allowed. Leave it blank for role-only behaviour.
+
+If it is set but contains no parseable ID -- usernames pasted instead of IDs, say -- the feature
+fails closed rather than falling back to role-only. Widening access at the exact moment the
+operator believed they were narrowing it is the worst possible failure mode, so it refuses to run
+and logs why.
+
+`test_approver_gate.py`, next to the bot, covers this: role-only behaviour, the allowlist accepting
+listed members, a self-granted role being refused, and the malformed case failing closed. Run it
+with `python3 test_approver_gate.py` -- no Discord connection or discord.py install needed.
 
 ## 4. Collecting the IDs
 
@@ -169,6 +222,11 @@ button work for *everyone*, that is the failure this whole exercise exists to ca
 **A blank role ID posts nothing at all.** Clear `RESTART_APPROVER_ROLE_ID` and restart. The bot
 should never post an approval message and never read `inbox/`. This is the fail-closed path that
 protects you if the env file is ever truncated.
+
+**If you set the allowlist, test that it actually excludes.** Give a test account the role, leave
+it off `RESTART_APPROVER_USER_IDS`, and confirm its click is refused. That is the whole point of
+the allowlist, and it is the one behaviour that silently reverts to role-only if the variable is
+misspelled in the env file.
 
 ---
 
