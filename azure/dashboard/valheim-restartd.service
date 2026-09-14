@@ -61,6 +61,12 @@ ProtectHostname=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete @mount @debug @clock @cpu-emulation @module @raw-io @reboot @swap
+# chown/fchown/fchownat/lchown live in @privileged, so the deny above blocks them -- and this
+# process must chgrp its own socket to the caddy group or Caddy cannot reach it and the restart
+# button is dead. Re-allowed deliberately: unprivileged chown can only ever retarget a file this
+# process already owns to a group it already belongs to (caddy, via SupplementaryGroups=).
+# Found on the VM -- it cannot be reproduced without systemd.
+SystemCallFilter=chown fchown fchownat lchown
 SystemCallErrorNumber=EPERM
 
 # The only writable path is the spool it creates request files in (mode 1730: create-by-name, no
