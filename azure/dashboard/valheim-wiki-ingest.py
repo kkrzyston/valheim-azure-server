@@ -56,9 +56,12 @@ USAGE:
                        `read_offline_fixtures()` below for the exact file layout DIR must have.
                        Exists so this script's behavior (parsing, sanitizing, sorting, the failure
                        policy) can be verified in an environment with no network access, or in CI.
-    --dump-path PATH   Reuse an already-downloaded copy of the Fandom .xml.7z dump instead of
-                       fetching it again -- handy while iterating locally. Skipped entirely when
-                       --offline is given.
+    --dump-path PATH   Reuse an already-DECOMPRESSED copy of the Fandom dump's XML (not the .7z
+                       archive) instead of downloading and decompressing it again -- handy while
+                       iterating locally. If PATH exists, it is read as-is and nothing is fetched;
+                       if it does not exist, the dump is downloaded and decompressed straight to
+                       PATH, so a second run with the same --dump-path reuses it. Meaningless with
+                       --offline (which touches no dump file, decompressed or not).
     --contact TEXT     Overrides the contact string embedded in the descriptive User-Agent (see
                        BASE_USER_AGENT below) sent with every live HTTP request. Also settable via
                        the WIKI_INGEST_CONTACT environment variable (this flag wins if both are
@@ -777,7 +780,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--dump-path", metavar="PATH", default=None,
-        help="reuse an already-downloaded Fandom .xml.7z dump instead of fetching it",
+        help="path to cache the decompressed Fandom dump XML at, or reuse it from if present",
     )
     p.add_argument("--contact", default=None, help="override the User-Agent contact token")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
