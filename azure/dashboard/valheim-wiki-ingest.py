@@ -502,6 +502,248 @@ def page_to_sections(title: str, wikitext: str) -> list:
     return out
 
 
+# ---------------------------------------------------------------- Fandom bulk dump (PLAN-v6.md step 1)
+def _local_tag(tag: str) -> str:
+    """Strip an ElementTree tag's namespace prefix ("{uri}name" -> "name"). MediaWiki's export
+    schema version (currently 0.11, "http://www.mediawiki.org/xml/export-0.11/", confirmed against
+    the real published dump while building this script) is deliberately never hardcoded here, so
+    a future export-version bump does not silently break parsing the way matching the literal
+    namespaced tag string would."""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def iter_dump_pages(path: str, limit: Optional[int] = None) -> Iterator[RawPage]:
+    """Stream-parse a decompressed MediaWiki export XML file (the Fandom bulk dump) via
+    ElementTree.iterparse, yielding one RawPage per ns0 page and clearing each <page> element as
+    soon as it is consumed so memory use stays bounded by roughly one page at a time rather than
+    the whole file (the current dump decompresses to ~9 MB, comfortably fine either way, but a
+    future larger dump should not require rewriting this).
+
+    A "pages_current" dump element can, per the export schema, carry more than one <revision> --
+    in practice this dump has exactly one, but if that ever changes the LAST <revision> under the
+    <page> is used, since that is the one "current" describes."""
+    count = 0
+    for _, elem in ET.iterparse(path, events=("end",)):
+        if _local_tag(elem.tag) != "page":
+            continue
+        try:
+            title = None
+            ns_text = None
+            revisions = []
+            for child in elem:
+                local = _local_tag(child.tag)
+                if local == "title":
+                    title = child.text or ""
+                elif local == "ns":
+                    ns_text = child.text
+                elif local == "revision":
+                    revisions.append(child)
+            if (ns_text or "").strip() != "0" or not title or not revisions:
+                continue
+            revision = revisions[-1]
+            revid, timestamp, wikitext = 0, "", None
+            for rchild in revision:
+                rlocal = _local_tag(rchild.tag)
+                if rlocal == "id":
+                    revid = int(rchild.text) if rchild.text and rchild.text.strip().isdigit() else 0
+                elif rlocal == "timestamp":
+                    timestamp = rchild.text or ""
+                elif rlocal == "text":
+                    wikitext = rchild.text or ""
+            if wikitext is None:
+                continue
+            yield RawPage(title=title, wikitext=wikitext, revid=revid, timestamp=timestamp, source="fandom")
+            count += 1
+            if limit is not None and count >= limit:
+                return
+        finally:
+            elem.clear()
+
+
+def download_fandom_dump(client: "WikiClient", dest_path: str):
+    """Fetch the published Fandom bulk dump (a plain S3 GET, not the MediaWiki API -- no maxlag,
+    no query params, just a descriptive User-Agent) and decompress it in place with py7zr. Raises
+    on any failure (network, non-200, extraction) -- callers treat a failure here as a hard
+    failure for the whole run, not a per-page skip, since without the base corpus there is nothing
+    sensible to fall back to for ~1,000 Fandom pages. `client` is reused only for its session
+    (User-Agent) and is not passed maxlag/serialization params here since this is a plain file
+    download, not a MediaWiki API call."""
+    if requests is None:
+        raise RuntimeError("the 'requests' package is not installed -- see requirements-ingest.txt")
+    if py7zr is None:
+        raise RuntimeError("the 'py7zr' package is not installed -- see requirements-ingest.txt")
+    resp = client._session.get(FANDOM_DUMP_URL, timeout=REQUEST_TIMEOUT_S * 4, stream=True)
+    resp.raise_for_status()
+    archive_path = dest_path + ".7z"
+    with open(archive_path, "wb") as fh:
+        for chunk in resp.iter_content(chunk_size=1 << 16):
+            fh.write(chunk)
+    extract_dir = dest_path + ".extracted"
+    with py7zr.SevenZipFile(archive_path, mode="r") as archive:
+        names = archive.getnames()
+        if len(names) != 1:
+            _LOG.warning("dump archive contains %d files, expected 1: %r", len(names), names)
+        archive.extractall(path=extract_dir)
+    extracted_name = names[0]
+    os.replace(os.path.join(extract_dir, extracted_name), dest_path)
+
+
+# ---------------------------------------------------------------- MediaWiki API walk (steps 2-3)
+def _revision_content(rev: dict) -> Optional[str]:
+    """A revision's wikitext, tolerating both the classic `rev["content"]` shape (confirmed
+    against both live wikis while building this script -- neither requires `rvslots` to return
+    content this way) and the newer MediaWiki "slots" shape (`rev["slots"]["main"]["content"]`),
+    in case either wiki's software version ever changes which one it returns by default."""
+    if "content" in rev:
+        return rev["content"]
+    slots = rev.get("slots") or {}
+    main = slots.get("main") or {}
+    return main.get("content")
+
+
+def walk_allpages(client: "WikiClient", source: str, limit: Optional[int] = None) -> Iterator[RawPage]:
+    """Batched, continuation-following walk over a wiki's live ns0 pages: `action=query&
+    generator=allpages&gapnamespace=0&prop=revisions&rvprop=content|ids|timestamp`, GAP_LIMIT
+    (500) pages per request. PLAN-v6.md specifies exactly this mechanism for BOTH the Fandom delta
+    walk (step 2) and the full Weird Gloop walk (step 3), so this one function serves both call
+    sites -- see ingest_fandom_delta() and the main Weird Gloop path in run_ingest() below for how
+    each uses what comes out.
+
+    Stops as soon as `limit` pages have been yielded (no further request is issued), regardless of
+    how many more `continue` batches the wiki still has -- this is what makes `--limit 20` cheap
+    against a live wiki with ~1,000+ pages rather than merely capping how much of a full walk gets
+    kept."""
+    params = {
+        "action": "query",
+        "generator": "allpages",
+        "gapnamespace": 0,
+        "gaplimit": GAP_LIMIT,
+        "prop": "revisions",
+        "rvprop": "content|ids|timestamp",
+        "format": "json",
+        "formatversion": 2,
+    }
+    count = 0
+    continue_params = {}
+    while True:
+        data = client.get({**params, **continue_params})
+        pages = (data.get("query") or {}).get("pages") or []
+        for page in pages:
+            if page.get("missing") or page.get("invalid"):
+                continue
+            revisions = page.get("revisions") or []
+            if not revisions:
+                continue
+            rev = revisions[0]
+            content = _revision_content(rev)
+            if content is None:
+                continue
+            yield RawPage(
+                title=page.get("title", ""),
+                wikitext=content,
+                revid=rev.get("revid", 0) or 0,
+                timestamp=rev.get("timestamp", ""),
+                source=source,
+            )
+            count += 1
+            if limit is not None and count >= limit:
+                return
+        if "continue" not in data:
+            return
+        continue_params = data["continue"]
+
+
+def ingest_fandom_delta(
+    client: "WikiClient", dump_timestamps: dict, limit: Optional[int] = None
+) -> Iterator[RawPage]:
+    """PLAN-v6.md step 2: walk Fandom's live pages and yield only the ones worth overriding the
+    dump's copy of -- a title whose live revision timestamp is strictly newer than what the dump
+    recorded FOR THAT EXACT TITLE, or a title the dump did not have at all (page created after the
+    dump was generated). Compared per-title rather than against one global "the dump's timestamp"
+    cutoff, since the dump can (and does) contain pages last edited on many different dates; a
+    single global cutoff would either re-fetch far more of the wiki than actually changed (if
+    taken as the oldest page's timestamp) or silently miss real changes to older, rarely-edited
+    pages (if taken as the newest). ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" strings compare correctly with
+    plain `<=`/`>`, so no date parsing is needed here."""
+    for page in walk_allpages(client, "fandom", limit=limit):
+        dump_ts = dump_timestamps.get(page.title)
+        if dump_ts is not None and page.timestamp <= dump_ts:
+            continue
+        yield page
+
+
+# ---------------------------------------------------------------- offline fixtures (no network)
+def read_offline_fixtures(fixture_dir: str) -> "tuple[list, list]":
+    """Read canned pages from `fixture_dir` instead of touching the network at all -- no dump
+    download, no decompression, no HTTP request of any kind. Exists so this script's actual
+    behavior (mwparserfromhell rendering, sanitizing, sorting, the failure policy) can be verified
+    without network access; see this task's report for the exact fixtures used.
+
+    Expected layout (either file may be absent, which yields an empty list for that source -- an
+    empty source is not an error, exactly like an empty `search()` result is not one for W2):
+
+        fixture_dir/fandom.json      JSON list of {"title", "wikitext", "revid", "timestamp"}
+        fixture_dir/weirdgloop.json  same shape
+
+    This is deliberately simpler than reproducing the dump/delta reconciliation dance: offline
+    verification is about proving the PARSING and ORCHESTRATION logic downstream of "here are some
+    (title, wikitext, revid, timestamp) tuples," not about re-testing network mechanics that, by
+    definition, this mode does not exercise."""
+
+    def _load(name):
+        path = os.path.join(fixture_dir, name)
+        if not os.path.isfile(path):
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_list = json.load(fh)
+        return raw_list
+
+    return _load("fandom.json"), _load("weirdgloop.json")
+
+
+# ---------------------------------------------------------------- assembling records (steps 4-7)
+def page_url(source: str, title: str) -> str:
+    base = FANDOM_BASE_URL if source == "fandom" else WEIRDGLOOP_BASE_URL
+    return base + urllib.parse.quote(title.replace(" ", "_"))
+
+
+def raw_pages_to_records(raw_pages: Iterator[RawPage], stats: RunStats) -> Iterator[Record]:
+    """PLAN-v6.md steps 4-6 applied to a stream of RawPage: parse with mwparserfromhell, split
+    into sections, sanitize -- all inside page_to_sections()/clean_wikicode() above. A page whose
+    parse raises ANY exception is logged with its title and skipped (RunStats.record_skip()),
+    never silently dropped and never allowed to abort the whole run; PLAN-v6.md's failure policy
+    (module docstring) is what decides, at the end of the run, whether the accumulated skip count
+    is small enough to still write a corpus."""
+    for raw in raw_pages:
+        try:
+            sections = page_to_sections(raw.title, raw.wikitext)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            stats.record_skip(raw.title, repr(exc))
+            continue
+        stats.record_success()
+        url = page_url(raw.source, raw.title)
+        for heading, text in sections:
+            yield Record(
+                title=raw.title, heading=heading, text=text, source=raw.source,
+                revid=raw.revid, timestamp=raw.timestamp, url=url,
+            )
+
+
+def write_corpus(records: list, out_path: str):
+    """PLAN-v6.md step 7: one JSON object per line, sorted by (title, heading, source) for a
+    byte-stable re-run. Written to a temp file then os.replace()'d into place -- the same
+    atomic-swap pattern task W2 uses for wiki.db, so a reader (or a second, concurrent ingest run)
+    never sees a half-written corpus file."""
+    records = sorted(records, key=lambda r: r.sort_key())
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+        for record in records:
+            fh.write(record.to_json_line())
+            fh.write("\n")
+    os.replace(tmp_path, out_path)
+    return len(records)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -536,12 +778,100 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Placeholder orchestration -- filled in as the remaining pieces (dump reader, API walkers,
-    mwparserfromhell rendering, sanitize, sort+emit, failure policy) land. Kept import-clean and
-    argument-parsing-complete from the first commit so py_compile and --help both work throughout
-    this task's history, per PLAN-v6.md's "commit each coherent piece as its own commit"."""
-    _LOG.error("run(): not yet implemented")
-    return 1
+    """Top-level orchestration. Returns the process exit code per this script's failure policy
+    (module docstring): 0 whenever a corpus file was successfully written (however many pages
+    were skipped below the 5% threshold), 1 on a hard failure (>5% of attempted pages failed to
+    parse, an entire source could not be fetched at all, or the output could not be written) --
+    and in every code-1 case, nothing is written to `args.out`.
+
+    A whole-SOURCE fetch failure (the dump could not be downloaded/decompressed, or a wiki's API
+    walk raised after exhausting its retries) is treated as a hard failure of the same severity as
+    the "wrote nothing" path, not folded into the per-page skip count: PLAN-v6.md's own rationale
+    ("a half-built corpus is worse than a stale one") applies at least as strongly to losing an
+    entire source outright as it does to a handful of bad pages within one. This is a judgement
+    call beyond what PLAN-v6.md's failure-policy paragraph states verbatim (that paragraph is
+    about per-page parse failures specifically); see this task's report."""
+    if mwparserfromhell is None:
+        _LOG.error("the 'mwparserfromhell' package is not installed -- see requirements-ingest.txt")
+        return 1
+
+    stats = RunStats()
+    fandom_raw: list = []
+    weirdgloop_raw: list = []
+
+    if args.offline:
+        _LOG.info("offline mode: reading fixtures from %s (no network access)", args.offline)
+        fandom_fixture, weirdgloop_fixture = read_offline_fixtures(args.offline)
+        limit = args.limit
+        fandom_raw = [RawPage(source="fandom", **p) for p in fandom_fixture][:limit]
+        weirdgloop_raw = [RawPage(source="weirdgloop", **p) for p in weirdgloop_fixture][:limit]
+    else:
+        if requests is None:
+            _LOG.error("the 'requests' package is not installed -- see requirements-ingest.txt")
+            return 1
+        user_agent = build_user_agent(args.contact)
+        fandom_client = WikiClient(FANDOM_API, user_agent)
+        weirdgloop_client = WikiClient(WEIRDGLOOP_API, user_agent)
+
+        dump_path = args.dump_path or (os.path.splitext(args.out)[0] + "-fandom-dump.xml")
+        try:
+            if not args.dump_path or not os.path.isfile(dump_path):
+                _LOG.info("downloading and decompressing the Fandom bulk dump...")
+                download_fandom_dump(fandom_client, dump_path)
+            _LOG.info("stream-parsing the Fandom dump (ns0 only)...")
+            dump_pages = list(iter_dump_pages(dump_path, limit=args.limit))
+        except Exception as exc:
+            _LOG.error("could not obtain the Fandom base corpus (dump download/parse failed): %r", exc)
+            return 1
+        dump_timestamps = {p.title: p.timestamp for p in dump_pages}
+        fandom_by_title = {p.title: p for p in dump_pages}
+        _LOG.info("Fandom base: %d pages from the dump", len(dump_pages))
+
+        try:
+            delta_pages = list(
+                ingest_fandom_delta(fandom_client, dump_timestamps, limit=args.limit)
+            )
+        except Exception as exc:
+            _LOG.error("could not complete the Fandom delta walk: %r", exc)
+            return 1
+        for p in delta_pages:
+            fandom_by_title[p.title] = p
+        _LOG.info("Fandom delta: %d pages newer than the dump (or new since it)", len(delta_pages))
+        fandom_raw = list(fandom_by_title.values())
+
+        try:
+            weirdgloop_raw = list(walk_allpages(weirdgloop_client, "weirdgloop", limit=args.limit))
+        except Exception as exc:
+            _LOG.error("could not complete the Weird Gloop walk: %r", exc)
+            return 1
+        _LOG.info("Weird Gloop: %d pages", len(weirdgloop_raw))
+
+    records = list(raw_pages_to_records(iter(fandom_raw + weirdgloop_raw), stats))
+
+    skip_ratio = stats.skip_ratio()
+    if skip_ratio > FAILURE_THRESHOLD:
+        _LOG.error(
+            "SUMMARY: hard failure -- %d/%d pages failed to parse (%.1f%%, over the %.0f%% "
+            "threshold); writing nothing. Skipped: %s",
+            stats.skipped, stats.attempted, skip_ratio * 100, FAILURE_THRESHOLD * 100,
+            ", ".join(stats.skipped_titles),
+        )
+        return 1
+
+    try:
+        written = write_corpus(records, args.out)
+    except OSError as exc:
+        _LOG.error("SUMMARY: could not write %s: %r -- writing nothing", args.out, exc)
+        return 1
+
+    log_level = logging.WARNING if stats.skipped else logging.INFO
+    _LOG.log(
+        log_level,
+        "SUMMARY: wrote %d records (%d pages) to %s -- %d/%d pages attempted, %d skipped%s",
+        written, stats.succeeded, args.out, stats.succeeded, stats.attempted, stats.skipped,
+        (": " + ", ".join(stats.skipped_titles)) if stats.skipped_titles else "",
+    )
+    return 0
 
 
 if __name__ == "__main__":
