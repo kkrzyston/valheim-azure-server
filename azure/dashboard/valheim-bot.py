@@ -696,17 +696,35 @@ _FUTHARK_NORM = {
 # told to wrap a literal value or exact on-screen string in -- see SYSTEM_PROMPT and join_reply()).
 # Tried in this order at each position:
 #   1. a fenced code block (```...```, DOTALL so it can span lines)
-#   2. an inline code span (`...`)
-#   3. a URL (http:// or https://)
-#   4. a Discord mention/channel reference (<@123>, <@!123>, <@&123>, <#123>)
-#   5. any maximal run of non-space characters that contains at least one digit -- this is what
+#   2. an UNTERMINATED fenced code block (opened with ``` but never closed) -- protects to end of
+#      input. Fails CLOSED on purpose: without this, a stray/truncated ``` makes the closed
+#      pattern above simply not match at all, so protection silently vanishes for everything after
+#      it (including any real proper noun in a later, separately-closed span) and it gets
+#      rune-mangled. Protecting too much (to end of string) is the safe failure mode here, not
+#      protecting too little. See to_futhark()'s warning log for when this fires.
+#   3. an inline code span (`...`)
+#   4. an UNTERMINATED inline code span (opened with ` but never closed) -- same fail-closed
+#      reasoning as #2, one backtick instead of three. Confirmed bug this fixes:
+#      to_futhark("...var `Bjorn ok Sigrid...") used to mangle "Bjorn" because the closed pattern
+#      above requires a matching close and, finding none, simply didn't match, so "Bjorn" ran
+#      through the ordinary per-character transliteration like any other word.
+#   5. a URL (http:// or https://)
+#   6. a Discord mention/channel reference (<@123>, <@!123>, <@&123>, <#123>)
+#   7. any maximal run of non-space characters that contains at least one digit -- this is what
 #      catches IPs, ports, dates, and timestamps like "17:42" without needing its own pattern for
 #      each shape, since all of those are, syntactically, "a token with a digit in it."
 # Plain markdown syntax (*, _, **, #, >, "- " bullets) needs no entry here: those characters have
 # no rune mapping at all, so the per-character loop below already leaves them untouched.
+#
+# The two unterminated alternatives are named groups purely so to_futhark() (and norse_reply()'s
+# own balance check, see _unbalanced_backtick_start()) can tell "this match is the fail-closed
+# fallback" apart from "this match is an ordinary, well-formed carve-out" via Match.lastgroup,
+# without re-deriving that from the matched text.
 _FUTHARK_PROTECTED_RE = re.compile(
     r"```.*?```"
+    r"|(?P<unterminated_fence>```.*\Z)"
     r"|`[^`]*`"
+    r"|(?P<unterminated_backtick>`.*\Z)"
     r"|https?://\S+"
     r"|<[@#][!&]?\d+>"
     r"|\S*\d\S*",
@@ -731,19 +749,32 @@ def _futhark_segment(segment):
 
 
 def to_futhark(text):
-    """Pure, no I/O, no deps. Runs the carve-out regex over `text` first and leaves every
-    protected span exactly as written; everything in between is transliterated a character at a
-    time by _futhark_segment(). See _FUTHARK_PROTECTED_RE's comment for what is protected and
-    why."""
+    """Pure, no I/O except a possible log call, no other deps. Runs the carve-out regex over
+    `text` first and leaves every protected span exactly as written; everything in between is
+    transliterated a character at a time by _futhark_segment(). See _FUTHARK_PROTECTED_RE's
+    comment for what is protected and why, including the two fail-closed unterminated-span
+    alternatives this function watches for below."""
     out = []
     pos = 0
+    unbalanced_kind = None  # set if an unterminated-fence/backtick fallback ever fires
     for m in _FUTHARK_PROTECTED_RE.finditer(text):
+        if m.lastgroup == "unterminated_fence":
+            unbalanced_kind = "code fence (```)"
+        elif m.lastgroup == "unterminated_backtick":
+            unbalanced_kind = "inline backtick (`)"
         if m.start() > pos:
             out.append(_futhark_segment(text[pos:m.start()]))
         out.append(m.group(0))
         pos = m.end()
     if pos < len(text):
         out.append(_futhark_segment(text[pos:]))
+    if unbalanced_kind:
+        # Observable, not silent: an unbalanced backtick/fence means either the model emitted
+        # malformed markdown or (more likely, see norse_reply()) truncation cut a well-formed
+        # answer mid-span. Either way this is worth knowing about even though the fail-closed
+        # behavior above already keeps it from mangling a proper noun.
+        log(f"to_futhark(): unbalanced {unbalanced_kind} in input -- protecting to end of string "
+            "rather than rune-mangling it (fail closed)", "warning")
     return "".join(out)
 
 
@@ -755,6 +786,48 @@ def truncate_discord(text, limit=DISCORD_LIMIT):
     if " " in cut:
         cut = cut.rsplit(" ", 1)[0]
     return cut.rstrip() + "…"
+
+
+def _unbalanced_backtick_start(text):
+    """Returns the start index of an opening code fence or inline-backtick marker in `text` that
+    has no matching close before the end of the string -- i.e. one of _FUTHARK_PROTECTED_RE's two
+    fail-closed fallback alternatives (see its comment) is what will end up matching it -- or None
+    if every backtick/fence in `text` is already balanced. `Match.lastgroup` is enough to tell a
+    fallback match apart from an ordinary, well-formed carve-out, since those two alternatives are
+    the only named groups in the pattern. Used by norse_reply() below; a plain truncate_discord()
+    call has no idea what a backtick is, so this is how the shrink loop finds out it just cut one
+    in half."""
+    for m in _FUTHARK_PROTECTED_RE.finditer(text):
+        if m.lastgroup in ("unterminated_fence", "unterminated_backtick"):
+            return m.start()
+    return None
+
+
+def _trim_to_balanced(text):
+    """If `text` ends with an unterminated code fence or inline-backtick span, trim back to just
+    before that opening marker (dropping the marker and everything after it) and re-apply the
+    ellipsis truncate_discord() would use, so the text handed to to_futhark() -- and shown to the
+    user -- never contains a half-open span. This is what actually prevents norse_reply()'s shrink
+    loop from manufacturing an unterminated span out of a well-formed answer: truncate_discord()
+    itself knows nothing about backticks, so it can and does cut mid-span; this is the cleanup
+    pass that runs after every such cut.
+
+    No-op (returns `text` unchanged) when nothing is unbalanced. Also a no-op -- deliberately does
+    NOT trim -- when trimming would remove the entire string (the unmatched opener sits at or near
+    position 0): collapsing an otherwise non-empty candidate down to nothing would violate
+    norse_reply()'s "both halves always present for non-empty input" invariant for a purely
+    cosmetic gain, and to_futhark()'s own fail-closed behavior already keeps that surviving span
+    from being rune-mangled -- the only remaining cost is a stray backtick and a non-transliterated
+    tail, not a broken or missing reply."""
+    start = _unbalanced_backtick_start(text)
+    if start is None:
+        return text
+    kept = text[:start].rstrip()
+    if not kept:
+        return text
+    if not kept.endswith("…"):
+        kept += "…"
+    return kept
 
 
 def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
@@ -798,8 +871,18 @@ def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
     `shrink = ceil(overshoot * cand_len / (cand_len + rune_len))` -- converges to the real
     ceiling in one or two steps instead. This is a MEASURED ratio recomputed every iteration, not
     a fixed divisor: do not replace it with a flat "budget half the length" shortcut, or every
-    normal answer pays for the "x" case again for no reason."""
-    candidate = truncate_discord(old_norse_text, limit=limit - 1)
+    normal answer pays for the "x" case again for no reason.
+
+    Every truncate_discord() call below is immediately followed by _trim_to_balanced(): plain
+    character-count truncation has no idea what a backtick is, so it can (and does, in practice --
+    "list all the medals" against the ~27-entry CATALOG is the realistic trigger, being both the
+    longest answer and the one densest in backticked names) cut a well-formed answer in the middle
+    of a code span. Left alone that manufactures an unterminated backtick/fence that was never in
+    the model's actual output, and to_futhark()'s fail-closed behavior would then (correctly, but
+    wastefully) protect the entire remainder of the reply from transliteration. Trimming back to
+    before the cut-open marker keeps a truncated reply fully runic except for its genuine,
+    intentional carve-outs."""
+    candidate = _trim_to_balanced(truncate_discord(old_norse_text, limit=limit - 1))
     while len(candidate) > 1:
         rune_line = to_futhark(candidate)
         out = rune_line + "\n" + candidate
@@ -809,7 +892,7 @@ def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
         cand_len = len(candidate)
         rune_len = len(rune_line)
         shrink = -(-(overshoot * cand_len) // (cand_len + rune_len))  # ceil, integer-only
-        candidate = truncate_discord(candidate, limit=max(1, cand_len - shrink))
+        candidate = _trim_to_balanced(truncate_discord(candidate, limit=max(1, cand_len - shrink)))
     # Degenerate fallback: `candidate` shrank to 0 or 1 characters (empty input, or an
     # absurdly small `limit`) without ever passing the loop's own check. Build the same
     # rune-line-then-Latin-line shape from whatever is left and let truncate_discord()'s
@@ -1577,6 +1660,26 @@ def cmd_selftest():
         print(f"{'PASS' if survived else 'FAIL'} ({label}): {must_survive!r} in {out!r}")
         all_ok = all_ok and survived
 
+    print("\n--- to_futhark() fails CLOSED on an unterminated backtick/fence (must not mangle) ---")
+    # Regression check: an unclosed inline code span used to simply not match the closed-span
+    # pattern, so protection silently vanished and everything after the stray backtick -- including
+    # a real proper noun -- got rune-mangled like ordinary prose. Confirmed trigger:
+    # to_futhark("...var `Bjorn ok Sigrid...") used to mangle "Bjorn".
+    unterminated_cases = [
+        ("unterminated inline backtick",
+         "Sá sigraði var `Bjorn ok Sigrid gengu til hallar", "Bjorn"),
+        ("unterminated fence",
+         "Sjá þetta: ```Bjorn ok Sigrid gengu til hallar", "Bjorn"),
+    ]
+    for label, text, must_survive_literally in unterminated_cases:
+        out = to_futhark(text)
+        # The whole tail from the opening marker onward must survive byte-for-byte, which in
+        # particular means the proper noun inside it is never transliterated into runes.
+        survived = must_survive_literally in out
+        print(f"{'PASS' if survived else 'FAIL'} ({label}): {must_survive_literally!r} survives "
+              f"unmangled in {out!r}")
+        all_ok = all_ok and survived
+
     print("\n--- norse_reply() length budget (must never lose the Latin half to truncation) ---")
     # Regression check for the bug where a long answer's rune line alone could already reach
     # DISCORD_LIMIT characters, so the old "transliterate everything, then truncate the combined
@@ -1640,6 +1743,69 @@ def cmd_selftest():
     else:
         all_ok = False
         print("FAIL x-heavy input: Latin half non-empty: no \"\\n\" to split on")
+
+    print("\n--- truncate_discord() can manufacture an unbalanced span; _trim_to_balanced() repairs it ---")
+    # Regression check for norse_reply()'s half of Fix 2. truncate_discord()'s word-boundary
+    # rsplit(" ", 1) only avoids cutting a SINGLE space-free token in half -- it has no idea a
+    # multi-word backtick span (a real medal name like "Sæll ferðamaðr" has an internal space) is
+    # one atomic unit, so a cut can still land on an internal space inside such a span. This first
+    # asserts the raw bug is real (not something that merely used to be a risk), then asserts the
+    # fix repairs it -- so this could not have passed vacuously against either an unreachable
+    # scenario or a no-op fix.
+    probe_before = "Fyrri hlutr svarsins um höllina er nokkuð langr, en þetta er kjarninn: "
+    probe_span = "`Sæll ferðamaðr fyrir viku eitt` er löng nafngift."
+    probe_text = probe_before + probe_span
+    mid_idx = probe_text.index("ferðamaðr")  # a few characters into the multi-word span
+    probe_limit = mid_idx + 3
+    raw_cut = truncate_discord(probe_text, limit=probe_limit)
+    raw_is_broken = _unbalanced_backtick_start(raw_cut) is not None
+    print(f"{'PASS' if raw_is_broken else 'FAIL'} truncate_discord() alone DOES leave an "
+          f"unbalanced backtick here (proves the scenario is real): {raw_cut!r}")
+    all_ok = all_ok and raw_is_broken
+    repaired = _trim_to_balanced(raw_cut)
+    repaired_balanced = _unbalanced_backtick_start(repaired) is None
+    print(f"{'PASS' if repaired_balanced else 'FAIL'} _trim_to_balanced() repairs it: {repaired!r}")
+    all_ok = all_ok and repaired_balanced
+    repaired_nonempty = len(repaired) > 0
+    print(f"{'PASS' if repaired_nonempty else 'FAIL'} repaired text is non-empty")
+    all_ok = all_ok and repaired_nonempty
+
+    print("\n--- norse_reply() end-to-end: dense multi-word backtick spans never leave a half-open one ---")
+    dense_backtick_answer = " ".join(
+        f"`Spilari{i}` vann `Sæll ferðamaðr fyrir viku {i}` medalíuna." for i in range(120)
+    )
+    dense_out = norse_reply(dense_backtick_answer)
+    dense_fits = len(dense_out) <= DISCORD_LIMIT
+    print(f"{'PASS' if dense_fits else 'FAIL'} dense-backtick input: combined length <= "
+          f"{DISCORD_LIMIT}: {len(dense_out)}")
+    all_ok = all_ok and dense_fits
+    dense_has_newline = "\n" in dense_out
+    print(f"{'PASS' if dense_has_newline else 'FAIL'} dense-backtick input: both halves present")
+    all_ok = all_ok and dense_has_newline
+    if dense_has_newline:
+        dense_rune, dense_latin = dense_out.split("\n", 1)
+        dense_latin_nonempty = len(dense_latin) > 0
+        print(f"{'PASS' if dense_latin_nonempty else 'FAIL'} dense-backtick input: Latin half "
+              f"non-empty: {len(dense_latin)} chars")
+        all_ok = all_ok and dense_latin_nonempty
+        dense_matches = to_futhark(dense_latin) == dense_rune
+        print(f"{'PASS' if dense_matches else 'FAIL'} dense-backtick input: rune half == "
+              "to_futhark(kept Latin half)")
+        all_ok = all_ok and dense_matches
+        dense_balanced = _unbalanced_backtick_start(dense_latin) is None
+        print(f"{'PASS' if dense_balanced else 'FAIL'} dense-backtick input: Latin half contains "
+              "no unterminated backtick/fence span")
+        all_ok = all_ok and dense_balanced
+        dense_ellipsis = dense_latin.endswith("…")
+        print(f"{'PASS' if dense_ellipsis else 'FAIL'} dense-backtick input: Latin half ends "
+              "with an ellipsis (it was truncated)")
+        all_ok = all_ok and dense_ellipsis
+    else:
+        all_ok = False
+        print("FAIL dense-backtick input: Latin half non-empty: no \"\\n\" to split on")
+        print("FAIL dense-backtick input: rune half == to_futhark(kept Latin half): no \"\\n\" to split on")
+        print("FAIL dense-backtick input: Latin half contains no unterminated backtick/fence span: "
+              "no \"\\n\" to split on")
 
     print()
     if not all_ok:
