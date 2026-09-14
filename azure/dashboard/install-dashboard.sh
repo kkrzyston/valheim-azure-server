@@ -61,6 +61,13 @@ install -d -m 0700 -o root -g root             /var/lib/valheim-restart/archive
 install -d -m 0700 -o root -g root             /var/lib/valheim-restart/quarantine
 # gate.json and secret.csrf are created by the executor on its first tick, with the right modes.
 
+# Hermodr's `!lag` spool, same shape and same reason as requests/ above: 1730 lets valheim-bot
+# create a report by name but never list or read the directory back, and root (the collector)
+# drains it into events.jsonl once a minute. The bot cannot write events.jsonl itself -- the
+# collector rewrites and renames that file every run, which would reset its owner and mode and
+# could swallow an appended line outright.
+install -d -m 1730 -o root -g valheim-bot /var/lib/valheim-status/lagreports
+
 HASH=$(caddy hash-password --plaintext "$PW")
 OWNER_HASH=$(caddy hash-password --plaintext "$OWNER_PW")
 sed -e "s#__HASH__#$HASH#" -e "s#__OWNER_HASH__#$OWNER_HASH#" -e "s#__DASHBOARD_HOST__#$DASHBOARD_HOST#" Caddyfile > /etc/caddy/Caddyfile

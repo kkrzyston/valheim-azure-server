@@ -776,6 +776,51 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------------- lag reports (from Hermodr)
+# Hermodr's `!lag` drops one small JSON file per player report into a spool it can write but not
+# read back (mode 1730, group valheim-bot -- the same one-writer pattern as the restart spool).
+# We are root and the only writer of events.jsonl, so draining it here is what keeps a report
+# from being lost to append_and_trim()'s read-modify-rename once a minute.
+LAG_SPOOL = f"{LIB}/lagreports"
+
+
+def drain_lag_reports():
+    out = []
+    try:
+        names = sorted(os.listdir(LAG_SPOOL))
+    except FileNotFoundError:
+        return out
+    except Exception as e:
+        print(f"drain_lag_reports: cannot list {LAG_SPOOL}: {e!r}", file=sys.stderr)
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue        # *.tmp is a report still being written; it will be here next minute
+        p = os.path.join(LAG_SPOOL, name)
+        try:
+            with open(p) as f:
+                rec = json.load(f)
+            t, who = rec.get("t"), rec.get("name")
+            if not isinstance(t, (int, float)) or not isinstance(who, str) or not who.strip():
+                raise ValueError(f"expected t and name, got {rec!r}"[:200])
+        except Exception as e:
+            # Loud, then dropped. A malformed file left in place would be re-read and re-reported
+            # every single minute forever; silently deleting it would lose a player's report with
+            # no trace of why. Say what was wrong, once, and move on.
+            print(f"drain_lag_reports: discarding unusable {name}: {e!r}", file=sys.stderr)
+        else:
+            # The name is a Discord display name -- arbitrary user-controlled text. It is length-
+            # capped and stripped of control characters here, before it enters events.jsonl,
+            # which is never trimmed. (index.html escapes it again at render time.)
+            who = re.sub(r"[\x00-\x1f\x7f]", "", who).strip()[:48]
+            out.append({"t": float(t), "kind": "lagreport", "name": who or "someone"})
+        try:
+            os.unlink(p)
+        except Exception as e:
+            print(f"drain_lag_reports: could not unlink {name}: {e!r}", file=sys.stderr)
+    return out
+
+
 # ---------------------------------------------------------------- persist events + samples
 def append_and_trim(path, new_items, keep_after):
     items = []
@@ -806,6 +851,7 @@ sample = {"t": int(now), "p": players_now, "c": cpu_pct, "m": round(100 * (1 - m
           "o": 1 if server_online else 0, "rx": rx_bytes, "tx": tx_bytes, "w": world_bytes}
 if pg:
     sample["pg"] = pg
+events.extend(drain_lag_reports())
 samples = append_and_trim(f"{LIB}/samples.jsonl", [sample], now - RETAIN_SECONDS)
 all_events = append_and_trim(f"{LIB}/events.jsonl", events, 0)
 
