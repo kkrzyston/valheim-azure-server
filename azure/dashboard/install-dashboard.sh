@@ -86,6 +86,16 @@ install -m 0755 valheim-restartd.py valheim-restart-exec.py /usr/local/sbin/
 install -m 0644 valheim-restartd.service valheim-restart-exec.service \
                 valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
 install -m 0644 manifest.webmanifest icon.svg icon-192.png icon-512.png /var/www/valheim/
+# --- egress probe (lag investigation) ---------------------------------------------------------
+# valheim-egress.service's ExecStartPre= runs the nft helper, so the `inet valheim_meter` table
+# (counters + the `peers` set the collector now reads instead of running tcpdump) is rebuilt on
+# every start and after a reboot. Keep this unit enabled: stopping it leaves the table in place,
+# but a reboot with it disabled would take the dashboard's per-player ping column with it.
+# The report script is offline and operator-run; it is installed only so it is on PATH.
+install -m 0755 valheim-meter-nft.sh /usr/local/sbin/valheim-meter-nft.sh
+install -m 0755 valheim-egress-probe.py /usr/local/sbin/valheim-egress-probe.py
+install -m 0755 valheim-egress-report.py /usr/local/sbin/valheim-egress-report.py
+install -m 0644 valheim-egress.service /etc/systemd/system/
 # Hermodr (Discord Q&A bot) -- its own venv so discord.py never touches the system Python used by
 # the collector/alert/medals scripts above. Installed but NOT started: it needs DISCORD_BOT_TOKEN
 # (and HERMODR_CHANNEL_ID or HERMODR_CHANNEL_NAME) in /etc/valheim-alert.env first, and there is no
@@ -106,6 +116,9 @@ systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals
 systemctl enable --now valheim-restart-exec.timer
 systemctl enable --now valheim-restartd.service
 systemctl enable --now valheim-status.timer
+# Started before the collector's first run, so the meter table (and its `peers` set) exists by the
+# time valheim-status-collect.py first looks for it.
+systemctl enable --now valheim-egress.service
 systemctl start valheim-status.service
 systemctl enable --now caddy
 systemctl reload caddy

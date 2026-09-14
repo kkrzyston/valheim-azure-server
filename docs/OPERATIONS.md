@@ -157,6 +157,9 @@ meaningful extra cloud charge.
 |---|---|
 | Collector health | `systemctl status valheim-status.timer valheim-status.service` |
 | Run collector by hand | `sudo systemctl start valheim-status.service` |
+| Egress probe health | `systemctl status valheim-egress`; `sudo valheim-meter-nft.sh show` — the counters climb while players are online and stand still when nobody is |
+| One live egress sample | `sudo valheim-egress-probe.py --once` |
+| Read the egress data | `sudo valheim-egress-report.py` (or `--days 7`) |
 | Web server health | `systemctl status caddy`; `sudo journalctl -u caddy -n 50` |
 | Test the Discord webhook | `sudo rm -f /var/lib/valheim-status/alerts.json` then wait a minute (only real conditions post; use a temporary bad status to test) or `curl -H 'Content-Type: application/json' -d '{"content":"test"}' "$URL"` |
 | Change either password | `cd /home/azureuser/dashboard && sudo bash install-dashboard.sh <viewer-pw> <owner-pw>` (both are required every time; pass the unchanged one again). The installer also re-installs `index.html`, the collector and the alert script from that folder, so `sudo cp` the live copies (`/var/www/valheim/index.html`, `/usr/local/sbin/valheim-status-collect.py`, `/usr/local/sbin/valheim-alert.py`) into it first if they are newer than the folder. It never overwrites `/etc/valheim-alert.env`. |
@@ -174,6 +177,47 @@ Files: `dashboard/` in this folder (`index.html`, `valheim-status-collect.py`,
 a rebuilt VM, copy that folder to `/home/azureuser/dashboard` and run the installer with
 both passwords; the DNS label on the public IP and an NSG rule opening TCP 80/443 from the
 internet must exist.
+
+**The egress probe** (`valheim-egress.service`, `Type=simple`, always on) answers one question:
+is game egress limited by the VM, or by Valheim itself? The server sits 98% idle with no UDP
+buffer errors, no NIC drops and healthy per-player ping, yet egress plateaus around 240–276 KB/s
+and has never once exceeded 276,425 B/s. The suspect is Valheim's own per-peer send budget
+(ZDOMan's `m_dataPerSec`, historically 61440 B/s): if that is the limit, more players do not buy
+more bytes, they buy staler updates — which is what players describe when they say it only
+stutters when everyone is in one place.
+
+Once-a-minute sampling cannot tell those apart, so the probe samples once a second. Its
+measurement primitive is a self-contained nftables table, `inet valheim_meter`, installed by
+`valheim-meter-nft.sh` from the unit's `ExecStartPre=`: two counters on the game ports and a
+15-minute-timeout set of the addresses currently talking to the game port. The counter rules
+carry no verdict and hook at priority 300, after all existing filtering, so they cannot change
+what happens to a packet; the worst a bug there can do is produce a wrong number. That same
+`peers` set replaced the once-a-minute `tcpdump` the collector used to run on the game's own
+receive path, which is why `nftables` is now an installed package and `tcpdump` is not.
+
+It writes `/var/lib/valheim-status/egress-YYYY-MM-DD.jsonl` — per second: bytes and packets both
+ways, **mean packet size**, player count, the game socket's `tx_queue`, and an A2S round trip
+every fifth sample. Whole days are unlinked after seven. It only runs while players are online
+(gated on the collector's `status.json`, so deciding whether to measure costs nothing), buffers in
+memory and writes once every 15 s, and runs at `Nice=10`/`IOWeight=50` so the game always wins.
+
+Players contribute the other half: **`!lag`** in the Hermóðr channel records one timestamped
+report (one a minute, ten an hour, per person). Without it the data can show a ceiling exists but
+not that it is what anyone is feeling. Hermóðr cannot write `events.jsonl` directly — the
+collector rewrites that file wholesale every minute — so `!lag` drops a file into
+`/var/lib/valheim-status/lagreports` (mode 1730, same one-writer pattern as the restart spool)
+and the collector drains it on its next run.
+
+`valheim-egress-report.py` reads all of it offline and prints **CONFIRMED / REFUTED /
+INCONCLUSIVE**. It leads with six refutation conditions and stops at the first that fires: a
+single second above the arithmetic ceiling, a plateau that does not scale with player count, lag
+reports while egress is well below the ceiling, small packets inside plateaus, a non-empty socket
+send queue, or A2S latency spikes at low egress. Its strongest positive test compares raid
+windows against non-raid windows at the same player count *and the same inbound rate* — if demand
+demonstrably rose and egress did not move, the sender is supply-limited. `--selftest` runs it
+against two synthetic worlds with known answers. Once the question is settled, the probe unit can
+simply be disabled — but leave the meter table installed (`valheim-meter-nft.sh install`), or the
+dashboard loses its per-player ping column.
 
 **Off-site backups** copy the world off the VM daily, independent of the local
 `/home/valheim/backups` snapshots. `valheim-offsite.timer` (daily 03:45 local + up to 10 min
@@ -364,7 +408,9 @@ Budgets.)
   `valheim-alert.env` template, `valheim-world-scan.py`, `valheim-offsite-backup.sh`,
   `valheim-offsite.service`/`.timer`, `valheim-digest.py`,
   `valheim-digest.service`/`.timer`, `valheim-medals.py`,
-  `valheim-medals-daily.service`/`.timer`, PWA `manifest.webmanifest` +
+  `valheim-medals-daily.service`/`.timer`, `valheim-egress-probe.py` +
+  `valheim-egress.service` + `valheim-meter-nft.sh` + `valheim-egress-report.py` (the 1 Hz
+  egress probe, its nftables meter table, and the offline analysis), PWA `manifest.webmanifest` +
   `icon.svg`/`icon-192.png`/`icon-512.png`, `install-dashboard.sh`, and the `PLAN-v*.md`
   design notes).
 - `migrate-world.sh` — checksum-verified world placement; arms the service.
