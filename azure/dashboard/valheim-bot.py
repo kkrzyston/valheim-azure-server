@@ -742,12 +742,52 @@ def to_futhark(text):
     return "".join(out)
 
 
-def norse_reply(old_norse_text):
+def truncate_discord(text, limit=DISCORD_LIMIT):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip() + "…"
+
+
+def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
     """The on-screen shape for every reply: the Elder Futhark line first, then the same sentence
     in Old Norse Latin orthography beneath it -- see this task's brief for the exact shape. Used
     for both the model path (call_ai_sync's Old Norse answers) and the fixed canned strings
-    below; never used when the English escape hatch (ENGLISH_RE) is active for a reply."""
-    return to_futhark(old_norse_text) + "\n" + old_norse_text
+    below; never used when the English escape hatch (ENGLISH_RE) is active for a reply.
+
+    Budgets the Latin half BEFORE transliterating, rather than transliterating the full answer
+    and truncating the combined string afterwards. That used to be able to silently eat the
+    entire Latin line: to_futhark() output is close to 1:1 with its input in length, so on a
+    long answer the rune line alone could already reach DISCORD_LIMIT characters, and
+    truncate_discord()'s flat character-count cut on the combined string would then land
+    entirely inside the rune line, before ever reaching the "\\n" -- the Latin sentence dropped
+    with no trace, "list all the medals" against the ~27-entry CATALOG being a realistic way to
+    trigger it, not just a crafted edge case.
+
+    half is the nominal per-line budget (rune line and Latin line each get roughly half of
+    `limit`, minus 1 char held back for the "\\n" separator). The Latin body is NOT truncated to
+    `half`, though -- it is truncated to half // 2. That margin is sized against the actual
+    worst-case expansion in to_futhark()'s own mapping table, not guessed: every character in
+    that table maps 1:1, or CONTRACTS ("ck" -> "k", "th" -> a single þ), except "x" -> "ks",
+    which is the one 1-character-in/2-runes-out expansion in the whole table. So in the
+    mathematical worst case -- a Latin body that is nothing but "x" characters -- the rune line
+    is exactly DOUBLE the Latin body's length, never more. Budgeting the Latin body at half // 2
+    guarantees the rune line stays within `half` even in that adversarial case, so
+    rune_line + "\\n" + body is bounded by half + 1 + half // 2, which is always comfortably
+    under `limit` regardless of content. Do NOT raise this back to `half` as a false
+    optimization -- an all-"x" (or heavily-x) answer would then blow the rune line past
+    DISCORD_LIMIT and reproduce exactly the silent-Latin-loss bug this replaced. The final
+    truncate_discord(out, limit) call below is a pure backstop for that reason: by this
+    construction it should never actually need to cut anything."""
+    half = (limit - 1) // 2
+    latin_budget = half // 2
+    body = truncate_discord(old_norse_text, limit=latin_budget)
+    rune_line = to_futhark(body)
+    out = rune_line + "\n" + body
+    return truncate_discord(out, limit=limit)
 
 
 # ---------------------------------------------------------------- fixed Old Norse replies
@@ -762,16 +802,6 @@ def sanitize_output(text):
     """Backstop: allowed_mentions=none() already stops Discord from acting on a mention, but the
     model will eventually type the literal text anyway, so strip it too."""
     return EVERYONE_RE.sub(lambda m: m.group(1), text)
-
-
-def truncate_discord(text, limit=DISCORD_LIMIT):
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    cut = text[: limit - 1]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut.rstrip() + "…"
 
 
 # ---------------------------------------------------------------- rate limiting (in-memory)
@@ -1512,6 +1542,58 @@ def cmd_selftest():
         survived = must_survive in out
         print(f"{'PASS' if survived else 'FAIL'} ({label}): {must_survive!r} in {out!r}")
         all_ok = all_ok and survived
+
+    print("\n--- norse_reply() length budget (must never lose the Latin half to truncation) ---")
+    # Regression check for the bug where a long answer's rune line alone could already reach
+    # DISCORD_LIMIT characters, so the old "transliterate everything, then truncate the combined
+    # string" order could cut the Latin sentence entirely -- reachable in practice via something
+    # as ordinary as "list all the medals" against the ~27-entry CATALOG, not just a crafted input.
+    long_sentence = "Þrír menn eru í höllu núna, ok Sigrid vann flest stig í viku. "
+    long_answer = (long_sentence * 34).strip()
+    print(f"synthetic long answer: {len(long_answer)} chars")
+    long_out = norse_reply(long_answer)
+    print(f"norse_reply() output: {len(long_out)} chars")
+    fits = len(long_out) <= DISCORD_LIMIT
+    print(f"{'PASS' if fits else 'FAIL'} combined length <= {DISCORD_LIMIT}: {len(long_out)}")
+    all_ok = all_ok and fits
+    has_newline = "\n" in long_out
+    print(f"{'PASS' if has_newline else 'FAIL'} \"\\n\" separator present (Latin half was not eaten)")
+    all_ok = all_ok and has_newline
+    if has_newline:
+        rune_half, latin_half = long_out.split("\n", 1)
+        latin_nonempty = len(latin_half) > 0
+        print(f"{'PASS' if latin_nonempty else 'FAIL'} Latin half non-empty: {len(latin_half)} chars")
+        all_ok = all_ok and latin_nonempty
+        matches = to_futhark(latin_half) == rune_half
+        print(f"{'PASS' if matches else 'FAIL'} rune half == to_futhark(kept Latin half) "
+              f"(rune half {len(rune_half)} chars, latin half {len(latin_half)} chars)")
+        all_ok = all_ok and matches
+    else:
+        all_ok = False
+        print("FAIL Latin half non-empty: no \"\\n\" to split on")
+        print("FAIL rune half == to_futhark(kept Latin half): no \"\\n\" to split on")
+
+    # Worst-case expansion: to_futhark() maps every "x" to two runes ("ks"), the only
+    # one-character-in/two-runes-out case in the whole mapping table -- an all-"x" input is the
+    # adversarial case the half // 2 margin in norse_reply() is specifically sized against.
+    x_heavy = "x" * 3000
+    x_out = norse_reply(x_heavy)
+    x_fits = len(x_out) <= DISCORD_LIMIT
+    print(f"{'PASS' if x_fits else 'FAIL'} x-heavy input: combined length <= {DISCORD_LIMIT}: "
+          f"{len(x_out)}")
+    all_ok = all_ok and x_fits
+    x_has_newline = "\n" in x_out
+    print(f"{'PASS' if x_has_newline else 'FAIL'} x-heavy input: both halves present")
+    all_ok = all_ok and x_has_newline
+    if x_has_newline:
+        x_rune, x_latin = x_out.split("\n", 1)
+        x_latin_nonempty = len(x_latin) > 0
+        print(f"{'PASS' if x_latin_nonempty else 'FAIL'} x-heavy input: Latin half non-empty: "
+              f"{len(x_latin)} chars")
+        all_ok = all_ok and x_latin_nonempty
+    else:
+        all_ok = False
+        print("FAIL x-heavy input: Latin half non-empty: no \"\\n\" to split on")
 
     print()
     if not all_ok:
