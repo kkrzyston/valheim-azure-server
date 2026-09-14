@@ -595,6 +595,15 @@ try:
 except Exception:
     pass
 
+# Restart history, written by valheim-restart-exec.py. This is the token-free copy -- the
+# page's live view comes from /var/www/valheim/restart-state.json, which carries the CSRF
+# token and is therefore not world-readable. Absent until the restart feature is deployed.
+restart_info = {}
+try:
+    restart_info = load_json(f"{LIB}/restart.json", {}) or {}
+except Exception:
+    pass
+
 # ---------------------------------------------------------------- build id / auto-update
 build = None
 try:
@@ -736,6 +745,11 @@ def append_and_trim(path, new_items, keep_after):
     with open(tmp, "w") as f:
         for x in items:
             f.write(json.dumps(x, separators=(",", ":")) + "\n")
+    # Explicit, like save_json: events.jsonl and samples.jsonl are read by the medals engine
+    # running as the unprivileged valheim-bot user. Leaving the mode to the process umask
+    # meant a later UMask= hardening of this unit would make them unreadable, breaking
+    # Hermodr's stats silently.
+    os.chmod(tmp, 0o644)
     os.replace(tmp, path)
     return items
 
@@ -1110,6 +1124,7 @@ status = {
         "maintenance": azure_maintenance,
     },
     "backup": backup_offsite,
+    "restart": restart_info,
     "news": news,
     "discord": discord,
     "events": all_events[-MAX_EVENTS_IN_STATUS:][::-1],

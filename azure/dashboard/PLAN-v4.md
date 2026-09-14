@@ -3,6 +3,7 @@
 Read `PLAN-v3.md` first for the environment, SSH, deploy conventions and the existing data contract. Everything there still holds.
 Hard rules for every agent:
 - NEVER stop/restart/touch `valheim.service`, never run steamcmd, never force an update, never edit the NSG rules that exist, never reboot the VM. Four people are usually playing.
+  - **AMENDED by `PLAN-v5.md` (2026-09-14), one carve-out only:** `valheim-restart-exec.py`, running as root from `valheim-restart-exec.timer`, may stop and start `valheim.service` for a restart request that a Discord role holder approved, under the rails in PLAN-v5. The auto-updater's existing `systemctl restart` is unchanged. **Everything else -- every other script, agent, bot and dashboard code path -- is still bound by the rule above, unchanged.** `--force` is still never scheduled. Read PLAN-v5 before concluding the restart feature violates this line; it does not.
 - Only edit the files your task owns (listed per task). Other agents are editing the other files at the same time.
 - Deploy = scp to `/home/azureuser/dashboard/` then `sudo install` to the destination. Collector/alert changes take effect on the next minute (`sudo systemctl start valheim-status.service` runs them now; check `sudo journalctl -u valheim-status -n 30 --no-pager` for tracebacks).
 - Line endings LF. Python syntax check before scp. Keep the collector's total runtime under ~3.5 s (`collect_ms` in status.json).
