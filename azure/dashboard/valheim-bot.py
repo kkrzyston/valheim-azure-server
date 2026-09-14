@@ -93,7 +93,6 @@ VALHEIM_RESTART_ROOT overrides /var/lib/valheim-restart the same way, for local 
 import argparse
 import asyncio
 import importlib.util
-import inspect
 import json
 import logging
 import os
@@ -571,6 +570,28 @@ def search_wiki_sync(question):
         # between our code and an external module, the same posture build_context() takes with
         # every valheim-medals.py call even though that module also promises not to throw.
         log(f"wiki search() raised despite its no-raise contract: {exc!r}", "error")
+        return []
+
+
+async def fetch_wiki_records(question):
+    """Runs search_wiki_sync() off the event-loop thread via asyncio.to_thread -- PLAN-v6 W3: a
+    slow or wedged wiki.db read must never stall the gateway heartbeat, the same posture
+    on_message() takes around get_context_cached() and call_ai_sync(). search_wiki_sync() never
+    raises (see its own docstring), so the try/except here is the same belt-and-suspenders
+    posture, not the primary safety net.
+
+    Pulled out of on_message()'s closure into its own function specifically so --selftest can
+    behaviourally verify asyncio.to_thread is actually the call in this path -- by monkeypatching
+    asyncio.to_thread and calling this function directly -- instead of grepping run_bot()'s
+    source text for the literal string "asyncio.to_thread(search_wiki_sync". That grep was proven
+    vacuous by a test analyst: it kept passing after the real awaited call was swapped for a
+    synchronous, heartbeat-blocking one, because a nearby comment happened to still contain the
+    same literal text. See decide_route()'s docstring for the same on_message-closure
+    reachability problem, solved the same way, for a different piece of this handler."""
+    try:
+        return await asyncio.to_thread(search_wiki_sync, question)
+    except Exception as exc:
+        log(f"wiki search_wiki_sync failed: {exc!r}", "error")
         return []
 
 
@@ -1796,13 +1817,10 @@ def run_bot():
 
         # PLAN-v6 W3: retrieval also runs off the gateway thread, same as build_context() and
         # the AI call itself -- a slow or wedged wiki.db read must never stall the heartbeat.
-        # search_wiki_sync() never raises (see its own docstring), but the to_thread call is
-        # still wrapped for the same belt-and-suspenders reason the context fetch above is.
-        try:
-            wiki_records = await asyncio.to_thread(search_wiki_sync, question)
-        except Exception as exc:
-            log(f"wiki search_wiki_sync failed: {exc!r}", "error")
-            wiki_records = []
+        # See fetch_wiki_records()'s own docstring for why this is a standalone function rather
+        # than inlined here (short version: so --selftest can behaviourally verify the
+        # asyncio.to_thread call instead of grepping source text for it).
+        wiki_records = await fetch_wiki_records(question)
         log_wiki_retrieval(wiki_records)
         game_knowledge = build_game_knowledge_block(wiki_records)
 
@@ -2283,11 +2301,31 @@ def cmd_selftest():
             # still open, so without this the selftest itself crashes on cleanup after this point.
             wiki_mod._reset_cache_for_tests()
 
-    # search() must run off the gateway thread, same as build_context()/call_ai_sync() -- a
-    # source-level check on run_bot()'s actual on_message code, not a claim taken on faith.
-    to_thread_ok = "asyncio.to_thread(search_wiki_sync" in inspect.getsource(run_bot)
-    print(f"{'PASS' if to_thread_ok else 'FAIL'} on_message() runs search_wiki_sync() via "
-          "asyncio.to_thread (never blocks the gateway heartbeat)")
+    # search() must run off the gateway thread, same as build_context()/call_ai_sync(). This used
+    # to be `"asyncio.to_thread(search_wiki_sync" in inspect.getsource(run_bot)` -- a source-text
+    # grep proven vacuous by a test analyst: it kept reporting PASS after the real awaited call
+    # was replaced with a synchronous, heartbeat-blocking one, because a nearby comment still
+    # contained that literal string. A check that cannot tell working code from a comment is
+    # worse than no check, since it reads as coverage. Fixed behaviourally: monkeypatch
+    # asyncio.to_thread itself and observe fetch_wiki_records() actually call through it, with
+    # search_wiki_sync as the function handed to it -- not a claim taken on faith from source text.
+    _to_thread_calls = []
+    _real_to_thread = asyncio.to_thread
+
+    async def _recording_to_thread(func, *args, **kwargs):
+        _to_thread_calls.append(func)
+        return await _real_to_thread(func, *args, **kwargs)
+
+    asyncio.to_thread = _recording_to_thread
+    try:
+        asyncio.run(fetch_wiki_records("what is Fenring weak to"))
+    finally:
+        asyncio.to_thread = _real_to_thread
+
+    to_thread_ok = _to_thread_calls == [search_wiki_sync]
+    print(f"{'PASS' if to_thread_ok else 'FAIL'} fetch_wiki_records() runs search_wiki_sync() via "
+          f"a REAL asyncio.to_thread call (never blocks the gateway heartbeat): observed calls "
+          f"to {[getattr(f, '__name__', f) for f in _to_thread_calls]!r}")
     all_ok = all_ok and to_thread_ok
 
     # The 20K TPM budget arithmetic (PLAN-v6 W3.5) is the owner's call, not this task's -- pin
