@@ -71,7 +71,6 @@ own default).
 """
 
 import argparse
-import io
 import json
 import logging
 import os
@@ -234,6 +233,14 @@ class WikiClient:
         self._session = requests.Session() if requests is not None else None
         if self._session is not None:
             self._session.headers["User-Agent"] = user_agent
+
+    @property
+    def session(self):
+        """Exposed (rather than left as `_session`) for download_fandom_dump(): a plain S3 file
+        GET reuses this client's session for its User-Agent, but is not a MediaWiki API call, so
+        it goes around WikiClient.get() entirely (no maxlag param, no JSON/maxlag-error decoding)
+        rather than awkwardly overloading that method for a request shape it was not written for."""
+        return self._session
 
     def _throttle(self):
         elapsed = time.monotonic() - self._last_request_ts
@@ -572,7 +579,7 @@ def download_fandom_dump(client: "WikiClient", dest_path: str):
         raise RuntimeError("the 'requests' package is not installed -- see requirements-ingest.txt")
     if py7zr is None:
         raise RuntimeError("the 'py7zr' package is not installed -- see requirements-ingest.txt")
-    resp = client._session.get(FANDOM_DUMP_URL, timeout=REQUEST_TIMEOUT_S * 4, stream=True)
+    resp = client.session.get(FANDOM_DUMP_URL, timeout=REQUEST_TIMEOUT_S * 4, stream=True)
     resp.raise_for_status()
     archive_path = dest_path + ".7z"
     with open(archive_path, "wb") as fh:
