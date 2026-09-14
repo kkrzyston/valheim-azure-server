@@ -25,10 +25,10 @@ MATCH. That result is then passed to sqlite3 as a bound `?` parameter, never str
 into SQL text -- belt-and-suspenders: the quoting protects FTS5's own grammar, the parameter
 binding protects the surrounding SQL statement.
 
-Stdlib only: sqlite3, json, os, re, sys, difflib, threading, argparse, time. All standard
-library. Imported directly by valheim-bot.py (via importlib, like valheim-medals.py, because of
-the hyphenated filename) and valheim-bot.py must stay stdlib-only per PLAN-v6's hard rules -- so
-this module must too.
+Stdlib only: sqlite3, json, os, re, sys, difflib, threading, argparse, time, tempfile, io,
+contextlib. All standard library. Imported directly by valheim-bot.py (via importlib, like
+valheim-medals.py, because of the hyphenated filename) and valheim-bot.py must stay stdlib-only
+per PLAN-v6's hard rules -- so this module must too.
 
 All paths take an env override (VALHEIM_WIKI_ROOT), matching the VALHEIM_RESTART_ROOT /
 valheim-medals.py convention, so this can run against fixtures without touching /var.
@@ -37,12 +37,15 @@ valheim-medals.py convention, so this can run against fixtures without touching 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
+import io
 import json
 import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 
@@ -597,6 +600,211 @@ def build_index(records_path=None, db_path=None):
     }
 
 
+# ---------------------------------------------------------------- selftest (stdlib-only, no network)
+def cmd_selftest():
+    """Stdlib-only, no-network selftest for this module's two responsibilities: the dedupe rule
+    (_sections_materially_differ()/_dedupe(), used by build_index()) and the read-time search()
+    contract, including H1's fix (a broken index must be observable in the log, not silently
+    identical to an honest empty result). Real assertions, not prints -- a failed one exits this
+    process non-zero.
+
+    Before this function existed, this module -- an entire stdlib-only, no-network module built
+    specifically for fast direct testing (see the module docstring) -- had zero direct tests of
+    its own; every one of its behaviours was only ever exercised indirectly, through
+    valheim-bot.py's own --selftest importing it. That was the single highest-value test gap a
+    reviewer found in PLAN-v6 W2/W6."""
+    global DB_PATH_DEFAULT
+    all_ok = True
+
+    print("--- _sections_materially_differ(): the C3 dedupe-rule fix ---")
+    cases = [
+        ("non-numeric disagreement (required minimum case)",
+         "weak to fire", "weak to frost", True),
+        ("identical text", "Fenring is weak to fire.", "Fenring is weak to fire.", False),
+        ("numeric disagreement (the pre-existing rule, still must hold)",
+         "Health: 10", "Health: 12", True),
+        ("reworded, same numbers, no recognized keyword -- still collapses to one copy",
+         "This creature has 10 health and deals 4 damage each hit.",
+         "This creature has 10 health and deals 4 damage per hit.", False),
+        ("label-style, comma-list value swap (the exact case a reviewer demonstrated the "
+         "old numeric-only rule missing)",
+         "...weakness: fire\nresistant to: frost, poison...",
+         "...weakness: frost\nresistant to: fire, poison...", True),
+    ]
+    for desc, text_a, text_b, expected in cases:
+        got = _sections_materially_differ(text_a, text_b)
+        ok = got is expected
+        print(f"{'PASS' if ok else 'FAIL'} {desc}: got {got} (want {expected})")
+        all_ok = all_ok and ok
+
+    print("\n--- _dedupe(): a non-numeric disagreement keeps BOTH copies, never picks a winner ---")
+    conflicting_records = [
+        {"title": "Fenring", "heading": "Weaknesses",
+         "text": "...weakness: fire\nresistant to: frost, poison...",
+         "source": "fandom", "revid": 1, "url": "https://example.invalid/fandom/fenring"},
+        {"title": "Fenring", "heading": "Weaknesses",
+         "text": "...weakness: frost\nresistant to: fire, poison...",
+         "source": "weirdgloop", "revid": 2, "url": "https://example.invalid/weirdgloop/fenring"},
+    ]
+    kept = _dedupe(conflicting_records)
+    kept_sources = sorted(r["source"] for r in kept)
+    dedupe_ok = kept_sources == ["fandom", "weirdgloop"]
+    print(f"{'PASS' if dedupe_ok else 'FAIL'} both sources survive dedupe for a non-numeric "
+          f"disagreement -- this is C3: it used to silently keep only ['fandom']: "
+          f"{kept_sources!r}")
+    all_ok = all_ok and dedupe_ok
+
+    print("\n--- search(): never raises -- missing db, empty query, no-match, FTS5 metachars ---")
+    original_db_path = DB_PATH_DEFAULT
+    try:
+        with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-") as tmp_dir:
+            missing_db = os.path.join(tmp_dir, "does-not-exist.db")
+            DB_PATH_DEFAULT = missing_db
+            _reset_cache_for_tests()
+
+            buf_missing = io.StringIO()
+            with contextlib.redirect_stderr(buf_missing):
+                missing_result = search("anything")
+            missing_ok = missing_result == []
+            print(f"{'PASS' if missing_ok else 'FAIL'} search() against a missing db returns []: "
+                  f"{missing_result!r}")
+            all_ok = all_ok and missing_ok
+            missing_silent_ok = buf_missing.getvalue() == ""
+            print(f"{'PASS' if missing_silent_ok else 'FAIL'} a missing db (no index built yet) "
+                  f"is the normal, silent case -- logs nothing, unlike a broken one (H1): "
+                  f"{buf_missing.getvalue()!r}")
+            all_ok = all_ok and missing_silent_ok
+
+            empty_query_result = search("")
+            empty_query_ok = empty_query_result == []
+            print(f"{'PASS' if empty_query_ok else 'FAIL'} search('') returns []: "
+                  f"{empty_query_result!r}")
+            all_ok = all_ok and empty_query_ok
+
+            # A real, healthy index for the no-match / metacharacter / max_chars checks below.
+            records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+            healthy_db = os.path.join(tmp_dir, "wiki.db")
+            filler = " ".join(["lengthy"] * 900)  # well over 4000 chars, no unbroken long run
+            stub_records = [
+                {"title": "Fenring", "heading": "Weaknesses",
+                 "text": "Fenring is weak to fire and pierce damage.",
+                 "source": "weirdgloop", "revid": 101,
+                 "url": "https://example.invalid/weirdgloop/fenring", "timestamp": ""},
+                {"title": "Serpent", "heading": "Drops",
+                 "text": "Serpent drops these items: " + filler,
+                 "source": "fandom", "revid": 301,
+                 "url": "https://example.invalid/fandom/serpent", "timestamp": ""},
+            ]
+            with open(records_path, "w", encoding="utf-8") as fh:
+                for rec in stub_records:
+                    fh.write(json.dumps(rec) + "\n")
+            build_index(records_path=records_path, db_path=healthy_db)
+            DB_PATH_DEFAULT = healthy_db
+            _reset_cache_for_tests()
+
+            no_match_result = search("how many players are online today")
+            no_match_ok = no_match_result == []
+            print(f"{'PASS' if no_match_ok else 'FAIL'} search() against a healthy index with no "
+                  f"matching terms returns []: {no_match_result!r}")
+            all_ok = all_ok and no_match_ok
+
+            metachar_query = "\"unterminated OR NEAR() AND fire\" NOT frost"
+            try:
+                metachar_result = search(metachar_query)
+                metachar_ok = isinstance(metachar_result, list)
+            except Exception as exc:
+                metachar_result = exc
+                metachar_ok = False
+            print(f"{'PASS' if metachar_ok else 'FAIL'} search() with raw FTS5 metacharacters in "
+                  f"the query does not raise: {metachar_result!r}")
+            all_ok = all_ok and metachar_ok
+
+            budget_result = search("serpent drops", max_chars=100)
+            budget_total = sum(len(r["text"]) for r in budget_result)
+            budget_ok = 0 < budget_total <= 100
+            print(f"{'PASS' if budget_ok else 'FAIL'} max_chars is respected even when the best "
+                  f"match alone is much longer than the budget: {budget_total} chars (limit 100)")
+            all_ok = all_ok and budget_ok
+
+            _reset_cache_for_tests()  # release the connection before TemporaryDirectory cleans up
+    finally:
+        DB_PATH_DEFAULT = original_db_path
+        _reset_cache_for_tests()
+
+    print("\n--- H1: a broken index logs an ERROR line; an honest empty result logs nothing ---")
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-h1-") as tmp_dir:
+        broken_db = os.path.join(tmp_dir, "broken.db")
+        sqlite3.connect(broken_db).close()  # a valid sqlite file, but missing the `sections` table
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = broken_db
+            _reset_cache_for_tests()
+            _reset_error_log_for_tests()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                broken_result = search("anything")
+            broken_ok = broken_result == []
+            print(f"{'PASS' if broken_ok else 'FAIL'} search() against a table-less (broken) db "
+                  f"still returns [] rather than raising: {broken_result!r}")
+            all_ok = all_ok and broken_ok
+
+            logged = buf.getvalue()
+            logged_ok = bool(logged.strip()) and "no such table" in logged.lower()
+            print(f"{'PASS' if logged_ok else 'FAIL'} the broken-index failure IS logged to "
+                  f"stderr -- this is H1: it used to log NOTHING, identical to an honest "
+                  f"no-match: {logged!r}")
+            all_ok = all_ok and logged_ok
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                search("something else entirely")
+            not_flooded_ok = buf2.getvalue() == ""
+            print(f"{'PASS' if not_flooded_ok else 'FAIL'} the SAME failure on a second question "
+                  f"is rate-limited, not logged again immediately: {buf2.getvalue()!r}")
+            all_ok = all_ok and not_flooded_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
+            _reset_error_log_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-h1b-") as tmp_dir:
+        records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+        healthy_db = os.path.join(tmp_dir, "wiki.db")
+        with open(records_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "title": "Fenring", "heading": "Weaknesses", "text": "Fenring is weak to fire.",
+                "source": "weirdgloop", "revid": 1,
+                "url": "https://example.invalid/weirdgloop/fenring", "timestamp": "",
+            }) + "\n")
+        build_index(records_path=records_path, db_path=healthy_db)
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = healthy_db
+            _reset_cache_for_tests()
+            buf3 = io.StringIO()
+            with contextlib.redirect_stderr(buf3):
+                honest_empty = search("how many players are online today")
+            honest_empty_ok = honest_empty == [] and buf3.getvalue() == ""
+            print(f"{'PASS' if honest_empty_ok else 'FAIL'} an honest no-match against a HEALTHY "
+                  f"index returns [] and logs nothing -- the property H1 protects, a legitimate "
+                  f"empty result must stay silent: result={honest_empty!r} "
+                  f"logged={buf3.getvalue()!r}")
+            all_ok = all_ok and honest_empty_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
+
+    print()
+    if not all_ok:
+        print("SELFTEST FAILED -- see FAIL lines above", file=sys.stderr)
+        return 1
+    print("selftest: all assertions passed")
+    return 0
+
+
 # ---------------------------------------------------------------- CLI (for W4's timer / manual runs)
 def _main(argv):
     parser = argparse.ArgumentParser(
@@ -613,7 +821,15 @@ def _main(argv):
         default=DB_PATH_DEFAULT,
         help="output wiki.db path (default: %(default)s)",
     )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run this module's stdlib-only, no-network selftest and exit (no wiki-records.jsonl "
+             "or on-disk wiki.db required; see cmd_selftest())",
+    )
     args = parser.parse_args(argv)
+    if args.selftest:
+        return cmd_selftest()
     try:
         stats = build_index(args.records, args.db)
     except Exception as exc:
