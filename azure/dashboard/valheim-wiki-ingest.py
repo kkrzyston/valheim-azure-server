@@ -989,6 +989,11 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    if args.selftest:
+        if mwparserfromhell is None:
+            _LOG.error("the 'mwparserfromhell' package is not installed -- see requirements-ingest.txt")
+            return 1
+        return selftest()
     return run(args)
 
 
@@ -1012,6 +1017,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--contact", default=None, help="override the User-Agent contact token")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+    p.add_argument(
+        "--selftest", action="store_true",
+        help="run the built-in rendering checks against embedded wikitext (no network, no "
+             "--offline dir needed) and exit -- see selftest()",
+    )
     return p.parse_args(argv)
 
 
@@ -1110,6 +1120,113 @@ def run(args: argparse.Namespace) -> int:
         (": " + ", ".join(stats.skipped_titles)) if stats.skipped_titles else "",
     )
     return 0
+
+
+def selftest() -> int:
+    """`--selftest`: exercises the W6 rendering paths (data-bearing templates, wikitables)
+    against small embedded wikitext fixtures -- no network, no --offline directory, no dump
+    needed. Prints PASS/FAIL per check and returns 0 only if every one passed.
+
+    This IS "add checks for the new coverage" from PLAN-v6.md's W6 section: a creature's drops
+    end up attached to that creature, a wikitable row keeps its header label with its value, an
+    excluded (navbox/hatnote) template disappears cleanly rather than leaking its name or params
+    as noise, {{ and [[ never survive rendering, and rendering the same input twice is
+    deterministic. Every fixture here is synthetic and minimal on purpose, not a real wiki page,
+    so this runs instantly and offline and so a future change that breaks one of these specific
+    behaviors fails here immediately -- see this task's report for how each assertion was watched
+    to actually fail (by temporarily reverting the corresponding rendering change) before being
+    confirmed passing again; an assertion never watched to fail is not a lock."""
+    checks = []
+
+    def check(name, condition):
+        checks.append((name, bool(condition)))
+
+    # 1. A creature's drops end up attached to that creature.
+    creature_page = (
+        "{{infobox creature\n| title = Test Beast\n}}\n"
+        "== Drops ==\n"
+        "{{drop table|{{drop row|item=Test Trophy|0star=10%}}\n"
+        "{{drop row|item=Test Meat|0star=5}}}}\n"
+    )
+    creature_sections = dict(page_to_sections("Test Beast", creature_page))
+    drops_text = creature_sections.get("Drops", "")
+    check(
+        "creature drops attached to the creature (item name + rate together in Drops)",
+        "Test Trophy" in drops_text and "10%" in drops_text and "Test Meat" in drops_text,
+    )
+
+    # 2. A wikitable row keeps its header label with its value.
+    table_page = (
+        "== Damage ==\n"
+        '{| class="wikitable"\n'
+        "! Damage type !! Multiplier\n"
+        "|-\n"
+        "| Fire || 25%\n"
+        "|-\n"
+        "| Frost || 50%\n"
+        "|}\n"
+    )
+    table_sections = dict(page_to_sections("Test Table Page", table_page))
+    damage_text = table_sections.get("Damage", "")
+    check(
+        "wikitable row keeps its header label attached to its value",
+        "Damage type: Fire" in damage_text and "Multiplier: 25%" in damage_text
+        and "Damage type: Frost" in damage_text and "Multiplier: 50%" in damage_text,
+    )
+
+    # 3. An excluded (navbox/hatnote) template disappears cleanly; real prose is untouched.
+    navbox_page = "== Notes ==\nReal prose stays. {{TestThingNav}} {{For|a disambiguation note|Other Page}}\n"
+    navbox_sections = dict(page_to_sections("Test Navbox Page", navbox_page))
+    notes_text = navbox_sections.get("Notes", "")
+    check(
+        "excluded navbox/hatnote template leaves no trace, real prose survives",
+        "Real prose stays" in notes_text
+        and "TestThingNav" not in notes_text
+        and "disambiguation note" not in notes_text,
+    )
+
+    # 4. {{Item link}} renders inline with its quantity (or bare, when none is given).
+    item_link_page = "== Recipe ==\nRequires {{Item link|Wood|10}} and {{Item link|Stone}}.\n"
+    item_sections = dict(page_to_sections("Test Recipe Page", item_link_page))
+    recipe_text = item_sections.get("Recipe", "")
+    check(
+        "Item link renders as 'Name xN' with its quantity, bare 'Name' with none",
+        "Wood x10" in recipe_text and "Stone" in recipe_text,
+    )
+
+    # 5. {{ and [[ never survive rendering, across every fixture above. NOTE on this check's real
+    # coverage (confirmed empirically while building this task): mwparserfromhell's
+    # Wikicode.replace() RE-PARSES its string argument, so a render_* function that accidentally
+    # embedded a raw but WELL-FORMED nested template/link would have it silently re-absorbed and
+    # dropped by the final strip_code() call -- the same silent-content-loss failure mode W6 exists
+    # to fix, not a visible brace leak, and checks 1/2/4 above (content actually present) are what
+    # catch that class of regression. This check's real teeth are narrower: it catches a
+    # MALFORMED/incomplete brace sequence (confirmed: strip_code() leaves an unmatched "{{" with no
+    # closing "}}" as literal text rather than silently eating it), which is still a real and
+    # distinct way this script could visibly leak wiki markup into the corpus.
+    all_text = "\n".join(
+        text
+        for secs in (creature_sections, table_sections, navbox_sections, item_sections)
+        for text in secs.values()
+    )
+    check(
+        "no literal '{{' or '[[' survives in any fixture's rendered output",
+        "{{" not in all_text and "[[" not in all_text,
+    )
+
+    # 6. Rendering the same input twice is deterministic (no dict/set-ordering surprise) --
+    # the real-world equivalent of write_corpus()'s sort making a full run byte-stable.
+    check(
+        "rendering the same page twice produces identical output",
+        page_to_sections("Test Beast", creature_page) == page_to_sections("Test Beast", creature_page),
+    )
+
+    ok = True
+    for name, passed in checks:
+        print(f"{'PASS' if passed else 'FAIL'}: {name}")
+        ok = ok and passed
+    print("SELFTEST:", "all checks passed" if ok else "one or more checks FAILED")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
