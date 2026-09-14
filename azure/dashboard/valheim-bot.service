@@ -1,24 +1,70 @@
 [Unit]
-Description=Hermodr, Valheim Discord Q&A bot
+Description=Hermodr, Valheim Discord Q&A bot and restart-approval relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/opt/hermodr/venv/bin/python /usr/local/sbin/valheim-bot.py
-EnvironmentFile=-/etc/valheim-alert.env
+# Its own template now -- see valheim-bot.env's header for why this split from
+# /etc/valheim-alert.env, which the alert/medals/digest scripts keep using.
+EnvironmentFile=-/etc/valheim-bot.env
 Restart=always
 RestartSec=10
 Nice=10
 
-# Hardening. The bot only ever reads the dashboard's own on-disk state and writes its own log --
-# nothing else, so it gets a strict, mostly read-only sandbox.
+# De-rooted (see this task's report): a long-running gateway daemon parsing untrusted internet
+# text through discord.py's dependency tree has no business at uid 0, and the restart-approval
+# feature's whole trust model ("only accept verdicts written by the bot's own uid") is meaningless
+# if the bot IS root. valheim-bot is a system account with a nologin shell -- see task I1's
+# useradd line. Group-owned files this unit needs to read (samples.jsonl, events.jsonl, etc.)
+# must be world-readable; see this task's report on valheim-status-collect.py's file modes.
+User=valheim-bot
+Group=valheim-bot
+
+# LogsDirectory=hermodr creates /var/log/hermodr owned by valheim-bot:valheim-bot before start,
+# so the bot can write its own log without a broader /var/log grant. HERMODR_LOG now defaults to
+# /var/log/hermodr/hermodr.log (see valheim-bot.py) -- the log path changed, flag this for the
+# README (task I1).
+LogsDirectory=hermodr
+
+# Hardening. The bot reads the dashboard's own on-disk state, the restart spool's inbox/, and
+# writes only its own log plus create-only files under the restart spool's verdicts/ -- nothing
+# else, so it gets a strict, mostly read-only sandbox.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log
-ReadOnlyPaths=/var/www/valheim /var/lib/valheim-status
+# ProtectSystem=strict already makes /var/lib/valheim-restart/inbox read-only like everything
+# else outside ReadWritePaths=; it is still listed here (alongside the two paths that predate the
+# restart feature) purely for documentation and defense-in-depth, matching this unit's existing
+# style of spelling out what it reads even where that duplicates ProtectSystem's own default.
+ReadOnlyPaths=/var/www/valheim /var/lib/valheim-status /var/lib/valheim-restart/inbox
+# The only path this process can write to besides its own log: verdicts/ is mode 1730
+# (root:valheim-bot, create-only -- see PLAN-v5's spool table), so even with this grant the bot
+# can create a new file by name but can never list or read the directory back.
+ReadWritePaths=/var/lib/valheim-restart/verdicts
+
+# Additional hardening for the restart-approval feature: this process talks to Discord's gateway
+# and the Azure AI endpoint over plain outbound HTTPS/WSS and does not need anything resembling a
+# privileged syscall, a kernel interface, or a second namespace.
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @module @raw-io @reboot @swap @mount
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryMax=512M
+TasksMax=64
 
 [Install]
 WantedBy=multi-user.target
