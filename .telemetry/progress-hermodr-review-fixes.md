@@ -1,1 +1,2 @@
 2026-09-14T21:37:01Z	~28	Fix1 (english_mode on AI-failure path) and Fix2 (to_futhark fail-closed + norse_reply trim-to-balanced) committed, selftest green	Fix3 (ENGLISH_RE false positives), Fix4 (decide_route extraction), Fix5 (empty-reply guard + canned-reply assertions)
+2026-09-14T21:56:00Z	~64	All 5 fixes committed (05d9bcc,0734dd7,15034d3,d1f9f24,4963829); final selftest exit 0, decide_route sabotage-verified	done -- final report to orchestrator
