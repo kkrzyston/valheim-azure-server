@@ -1619,6 +1619,21 @@ def run_bot():
             return
 
         answer = sanitize_output(answer)
+        if not answer.strip():
+            # norse_reply("") and norse_reply("   ") both return "" (see its docstring's
+            # degenerate-fallback path), and an english_mode answer that is blank stays blank --
+            # either way message.reply("") raises. A model call that "succeeded" with nothing
+            # usable in it is functionally the same failure as an AI call that errored outright,
+            # so it gets the same reply.
+            log(f"AI returned an empty/blank answer after sanitization ({'english' if english_mode else 'old norse'} mode); sending the AI-failure reply instead of an empty message", "error")
+            try:
+                await message.reply(
+                    AI_FAILURE_REPLY_ENGLISH if english_mode else AI_FAILURE_REPLY,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception as exc:
+                log(f"failed to send AI-failure notice: {exc!r}", "warning")
+            return
         reply_text = answer if english_mode else norse_reply(answer)
         reply_text = truncate_discord(reply_text)
         try:
@@ -1653,6 +1668,7 @@ def cmd_selftest():
         ("empty-question nudge", EMPTY_QUESTION_REPLY),
         ("rate-limit notice", RATE_LIMIT_REPLY),
         ("AI-failure notice", AI_FAILURE_REPLY),
+        ("AI-failure notice (english_mode)", AI_FAILURE_REPLY_ENGLISH),
         ("join_reply()", join_reply()),
         ("join_reply(english=True)", join_reply(english=True)),
     ):
@@ -1660,7 +1676,36 @@ def cmd_selftest():
         print(text)
         print()
 
-    print("--- ENGLISH_RE (explicit-ask matches only) ---")
+    print("--- canned Old Norse replies: content assertions (a hardcoded-text typo must fail) ---")
+    # EMPTY_QUESTION_REPLY, RATE_LIMIT_REPLY, and AI_FAILURE_REPLY are printed above but were
+    # never previously asserted -- a typo in the hardcoded Old Norse, or a norse_reply() call that
+    # silently degenerated (see Fix 5's guard in on_message for exactly that failure mode), would
+    # show up in the printed output but never fail the exit code. These three, and only these
+    # three, are deliberately Old-Norse-only regardless of english_mode (a product decision, not
+    # a bug -- see the rate-limit/empty-question call sites), so each must have both halves, a
+    # non-empty rune line, and a rune half that is exactly to_futhark() of its own Latin half.
+    for label, text in (
+        ("EMPTY_QUESTION_REPLY", EMPTY_QUESTION_REPLY),
+        ("RATE_LIMIT_REPLY", RATE_LIMIT_REPLY),
+        ("AI_FAILURE_REPLY", AI_FAILURE_REPLY),
+    ):
+        has_both = "\n" in text
+        print(f"{'PASS' if has_both else 'FAIL'} {label}: both halves present")
+        all_ok = all_ok and has_both
+        if has_both:
+            rune_half, latin_half = text.split("\n", 1)
+            rune_nonempty = len(rune_half) > 0
+            print(f"{'PASS' if rune_nonempty else 'FAIL'} {label}: rune half non-empty")
+            all_ok = all_ok and rune_nonempty
+            matches = to_futhark(latin_half) == rune_half
+            print(f"{'PASS' if matches else 'FAIL'} {label}: rune half == to_futhark(Latin half)")
+            all_ok = all_ok and matches
+        else:
+            all_ok = False
+            print(f"FAIL {label}: rune half non-empty: no \"\\n\" to split on")
+            print(f"FAIL {label}: rune half == to_futhark(Latin half): no \"\\n\" to split on")
+
+    print("\n--- ENGLISH_RE (explicit-ask matches only) ---")
     should_match = [
         "can you say that in english",
         "speak english please",
