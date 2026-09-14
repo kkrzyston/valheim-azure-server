@@ -278,29 +278,104 @@ def _normalize_for_compare(text):
     return _WHITESPACE_RE.sub(" ", (text or "").strip().lower())
 
 
+# C3 fix: a small, known vocabulary of relational words that game-wiki sections use to name a
+# short, specific answer -- a damage type, a status, an item list. Maps every inflection this
+# code recognizes down to one canonical bucket, so "weak"/"weakness"/"weaknesses" all compare
+# against each other regardless of which form either source used.
+#
+# See _sections_materially_differ()'s docstring for why this targeted, pattern-based check --
+# not a general "do the two texts use different words" comparison -- is the right level of
+# matching for telling "reworded" apart from "contradicted".
+_RELATION_KEYWORDS = {
+    "weak": "weakness", "weakness": "weakness", "weaknesses": "weakness",
+    "resist": "resistance", "resistant": "resistance", "resistance": "resistance",
+    "immune": "immunity", "immunity": "immunity",
+    "vulnerable": "vulnerability", "vulnerability": "vulnerability",
+    "susceptible": "vulnerability",
+    "drop": "drops", "drops": "drops",
+    "biome": "biome", "biomes": "biome",
+    "found": "location", "located": "location",
+}
+
+# Matches a keyword from the table above, an optional "to" and/or ":" separator (covering both
+# "weak to fire" and "weakness: fire" phrasings), then captures the short answer that follows up
+# to the next clause boundary (the char class deliberately excludes ".", so "...fire.\nresistant"
+# stops the capture at "fire" rather than swallowing the next sentence).
+_RELATION_VALUE_RE = re.compile(
+    r"\b(" + "|".join(
+        sorted((re.escape(k) for k in _RELATION_KEYWORDS), key=len, reverse=True)
+    ) + r")\b"
+    r"\s*(?:to)?\s*:?\s*"
+    r"([a-z][a-z0-9 ,/&'-]*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_relations(normalized_text):
+    """Pull {relation: set(values)} pairs -- e.g. {"weakness": {"fire"}, "resistance": {"frost",
+    "poison"}} -- out of wiki prose, however it phrases them: a label ("weakness: fire") or
+    inline ("weak to fire"), a single value or a comma/and/slash/&-separated list.
+
+    Best-effort and deliberately loose: this is only ever used to find REASONS to keep both
+    copies in _sections_materially_differ(), never to decide anything is safe to collapse on its
+    own, so an over-eager match here costs at most one harmless extra duplicate, never a hidden
+    contradiction."""
+    relations = {}
+    for m in _RELATION_VALUE_RE.finditer(normalized_text):
+        canonical = _RELATION_KEYWORDS[m.group(1).lower()]
+        items = {
+            item.strip(" .")
+            for item in re.split(r",|\band\b|/|&", m.group(2).lower())
+            if item.strip(" .")
+        }
+        if items:
+            relations.setdefault(canonical, set()).update(items)
+    return relations
+
+
 def _sections_materially_differ(text_a, text_b):
-    """Step 5's dedupe rule. Two same-(title, heading) sections are the SAME (safe to collapse
-    to the single Fandom copy) only if:
-      (a) their normalized text (lowercased, whitespace-collapsed) is byte-identical, OR
-      (b) their normalized text has the exact same multiset of numeric tokens, AND a
-          difflib.SequenceMatcher ratio on that text is >= _SAME_TEXT_RATIO_THRESHOLD (0.75).
+    """Step 5's dedupe rule -- decides whether two same-(title, heading) sections from Fandom and
+    Weird Gloop are safe to collapse to one copy, or must both be kept because they disagree on a
+    fact. Two normalized (lowercased, whitespace-collapsed) texts are the SAME only if ALL of:
+      (a) byte-identical after normalization (short-circuits everything below), OR
+      (b) their multiset of numeric tokens matches EXACTLY, AND
+      (c) neither text names a different value for the same short-answer attribute this code
+          recognizes -- weakness, resistance, immunity, vulnerability, drops, biome, location --
+          whether phrased as a label ("Weakness: fire") or inline ("weak to fire") -- see
+          _extract_relations(), AND
+      (d) a difflib.SequenceMatcher ratio on the normalized text is >= _SAME_TEXT_RATIO_THRESHOLD.
+    Any ONE of a numeric mismatch, a recognized-attribute mismatch, or a low ratio is sufficient
+    on its own to call the pair "different" and keep both.
 
-    Any pair whose numeric tokens differ AT ALL -- a health value, a percentage, a drop count,
-    a duration, anything made of digits -- is unconditionally "materially different" and BOTH
-    are kept, no matter how similar the surrounding prose reads. This is deliberate: the
-    disagreement this project actually needs to catch is almost always a number (PLAN-v6: "a
-    confidently-stated wrong number is the exact failure this design exists to avoid"), and a
-    single changed stat can sit inside two paragraphs that are otherwise 99% textually
-    identical -- a pure prose-similarity ratio would score that pair as "the same" and quietly
-    pick a winner, which is exactly the failure mode this function exists to prevent. Numeric
-    comparison is checked first and short-circuits to "different" before prose similarity is
-    even considered.
+    Why three checks and not the ratio alone (this function's original, too-narrow form): a pure
+    edit-distance ratio measures how much TEXT changed, not whether the ANSWER changed, and those
+    are not the same thing. Demonstrated case that motivated this rewrite:
+        fandom     = "...weakness: fire\\nresistant to: frost, poison..."
+        weirdgloop = "...weakness: frost\\nresistant to: fire, poison..."
+    These two score a difflib ratio of 0.958 (they share almost every character) and have
+    IDENTICAL numeric tokens (none) -- the old numeric-only rule called them "the same" and
+    silently kept one copy, discarding a directly contradictory fact. Swapping "fire" for "frost"
+    is a small, cheap edit by character count, which is exactly the property that makes ratio the
+    wrong instrument here: PLAN-v6's design goal is "a confidently-stated wrong number is the
+    exact failure to avoid" -- and a confidently-stated wrong weakness, biome, or drop is exactly
+    as bad, for the same reason, even though no digit is involved.
 
-    The 0.75 ratio threshold only ever applies to number-free (or number-identical) text, and
-    is intentionally lenient: on any doubt this rule must fail toward keeping both copies. The
-    cost of a false "materially different" is one harmless duplicate section shown to the user;
-    the cost of a false "same" is a silently wrong answer, which is the one outcome this whole
-    design exists to avoid.
+    (c) is deliberately narrow and pattern-based rather than a general "do the two texts use
+    different words" check: comparing whole content-word sets would flag nearly every reworded
+    sentence as "different" (synonyms, added clauses, reordered lists) and defeat dedup entirely.
+    Instead it targets the specific shape a wiki fact-swap actually takes -- a short, structured
+    answer sitting right after one of a small, known vocabulary of relational words -- which is
+    precisely what catches the case above without needing to parse prose in general.
+
+    This is not a claim that (c)'s keyword list is exhaustive, or that (d)'s ratio catches every
+    remaining non-numeric, non-keyword disagreement (an entity-name swap in a sentence with no
+    recognized keyword, for instance, is still only caught if it drags the ratio below threshold).
+    Where this function is uncertain, it is designed to fail toward "materially different": a
+    harmless duplicate section shown to the user costs a little redundancy; a fact silently
+    discarded because it happened to be phrased in a way this function doesn't recognize is the
+    exact failure PLAN-v6 exists to avoid. That is why (b), (c), and (d) are ANDed for "same" --
+    every one of them has to agree the pair is safe to collapse -- but any single one of them
+    disagreeing is enough to keep both.
     """
     norm_a = _normalize_for_compare(text_a)
     norm_b = _normalize_for_compare(text_b)
@@ -308,6 +383,11 @@ def _sections_materially_differ(text_a, text_b):
         return False
     if sorted(_NUMBER_RE.findall(norm_a)) != sorted(_NUMBER_RE.findall(norm_b)):
         return True
+    rel_a = _extract_relations(norm_a)
+    rel_b = _extract_relations(norm_b)
+    for key in rel_a.keys() & rel_b.keys():
+        if rel_a[key] != rel_b[key]:
+            return True
     ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
     return ratio < _SAME_TEXT_RATIO_THRESHOLD
 
