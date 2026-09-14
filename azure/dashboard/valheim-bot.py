@@ -482,11 +482,13 @@ def call_ai_sync(question, context):
     is True only when ENGLISH_RE matched `question` and the one-turn override below was appended
     to the system message for this call. Callers use it to know whether to post the answer
     through norse_reply() (Old Norse default) or as plain text (explicit English request)."""
+    english_mode = bool(ENGLISH_RE.search(question))
     try:
         token = get_azure_token()
     except Exception as exc:
-        return False, f"could not get a managed-identity token: {exc!r}", False
-    english_mode = bool(ENGLISH_RE.search(question))
+        log(f"could not get a managed-identity token ({'english' if english_mode else 'old norse'} "
+            f"mode): {exc!r}", "error")
+        return False, f"could not get a managed-identity token: {exc!r}", english_mode
     system_content = SYSTEM_PROMPT.format(context=context)
     if english_mode:
         # A Python-side, deterministic override -- not left to the model to decide on its own.
@@ -525,8 +527,11 @@ def call_ai_sync(question, context):
             detail = exc.read().decode("utf-8", "replace")[:300]
         except Exception:
             pass
+        log(f"AI endpoint returned {exc.code} ({'english' if english_mode else 'old norse'} mode): "
+            f"{detail}", "error")
         return False, f"AI endpoint returned {exc.code}: {detail}", english_mode
     except Exception as exc:
+        log(f"AI call failed ({'english' if english_mode else 'old norse'} mode): {exc!r}", "error")
         return False, f"AI call failed: {exc!r}", english_mode
 
 
@@ -818,6 +823,13 @@ def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
 EMPTY_QUESTION_REPLY = norse_reply("Spyr mik einhvers -- um höllina, víking, eða heiðr.")
 RATE_LIMIT_REPLY = norse_reply("Hægar -- ein spurning á 10 sekúndum, hámark á hverri stund.")
 AI_FAILURE_REPLY = norse_reply("Brunnrinn þvarr -- náði ekki til véfréttar núna. Reyn aftur brátt.")
+# Plain English, never run through norse_reply() -- used only when the AI call fails on a reply
+# where english_mode is True (the user explicitly asked for English via ENGLISH_RE). A user who
+# asks "why is the server down, in English please" and hits a network/AI failure needs to be able
+# to read the answer; handing them AI_FAILURE_REPLY's runes on exactly that path would defeat the
+# whole point of the escape hatch. Kept as plain text, not wrapped in norse_reply(), matching how
+# every other english_mode reply in on_message is sent (see the ok=True branch below).
+AI_FAILURE_REPLY_ENGLISH = "The well ran dry -- could not reach the oracle just now. Try again shortly."
 
 
 def sanitize_output(text):
@@ -1461,10 +1473,10 @@ def run_bot():
 
         ok, answer, english_mode = await asyncio.to_thread(call_ai_sync, question, context)
         if not ok:
-            log(f"AI call failed: {answer}", "error")
+            log(f"AI call failed ({'english' if english_mode else 'old norse'} mode): {answer}", "error")
             try:
                 await message.reply(
-                    AI_FAILURE_REPLY,
+                    AI_FAILURE_REPLY_ENGLISH if english_mode else AI_FAILURE_REPLY,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except Exception as exc:
