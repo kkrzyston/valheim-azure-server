@@ -62,7 +62,13 @@ Security (see azure/README.md "Hermodr" for the full model):
   7. Per-user rate limits, in-memory: Q&A is 1 question/10s and 20/hour; approval button clicks
      get their own instance of the same RateLimiter, so a prankster mashing buttons can't spam
      the log either.
-  8. max_tokens ~500, and the reply is truncated to Discord's 2000-char limit on a word boundary.
+  8. max_tokens ~700, and the reply is truncated to Discord's 2000-char limit on a word boundary.
+  9. Replies are Old Norse by default (SYSTEM_PROMPT's LANGUAGE block + to_futhark()'s runic
+     line prepended by norse_reply()) -- the model never types a rune itself, only Latin-letter
+     Old Norse, which keeps the runes consistent and keeps token cost off the deployment's 20K
+     TPM ceiling. English is available only via an explicit ask matched by ENGLISH_RE
+     ("in English", "translate that", "a ensku", ...), handled deterministically in Python
+     (call_ai_sync()) rather than left to the model to grant itself.
 
 Testing without a bot token or a VM:
   --selftest        builds the context, prints it with a char count, exits. No Discord, no AI,
@@ -132,7 +138,10 @@ INBOX_DIR = os.path.join(RESTART_ROOT, "inbox")
 VERDICTS_DIR = os.path.join(RESTART_ROOT, "verdicts")
 INBOX_POLL_S = 15  # modest poll, not a busy loop -- a restart request is not latency-sensitive
 
-MAX_TOKENS = 500
+# 500 -> 700: Old Norse prose plus its required backtick-wrapped proper nouns/values runs a bit
+# longer than the equivalent English answer for the same content, so the old ceiling was clipping
+# replies mid-sentence more often than before this change.
+MAX_TOKENS = 700
 DISCORD_LIMIT = 2000
 CONTEXT_TTL_S = 60  # medals compute() is the expensive part; cache the whole context for this long
 SHORT_COOLDOWN_S = 10
