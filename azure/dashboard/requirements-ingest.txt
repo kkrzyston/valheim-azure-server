@@ -1,0 +1,24 @@
+# Dependencies for valheim-wiki-ingest.py ONLY -- installed into its own venv, never into the
+# bot's runtime (see PLAN-v6.md "Hard rules for every agent": the bot process stays stdlib-only).
+#
+#   python3 -m venv .venv-ingest
+#   .venv-ingest/bin/pip install -r requirements-ingest.txt      # Linux/mac
+#   .venv-ingest\Scripts\pip install -r requirements-ingest.txt  # Windows
+#
+# mwparserfromhell: wikitext -> AST, so infobox template PARAMETERS (numbers, resistances) are
+#   read as structured data instead of guessed at with regex. PLAN-v6.md is explicit that regex
+#   here is the single most likely way to make this feature quietly useless.
+# requests: HTTP client for the MediaWiki APIs (Fandom, Weird Gloop) with a real session object,
+#   so the descriptive User-Agent (PLAN-v6.md "Sources, licensing and etiquette") is set once and
+#   applied to every request rather than re-specified per call.
+# py7zr: NOT in PLAN-v6.md's original two-package list -- added because the published Fandom bulk
+#   dump (`valheim_pages_current.xml.7z`) is 7-Zip-compressed, and CPython's stdlib `lzma` module
+#   speaks the raw .xz/.lzma stream format but not the 7z *container* format (multi-stream archive
+#   with its own header/index). Without this, "download the dump, decompress" in W1 step 1 has no
+#   implementation that doesn't shell out to a system `7z` binary of unknown availability on the
+#   operator's machine. py7zr is pure-Python-plus-C-extension-wheels (no system 7z install
+#   required) and reads the dump as a stream. Flagged in this task's report as a deviation from
+#   the plan's stated dependency list.
+mwparserfromhell==0.7.2
+requests==2.34.2
+py7zr==1.1.3
