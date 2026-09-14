@@ -73,7 +73,8 @@ install -m 0644 valheim-medals-web.service valheim-medals-web.timer /etc/systemd
 # The restart feature. valheim-restart-exec.path is installed but deliberately NOT enabled --
 # see the warning in its header; the 15 s timer is the guarantee, the path unit is convenience.
 install -m 0755 valheim-restartd.py valheim-restart-exec.py /usr/local/sbin/
-install -m 0644 valheim-restartd.service valheim-restart-exec.service \n                valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
+install -m 0644 valheim-restartd.service valheim-restart-exec.service \
+                valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
 install -m 0644 manifest.webmanifest icon.svg icon-192.png icon-512.png /var/www/valheim/
 # Hermodr (Discord Q&A bot) -- its own venv so discord.py never touches the system Python used by
 # the collector/alert/medals scripts above. Installed but NOT started: it needs DISCORD_BOT_TOKEN
