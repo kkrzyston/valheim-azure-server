@@ -72,9 +72,10 @@
   .tide .head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
   h2 { margin: 0 0 14px; font-family: var(--display); font-weight: 700; font-size: 26px; letter-spacing: .01em; }
   .tide h2 { margin: 0; }
-  .tide .range { display: flex; gap: 4px; }
-  .tide .range button { font: inherit; font-size: 16px; color: var(--ash); background: none; border: 1px solid transparent; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
-  .tide .range button[aria-pressed="true"] { color: var(--parchment); border-color: var(--seam); background: var(--timber); }
+  .range { display: flex; gap: 4px; }
+  .range button { font: inherit; font-size: 16px; color: var(--ash); background: none; border: 1px solid transparent; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
+  .range button:hover { color: var(--parchment); }
+  .range button[aria-pressed="true"] { color: var(--parchment); border-color: var(--seam); background: var(--timber); }
   .tide canvas { width: 100%; height: 190px; display: block; }
   .tide .note { color: var(--ash); font-size: 16px; margin: 8px 0 0; }
   .tide .pingwrap { margin-top: 26px; }
@@ -255,6 +256,66 @@
   .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
   /* off-site backups / azure / os update rows reuse .card and dl, no new selectors needed */
+
+  /* ---------------- v5: navigation, the hall of fame, the restart request ---------------- */
+
+  /* .facts/.cols/.two/.progress/.mapgrid all set `display`, which beats the UA's [hidden] rule.
+     The router toggles el.hidden, so [hidden] has to win everywhere. */
+  [hidden] { display: none !important; }
+
+  /* carved boards nailed across the top, not a tab bar */
+  .nav { border-bottom: 1px solid var(--seam); }
+  .nav ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
+  .nav li { flex: none; }
+  .nav a { display: block; font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: .01em; text-decoration: none; color: var(--ash); white-space: nowrap; padding: 11px 20px 9px; border-right: 1px solid var(--seam); border-bottom: 2px solid transparent; background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(0,0,0,.16)); }
+  .nav li:first-child a { border-left: 1px solid var(--seam); }
+  .nav a:hover { color: var(--parchment); }
+  .nav a:focus-visible { outline: 2px solid var(--torch); outline-offset: -3px; }
+  .nav a[aria-current="page"] { color: var(--torch); background: var(--timber); border-bottom-color: var(--torch); text-shadow: 0 0 16px rgba(227,165,74,.4); }
+  @media (max-width: 520px) { .nav a { font-size: 18px; padding: 10px 14px 8px; } }
+
+  a.btn { text-decoration: none; display: inline-block; }
+  .btn.primary { color: var(--soot); background: var(--torch); border-color: var(--torch); font-weight: 500; }
+  .btn.primary:hover { background: #efb962; }
+  .btn[disabled] { color: var(--ash); background: none; border-color: var(--seam); cursor: default; }
+  .btn.primary[disabled] { background: var(--seam); color: var(--ash); }
+  .note b { color: var(--parchment); font-weight: 500; }
+
+  /* medals and records */
+  #hallband h3 { font-family: var(--display); font-weight: 700; font-size: 24px; margin: 30px 0 4px; }
+  #hallband h4 { font-family: var(--body); font-weight: 500; font-size: 19px; color: var(--ash); margin: 22px 0 10px; }
+  .medals { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+  .medal { border: 1px solid var(--seam); border-radius: 4px; background: var(--timber); padding: 12px 14px 13px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .medal .t { display: flex; gap: 10px; align-items: baseline; }
+  .medal .t .em { font-size: 22px; line-height: 1.1; flex: none; }
+  .medal .t b { font-weight: 500; font-size: 19px; }
+  .medal .win { margin: 8px 0 0; }
+  .medal .win b { color: var(--torch); font-weight: 500; }
+  .medal .win .val { color: var(--parchment); font-weight: 500; }
+  .medal .run, .medal .how { color: var(--ash); font-size: 16px; margin: 6px 0 0; }
+  .medal.unwon { background: none; }
+  .medal.unwon .t b, .medal.unwon .t .em { opacity: .6; }
+  .medal.unwon .win { color: var(--ash); }
+
+  /* the restart request */
+  .rsform { display: grid; gap: 14px; }
+  .rsform > div > label { display: block; color: var(--ash); font-size: 16px; margin-bottom: 5px; }
+  .rsform select, .rsform input[type="text"] { font: inherit; font-size: 17px; color: var(--parchment); background: var(--char); border: 1px solid var(--seam); border-radius: 4px; padding: 6px 10px; width: 100%; max-width: 400px; }
+  .rsform select:focus-visible, .rsform input:focus-visible { outline: 2px solid var(--torch); outline-offset: 2px; }
+  .rsform .note { margin-top: 6px; }
+  .rsack { display: flex; gap: 11px; align-items: flex-start; border: 1px solid rgba(201,81,60,.55); border-radius: 4px; padding: 11px 13px; background: rgba(201,81,60,.08); }
+  .rsack input { flex: none; width: 18px; height: 18px; margin: .3em 0 0; accent-color: #e3a54a; }
+  .rsack label { display: block; color: var(--parchment); font-size: 17px; }
+  .rsmsg { margin: 8px 0 0; font-size: 17px; }
+  .rsmsg.bad { color: var(--blood); } .rsmsg.ok { color: var(--moss); }
+  .rsprog { border: 1px solid rgba(227,165,74,.5); border-radius: 4px; background: rgba(227,165,74,.07); padding: 13px 15px 15px; margin: 14px 0 18px; }
+  .rsprog .big { font-size: 22px; font-weight: 500; line-height: 1.25; }
+  .rsprog .k { color: var(--ash); font-size: 16px; margin-top: 5px; }
+  .rsprog .cd { font-size: 34px; color: var(--torch); font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 8px; }
+  .rsprog.done { border-color: var(--seam); background: var(--timber); }
+  .downcall .card { border-color: rgba(201,81,60,.6); background: rgba(201,81,60,.08); }
+  .downcall .card .big { font-size: 24px; }
+  .downcall .card p { margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -270,41 +331,38 @@
     </div>
   </header>
 
-  <section class="hero" id="hero">
+  <nav class="nav" aria-label="Parts of the hall">
+    <ul id="navlist">
+      <li><a href="#/" data-route="/">Now</a></li>
+      <li><a href="#/world" data-route="/world">The world</a></li>
+      <li><a href="#/vikings" data-route="/vikings">Vikings</a></li>
+      <li><a href="#/trends" data-route="/trends">Trends</a></li>
+      <li><a href="#/hall" data-route="/hall">Hall of fame</a></li>
+      <li><a href="#/server" data-route="/server">The machine</a></li>
+    </ul>
+  </nav>
+  <p class="sr" id="viewsay" role="status" aria-live="polite"></p>
+
+  <!-- ======================= #/ ======================= -->
+  <section class="hero" id="hero" data-view="now">
     <h1 id="headline"><span class="lamp"></span>Looking for the server…</h1>
     <ul class="who" id="who"></ul>
     <p class="invite">Join in Valheim with <code>20.230.157.206:2456</code><button type="button" id="copy">Copy address</button><a class="btn" href="steam://run/892970//+connect%2020.230.157.206:2456">Open in Steam (may just launch the game)</a></p>
   </section>
 
-  <section class="tide">
-    <div class="head">
-      <h2 id="tidetitle">Vikings in the world, last 24 hours</h2>
-      <div class="range" role="group" aria-label="Time range">
-        <button type="button" data-range="day" aria-pressed="true">24 hours</button>
-        <button type="button" data-range="week" aria-pressed="false">7 days</button>
-      </div>
-    </div>
-    <canvas id="chart" height="190" aria-label="Player count over time" role="img"></canvas>
-    <p class="note" id="tidenote"></p>
-    <div class="pingwrap" id="pingwrap" hidden>
-      <h3>Ping to each Viking, last 24 hours</h3>
-      <canvas id="pingchart" height="150" aria-label="Ping to each player over the last 24 hours" role="img"></canvas>
-      <ul class="legend" id="pinglegend"></ul>
-    </div>
+  <section class="band downcall" id="downcall" data-view="now" hidden>
+    <div class="card" id="downcallbody"></div>
   </section>
 
-  <section class="band timeline" id="timelineband">
-    <div class="head"><h2>Who was in the hall, last 7 days</h2><span class="count" id="timelinecount"></span></div>
-    <div class="scroll">
-      <div id="timeline"></div>
-      <div class="axis" id="timelineaxis"></div>
-    </div>
-    <p class="note" id="timelinenote">Not recorded yet.</p>
+  <section class="facts" id="facts" data-view="now"></section>
+
+  <section class="band" data-view="now">
+    <div class="head"><h2>Lately</h2><span class="count"><a href="#/server">Everything that has happened</a></span></div>
+    <ul class="feed" id="nowfeed"><li class="empty">Nothing recorded yet.</li></ul>
   </section>
 
-  <section class="facts" id="facts"></section>
-
-  <section class="band">
+  <!-- ======================= #/world ======================= -->
+  <section class="band" data-view="world">
     <div class="head"><h2>Progress</h2><span class="count" id="bosscount"></span></div>
     <div class="progress">
       <div>
@@ -318,7 +376,7 @@
     </div>
   </section>
 
-  <section class="band" id="mapband">
+  <section class="band" id="mapband" data-view="world">
     <div class="head"><h2>Vancouver Island, mapped</h2><span class="count" id="mapexplored"></span></div>
     <div class="mapgrid">
       <div>
@@ -352,39 +410,18 @@
     </div>
   </section>
 
-  <div class="cols">
-    <section>
-      <h2>What's been happening</h2>
-      <ul class="feed" id="feed"><li class="empty">Nothing recorded yet.</li></ul>
-    </section>
-    <aside>
-      <h2>The machine</h2>
-      <div id="meters"></div>
-      <h3>Updates</h3>
-      <dl id="updates"></dl>
-      <h3>The world</h3>
-      <dl id="worldfacts"></dl>
-      <h3>The mead hall on Discord</h3>
-      <div class="card" id="discord"></div>
-      <h3>Be told when someone arrives</h3>
-      <div class="card">
-        <button type="button" class="btn" id="notify">Notify me when someone joins</button>
-        <p class="k" id="notifynote">Your browser will show a note when the count of Vikings rises, for as long as this page stays open.</p>
-      </div>
-      <h3>Patch notes from Iron Gate</h3>
-      <ul class="news" id="news"><li class="empty">Not fetched yet.</li></ul>
-      <h3>For the owner</h3>
-      <div class="card" id="offsite"></div>
-      <p><a id="snaplink" href="snapshots/">World snapshots (owner login)</a></p>
-    </aside>
-  </div>
-
-  <section class="band">
+  <section class="band" data-view="world">
     <div class="head"><h2>Raids</h2><span class="count" id="raidcount"></span></div>
     <ul class="list" id="raids"><li class="empty">Raids are not recorded yet.</li></ul>
   </section>
 
-  <section class="hall">
+  <section class="band" data-view="world">
+    <h2>The world file itself</h2>
+    <dl id="worldfacts"></dl>
+  </section>
+
+  <!-- ======================= #/vikings ======================= -->
+  <section class="hall" data-view="vikings">
     <h2>Vikings of the hall</h2>
     <div class="scroll">
       <table id="stats">
@@ -407,13 +444,114 @@
     <div id="calendars" class="calendars"></div>
   </section>
 
-  <section class="band">
+  <section class="band timeline" id="timelineband" data-view="vikings">
+    <div class="head"><h2>Who was in the hall, last 7 days</h2><span class="count" id="timelinecount"></span></div>
+    <div class="scroll">
+      <div id="timeline"></div>
+      <div class="axis" id="timelineaxis"></div>
+    </div>
+    <p class="note" id="timelinenote">Not recorded yet.</p>
+  </section>
+
+  <section class="band" data-view="vikings">
     <h2>When people are around</h2>
     <div class="scroll"><div class="heat" id="heat"></div></div>
     <p class="note" id="heatnote"></p>
   </section>
 
-  <section class="band">
+  <!-- ======================= #/trends ======================= -->
+  <section class="tide" data-view="trends">
+    <div class="head">
+      <h2 id="tidetitle">Vikings in the world, last 24 hours</h2>
+      <div class="range" role="group" aria-label="Time range">
+        <button type="button" data-range="day" aria-pressed="true">24 hours</button>
+        <button type="button" data-range="week" aria-pressed="false">7 days</button>
+      </div>
+    </div>
+    <canvas id="chart" height="190" aria-label="Player count over time" role="img"></canvas>
+    <p class="note" id="tidenote"></p>
+    <div class="pingwrap" id="pingwrap" hidden>
+      <h3>Ping to each Viking, last 24 hours</h3>
+      <canvas id="pingchart" height="150" aria-label="Ping to each player over the last 24 hours" role="img"></canvas>
+      <ul class="legend" id="pinglegend"></ul>
+    </div>
+  </section>
+
+  <!-- ======================= #/hall ======================= -->
+  <section class="band" id="hallband" data-view="hall">
+    <div class="head">
+      <h2>The hall of fame</h2>
+      <div class="range" id="halltabs" role="group" aria-label="Which board">
+        <button type="button" data-tab="medals" aria-pressed="true">Medals</button>
+        <button type="button" data-tab="fame" aria-pressed="false">Hall of Fame</button>
+      </div>
+    </div>
+    <p class="note" id="hallnote"></p>
+    <div id="medalspanel"></div>
+    <div id="famepanel" hidden></div>
+  </section>
+
+  <!-- ======================= #/server ======================= -->
+  <section class="band" id="restartband" data-view="server">
+    <h2>Ask the hall to restart the server</h2>
+    <p class="note">This files a request. It does not restart anything. The request goes to Discord, where someone with the keys has to approve it — nothing happens until they do.</p>
+    <div id="rsprog"></div>
+    <div class="card">
+      <div class="rsform">
+        <div>
+          <label for="rsreason">What is wrong?</label>
+          <select id="rsreason">
+            <option value="not_responding">The server is not answering</option>
+            <option value="cannot_join">I cannot get in</option>
+            <option value="lag">It is lagging badly</option>
+            <option value="stuck_after_update">It looks stuck after an update</option>
+            <option value="other">Something else</option>
+          </select>
+        </div>
+        <div>
+          <label for="rsnick">Your name, so the hall knows who asked</label>
+          <input type="text" id="rsnick" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Optional — leave blank to stay unnamed">
+          <p class="note">Nothing checks this. The page cannot prove who you are, and whoever approves it is told as much.</p>
+        </div>
+        <div id="rsplayers"></div>
+        <div>
+          <button type="button" class="btn primary" id="rssend">File the request</button>
+          <p class="note" id="rsgate"></p>
+          <p class="rsmsg" id="rsmsg" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </div>
+    <p class="note">The world is saved before the server stops, so nothing anyone built is lost. It is usually back within a couple of minutes, though it can take up to about fifteen if Steam has an update waiting to install. <b>Anyone in the world gets no warning at all</b> — this server runs no mods and vanilla Valheim gives the server no way to speak to players, so the countdown only reaches Discord and this page.</p>
+    <h3>Restarts asked for lately</h3>
+    <ul class="list" id="rsrecent"><li class="empty">Nothing asked for yet.</li></ul>
+  </section>
+
+  <div class="cols" data-view="server">
+    <section>
+      <h2>What's been happening</h2>
+      <ul class="feed" id="feed"><li class="empty">Nothing recorded yet.</li></ul>
+    </section>
+    <aside>
+      <h2>The machine</h2>
+      <div id="meters"></div>
+      <h3>Updates</h3>
+      <dl id="updates"></dl>
+      <h3>The mead hall on Discord</h3>
+      <div class="card" id="discord"></div>
+      <h3>Be told when someone arrives</h3>
+      <div class="card">
+        <button type="button" class="btn" id="notify">Notify me when someone joins</button>
+        <p class="k" id="notifynote">Your browser will show a note when the count of Vikings rises, for as long as this page stays open.</p>
+      </div>
+      <h3>Patch notes from Iron Gate</h3>
+      <ul class="news" id="news"><li class="empty">Not fetched yet.</li></ul>
+      <h3>For the owner</h3>
+      <div class="card" id="offsite"></div>
+      <p><a id="snaplink" href="snapshots/">World snapshots (owner login)</a></p>
+    </aside>
+  </div>
+
+  <section class="band" data-view="server">
     <div class="two">
       <div>
         <h2>Restarts and updates</h2>
@@ -440,6 +578,10 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   let status = null, history = null, range = 'day';
+  // medals.json and restart-state.json are optional extras. Neither exists before its backend is
+  // deployed, and neither may ever be able to blank the page: they are fetched softly and the last
+  // good copy is kept, so a single failed poll changes nothing on screen.
+  let medals = null, restart = null, medalsSeen = false, restartSeen = false;
   // Fetch from the bare origin: a page opened via https://user:pass@host/ cannot use relative URLs.
   const base = location.origin + location.pathname.replace(/[^/]*$/, '');
 
@@ -523,12 +665,15 @@
       <div><div class="v">${status.players.peak_7d}<small>of ${s.max_players}</small></div><div class="k">most Vikings at once this week</div></div>`;
   }
 
-  function renderFeed() {
-    const ul = $('feed');
+  function renderFeed() { paintFeed($('feed'), status.events || []); }
+  // The Now view carries a short tail of the same feed; the whole thing lives on #/server.
+  function renderNowFeed() { paintFeed($('nowfeed'), (status.events || []).slice(0, 8)); }
+
+  function paintFeed(ul, events) {
     ul.innerHTML = '';
-    if (!status.events.length) { ul.innerHTML = '<li class="empty">Nothing recorded yet.</li>'; return; }
+    if (!events.length) { ul.innerHTML = '<li class="empty">Nothing recorded yet.</li>'; return; }
     let lastDay = '';
-    for (const e of status.events) {
+    for (const e of events) {
       const dn = dayName(e.t);
       if (dn !== lastDay) { const d = document.createElement('li'); d.className = 'day'; d.textContent = dn; ul.appendChild(d); lastDay = dn; }
       const li = document.createElement('li');
@@ -574,6 +719,10 @@
       : os.pending ? `${os.pending} update${os.pending === 1 ? '' : 's'} pending${os.security ? `, ${os.security} security` : ''}${os.reboot_required ? ', reboot required' : ''}`
       : os.reboot_required ? 'reboot required' : os.pending == null ? 'not recorded yet' : 'up to date';
     $('updates').innerHTML = `<dt>Status</dt><dd>${st}</dd><dt>Last check</dt><dd>${ago(u.last_check)}</dd><dt>Steam build</dt><dd>${esc(status.server.build || '—')}</dd><dt>System updates</dt><dd>${osLine}</dd><dt>How</dt><dd>Checks Steam every 30 minutes. Never restarts while someone is playing. Discord hears about downtime and updates.</dd>`;
+  }
+
+  // Lives on #/world: what the save file itself says about the world.
+  function renderWorldFacts() {
     const w = status.world, s = status.server, bks = w.backups || [];
     const bk = bks.length ? `${bks.length} kept, newest ${ago(bks[bks.length - 1].t)}` : 'none yet';
     const growth = w.growth_7d_bytes == null ? 'not recorded yet' : w.growth_7d_bytes < 0 ? `shrank by ${bytes(-w.growth_7d_bytes)}` : `grew by ${bytes(w.growth_7d_bytes)}`;
@@ -831,8 +980,12 @@
   function mapWorldScale(w, h) { return Math.min(w, h) / (2 * mapExtent); }
 
   // 'content' fits the built-up bbox padded 8%; 'world' fits the whole 2*extent square.
+  // Bails while the view is hidden: a canvas in a display:none section measures 0x0, and fitting
+  // to that would bake a wrong scale in. renderWorldMap and the ResizeObserver both fit again the
+  // moment #/world becomes visible.
   function mapFitTo(mode) {
-    const c = $('mapcanvas'), w = c.clientWidth || 300, h = c.clientHeight || 300;
+    const c = $('mapcanvas'), w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;
     if (mode === 'content' && mapData && mapData.bbox) {
       const bb = mapData.bbox;
       const padX = Math.max(50, (bb.maxX - bb.minX) * 0.08), padZ = Math.max(50, (bb.maxZ - bb.minZ) * 0.08);
@@ -848,7 +1001,8 @@
   // s clamps to [sWorld*0.8, 2]; centre clamps into the content bbox expanded by 40% of the
   // viewport (in world metres), hard-capped at +/- the world extent.
   function mapClamp() {
-    const c = $('mapcanvas'), w = c.clientWidth || 300, h = c.clientHeight || 300;
+    const c = $('mapcanvas'), w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;   // hidden view: leave the user's view state exactly as it was
     const sWorld = mapWorldScale(w, h);
     mapView.s = Math.max(sWorld * 0.8, Math.min(2, mapView.s));
     const bb = (mapData && mapData.bbox) || { minX: -mapExtent, maxX: mapExtent, minZ: -mapExtent, maxZ: mapExtent };
@@ -943,9 +1097,11 @@
     mapRaf = 0;
     const c = $('mapcanvas');
     if (!c || !mapData) return;
-    mapSizeCanvas();
+    // Measure before resizing: while #/world is hidden the canvas is 0x0, and re-sizing to that
+    // would throw away the bitmap the user left behind. Bail first, keep the picture.
     const w = c.clientWidth, h = c.clientHeight;
     if (!w || !h) return;
+    mapSizeCanvas();
     const ctx = c.getContext('2d');
     ctx.setTransform(mapDpr, 0, 0, mapDpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
@@ -1274,6 +1430,7 @@
     if (!history) return;
     const c = $('chart'), dpr = window.devicePixelRatio || 1;
     const W = c.clientWidth, H = 190;
+    if (!W) return;   // #/trends is hidden: nothing to measure, and the router redraws on arrival
     c.width = W * dpr; c.height = H * dpr;
     const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, W, H);
@@ -1403,28 +1560,387 @@
     prevCount = count; prevNames = names;
   }
 
-  async function load() {
+  // ================================ #/hall: medals and records ================================
+  // Everything here is rendered from medals.json's own `catalog` and the engine's own `display`
+  // strings. No medal name, emoji, category or rule is written down twice: adding a medal in
+  // valheim-medals.py lights it up here with no change to this page.
+  const CAT_TITLES = {
+    time: 'Hours in the hall', death: 'Dying, and not dying', social: 'Side by side',
+    world: 'Out in the world', fun: 'For the fun of it',
+  };
+  const CAT_ORDER = ['time', 'death', 'social', 'world', 'fun'];
+  const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  // The medals engine says "since 10 September" and never "all time"; match it exactly rather than
+  // letting toLocaleDateString reorder it per locale.
+  const dayMonth = (t) => { const d = new Date(t * 1000); return `${d.getDate()} ${MONTHS[d.getMonth()]}`; };
+  const HKEY = 'valheim.hallTab';
+  let hallTab = 'medals';
+  try { const v = localStorage.getItem(HKEY); if (v === 'fame' || v === 'medals') hallTab = v; } catch {}
+
+  const UNWON = {
+    day: 'No one claimed this that day.',
+    week: 'No one has claimed this yet this week.',
+    all: 'No one holds this one yet.',
+  };
+
+  function medalCard(m, res, w) {
+    const head = `<div class="t"><span class="em" aria-hidden="true">${esc(m.emoji || '')}</span><b>${esc(m.name || m.key)}</b></div>`;
+    const how = `<p class="how">How this is decided: ${esc(m.howto || 'not written down.')}</p>`;
+    const names = res && Array.isArray(res.names) ? res.names.filter(Boolean) : [];
+    if (!names.length) {
+      return `<li class="medal unwon">${head}<p class="win">${UNWON[w]} A medal needs at least two Vikings in the running before it is handed out at all.</p>${how}</li>`;
+    }
+    let verb = m.verb || '';
+    if (names.length > 1 && verb.startsWith('has ')) verb = 'have ' + verb.slice(4);
+    const val = res.display ? `<span class="val">${esc(res.display)}</span>` : '';
+    const who = `<b>${list(names.map(esc))}</b>`;
+    const win = verb ? `${who} ${esc(verb)}${val ? ' — ' + val : ''}` : `${who}${val ? ' — ' + val : ''}`;
+    const ru = Array.isArray(res.runners_up) ? res.runners_up.filter((r) => r && r.name) : [];
+    const run = ru.length
+      ? `<p class="run">Behind them: ${ru.map((r) => `${esc(r.name)}${r.display ? ' (' + esc(r.display) + ')' : ''}`).join(', ')}.</p>`
+      : '';
+    return `<li class="medal">${head}<p class="win">${win}</p>${run}${how}</li>`;
+  }
+
+  // One window (day / week / all) grouped into the five categories, in the catalogue's own order.
+  function medalPanel(w) {
+    const won = (medals.windows || {})[w] || {};
+    const mine = medals.catalog.filter((m) => m && Array.isArray(m.windows) && m.windows.includes(w));
+    if (!mine.length) return '<p class="note">No medals are handed out over this stretch of time.</p>';
+    let html = '';
+    for (const cat of [...CAT_ORDER, ...new Set(mine.map((m) => m.category).filter((c) => !CAT_ORDER.includes(c)))]) {
+      const group = mine.filter((m) => m.category === cat);
+      if (!group.length) continue;
+      html += `<h4>${esc(CAT_TITLES[cat] || cat)}</h4><ul class="medals">${group.map((m) => medalCard(m, won[m.key], w)).join('')}</ul>`;
+    }
+    const n = Object.keys(won).length;
+    const lead = n ? '' : `<p class="note">Nothing was handed out over this stretch — not enough Vikings were in the running.</p>`;
+    return lead + html;
+  }
+
+  function renderHall() {
+    const mp = $('medalspanel'), fp = $('famepanel'), note = $('hallnote');
+    for (const b of $('halltabs').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.tab === hallTab));
+    mp.hidden = hallTab !== 'medals';
+    fp.hidden = hallTab !== 'fame';
+    if (!medals || !Array.isArray(medals.catalog) || !medals.catalog.length) {
+      mp.innerHTML = ''; fp.innerHTML = '';
+      note.textContent = medalsSeen
+        ? 'The tally of medals came back empty. Nothing to show yet.'
+        : 'No tally of medals has reached the page yet. It is written on the server every few minutes, once that has been set up.';
+      return;
+    }
+    const age = medals.generated ? Date.now() / 1000 - medals.generated : null;
+    const stale = age != null && age > 6 * 3600 ? ` Counted ${ago(medals.generated)}, so it may be behind.` : '';
+    if (hallTab === 'medals') {
+      note.textContent = `${medals.catalog.length} medals. Handed out once a day; a medal needs at least two Vikings in the running, so a quiet day hands out little.${stale}`;
+      mp.innerHTML = `<h3>Yesterday${medals.day_label ? ' — ' + esc(medals.day_label) : ''}</h3>${medalPanel('day')}<h3>This week</h3>${medalPanel('week')}`;
+    } else {
+      note.textContent = `The marks that still stand, since ${medals.tracking_since ? dayMonth(medals.tracking_since) : 'the world moved to this server'} — records, not awards. Beat one and it is yours.${stale}`;
+      fp.innerHTML = medalPanel('all');
+    }
+  }
+
+  // ============================== #/server: the restart request ==============================
+  // The page files a request and watches it. It cannot restart anything: only the approved
+  // executor on the server may touch valheim.service, and only after a human says yes in Discord.
+  const RS_REASONS = {
+    not_responding: 'the server was not answering',
+    cannot_join: 'no one could get in',
+    lag: 'it was lagging badly',
+    stuck_after_update: 'it looked stuck after an update',
+    other: 'something else',
+  };
+  const RS_STATES = {
+    pending_validation: 'The request is being looked over.',
+    awaiting_approval: 'Waiting for someone in the hall to approve it in Discord. Nothing happens until they do.',
+    approved: 'Approved. Getting ready.',
+    counting_down: 'Counting down. Anyone in the world will not see this.',
+    waiting_for_lock: 'Waiting for the backup or the updater to let go of the world.',
+    backing_up: 'Copying the world first.',
+    stopping: 'Shutting the server down.',
+    stopped_verified: 'Down, and the world is saved.',
+    starting: 'Starting it up again.',
+    verifying: 'Up. Checking that it answers.',
+    succeeded: 'Done. The hall is back.',
+    denied: 'Someone in the hall turned it down.',
+    rejected_invalid: 'The request did not make sense and was thrown out.',
+    failed_precheck: 'Stopped before anything was touched — a check failed.',
+    expired_unapproved: 'No one approved it in time, so it lapsed.',
+    expired_approval: 'The approval went stale before the restart began.',
+    aborted: 'Called off.',
+    aborted_lock_timeout: 'Called off — the world stayed locked too long.',
+    failed_needs_admin: 'It went wrong and needs the owner. Nothing more will be tried on its own.',
+  };
+  const RS_DONE = new Set(['succeeded', 'denied', 'rejected_invalid', 'failed_precheck', 'expired_unapproved',
+    'expired_approval', 'aborted', 'aborted_lock_timeout', 'failed_needs_admin']);
+  const rsLive = (r) => r && r.current && !RS_DONE.has(r.current.state) ? r.current : null;
+  const mmss = (s) => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+  let rsBusy = false, rsAckSig = null;
+
+  // restart_at is an absolute deadline, so the countdown is read off the clock, not slept through.
+  function paintCountdown() {
+    for (const el of document.querySelectorAll('.cd')) {
+      const at = Number(el.dataset.at);
+      if (!at) continue;
+      const left = at - Date.now() / 1000;
+      el.textContent = left > 0.5 ? mmss(left) : 'any moment now';
+    }
+  }
+
+  function rsProgHtml(cur) {
+    const done = RS_DONE.has(cur.state);
+    const why = RS_REASONS[cur.reason] || cur.reason || 'no reason given';
+    // Phrased so the name is never the first word: an unnamed request reads as a description,
+    // not as a Viking called "Someone". The executor and the Discord embed say the same.
+    const who = cur.nickname ? `Asked by ${esc(cur.nickname)}` : 'Asked by someone who left no name';
+    const appr = cur.approver && cur.approver.display ? ` Approved by ${esc(cur.approver.display)}.` : '';
+    const cd = cur.state === 'counting_down' && cur.restart_at
+      ? `<div class="cd" data-at="${Number(cur.restart_at)}">${mmss(cur.restart_at - Date.now() / 1000)}</div>`
+      : '';
+    const pl = cur.players_at_request && cur.players_at_request.count
+      ? `<div class="k">${cur.players_at_request.count} Viking${cur.players_at_request.count === 1 ? '' : 's'} ${Array.isArray(cur.players_at_request.names) && cur.players_at_request.names.length ? '(' + list(cur.players_at_request.names.map(esc)) + ') ' : ''}${done ? 'were' : 'are'} in the world.</div>`
+      : '';
+    const link = cur.message_url ? ` <a href="${esc(cur.message_url)}" rel="noopener">See it in Discord</a>` : '';
+    // Optional and additive: absent (older requests, or before the backend ships) renders nothing
+    // at all -- no empty element, no stray punctuation, no shift.
+    const uw = cur.unwedged
+      ? '<div class="k">The hall was stuck fast — the machine had given up on the server after one failure too many, so it had to be prised open before the restart could go ahead.</div>'
+      : '';
+    return `<div class="rsprog${done ? ' done' : ''}">
+      <div class="big">${esc(RS_STATES[cur.state] || cur.state || 'In hand.')}</div>
+      ${cd}
+      <div class="k">${who} because ${esc(why)}, ${ago(cur.created_at)}.${appr}${link}</div>
+      ${pl}${uw}</div>`;
+  }
+
+  function rsNeedAck() { return !!(status && status.players && status.players.count > 0); }
+
+  // Rebuilt only when the names change, so a 30 s poll never clears the box the user just ticked.
+  function rsPlayersBlock() {
+    const el = $('rsplayers');
+    const online = (status && status.players && status.players.online) || [];
+    const names = online.map((p) => p.name);
+    const sig = JSON.stringify(names) + '|' + ((status && status.players && status.players.count) || 0);
+    if (sig === rsAckSig) return;
+    rsAckSig = sig;
+    if (!rsNeedAck()) {
+      el.innerHTML = '<p class="note">No one is in the world right now, so a restart would interrupt nobody.</p>';
+      return;
+    }
+    const n = (status.players.count) || names.length;
+    const whoText = names.length ? list(names.map(esc)) : `${n} Viking${n === 1 ? '' : 's'}`;
+    el.innerHTML = `<div class="rsack">
+      <input type="checkbox" id="rsack">
+      <label for="rsack">${whoText} ${names.length === 1 ? 'is' : 'are'} in the world right now and will be thrown out mid-swing with no warning in the game. I still want to ask for a restart.</label>
+    </div>`;
+    $('rsack').addEventListener('change', () => safe(rsGate));
+  }
+
+  function rsGate() {
+    const btn = $('rssend'), gate = $('rsgate');
+    let reason = '';
+    if (rsBusy) reason = '';
+    else if (!restart) reason = restartSeen ? 'The restart desk is not answering right now.' : 'Asking for a restart is not switched on for this server yet.';
+    else if (rsLive(restart)) reason = 'A request is already in hand. Only one at a time.';
+    else if (!restart.accepting) reason = restart.why_not || 'Requests are not being taken right now.';
+    else if (restart.cooldown_until && restart.cooldown_until > Date.now() / 1000) reason = `Too soon after the last one — you can ask again ${until(restart.cooldown_until)}.`;
+    else if (rsNeedAck() && !($('rsack') && $('rsack').checked)) reason = 'Tick the box to say you know people are in the world.';
+    btn.disabled = rsBusy || !!reason;
+    btn.textContent = rsBusy ? 'Sending…' : 'File the request';
+    gate.textContent = reason;
+  }
+
+  function renderRestart() {
+    const cur = restart && restart.current;
+    $('rsprog').innerHTML = cur ? rsProgHtml(cur) : (restart ? '' : `<p class="note">${restartSeen ? 'The restart desk stopped answering. Try again in a moment.' : 'Nothing on this page can restart the server yet. Until that is switched on, ask in Discord.'}</p>`);
+    safe(rsPlayersBlock);
+    safe(rsGate);
+    const ul = $('rsrecent'), recent = (restart && Array.isArray(restart.recent) ? restart.recent : []).slice(0, 10);
+    if (!restart) ul.innerHTML = '<li class="empty">Not recorded yet.</li>';
+    else if (!recent.length) ul.innerHTML = '<li class="empty">No one has asked for a restart yet.</li>';
+    else ul.innerHTML = recent.map((r) => {
+      const st = esc(RS_STATES[r.state] || r.state || 'unknown');
+      const by = r.approver && r.approver.display ? ` <span class="dim">Approved by ${esc(r.approver.display)}.</span>` : '';
+      const dt = r.downtime_s != null ? ` <span class="dim">Down for ${fmtDur(r.downtime_s)}.</span>` : '';
+      const uw = r.unwedged ? ' <span class="dim">The hall was stuck fast and had to be prised open first.</span>' : '';
+      return `<li><time>${r.at ? when(r.at) : '—'}</time><div><b>${esc(RS_REASONS[r.reason] || r.reason || 'no reason given')}</b> — ${st}${by}${dt}${uw}</div></li>`;
+    }).join('');
+    paintCountdown();
+  }
+
+  // On #/ Now: only ever shown when the server is not answering.
+  function renderDownCall() {
+    const sec = $('downcall'), body = $('downcallbody');
+    const s = status.server || {};
+    if (s.online) { sec.hidden = true; body.innerHTML = ''; return; }
+    sec.hidden = false;
+    const cur = rsLive(restart);
+    if (cur) {
+      body.innerHTML = `<div class="big">Someone has already asked for a restart.</div>
+        <div class="k">${esc(RS_STATES[cur.state] || cur.state)}</div>
+        <p><a class="btn" href="#/server">See where it stands</a></p>`;
+    } else if (restart) {
+      body.innerHTML = `<div class="big">The server is not answering.</div>
+        <div class="k">You can ask the hall to restart it. Someone in Discord has to approve it before anything happens.</div>
+        <p><a class="btn primary" href="#/server">Ask the hall to restart it</a></p>`;
+    } else {
+      body.innerHTML = `<div class="big">The server is not answering.</div>
+        <div class="k">Nothing on this page can restart it yet. Say something in Discord and someone will look.</div>`;
+    }
+  }
+
+  function rsSay(text, cls) { const el = $('rsmsg'); el.textContent = text; el.className = 'rsmsg' + (cls ? ' ' + cls : ''); }
+
+  // The one write path in the whole system. Four things are required by the server: the JSON
+  // content type, the X-Valheim-Restart header, a same-origin Sec-Fetch-Site (the browser sets
+  // that itself) and a current csrf value copied out of restart-state.json.
+  async function rsSubmit() {
+    if (rsBusy) return;
+    if (!restart || !restart.csrf) { rsSay('The page has no valid token to send. Give it a moment and try again.', 'bad'); return; }
+    const ack = !!($('rsack') && $('rsack').checked);
+    if (rsNeedAck() && !ack) { rsSay('Tick the box first — people are in the world.', 'bad'); return; }
+    // All four keys are always sent, but a blank field goes as "" and never as an invented name:
+    // the log has to be able to tell "gave no name" apart from "typed a name". Non-empty input is
+    // trimmed to the charset and length the server accepts; empty is allowed straight through.
+    const nickname = ($('rsnick').value || '').replace(/[^A-Za-z0-9 _.\-]/g, '').slice(0, 24).trim();
+    rsBusy = true; rsGate(); rsSay('Sending…');
+    let res = null, body = null;
     try {
-      const [s, h] = await Promise.all([
-        fetch(base + 'status.json?t=' + Date.now(), { cache: 'no-store' }).then((r) => r.json()),
-        fetch(base + 'history.json?t=' + Date.now(), { cache: 'no-store' }).then((r) => r.json()),
-      ]);
-      status = s; history = h;
-      renderHero(); renderFacts(); renderFeed(); renderMachine(); renderStats();
-      safe(renderProgress); safe(renderRaids); safe(renderRecords); safe(renderTogether); safe(renderHeat);
-      safe(renderRestarts); safe(renderSettings); safe(renderAside); safe(renderOffsite);
-      safe(renderTimeline); safe(renderCalendars); safe(renderWorldMap);
-      renderChart(); safe(renderPingChart); safe(() => checkArrivals(s));
-      const age = Date.now() / 1000 - s.generated;
-      const g = $('gen');
-      g.textContent = `Last report ${ago(s.generated)}.`;
-      g.className = age > 300 ? 'stale' : '';
-      if (age > 300) g.textContent += ' The reporter on the server has gone quiet; the numbers above may be old.';
-      document.title = (s.server.online ? (s.players.count ? `${s.players.count} online` : 'Open') : 'Down') + ' · Existence is Pain';
+      res = await fetch(base + 'api/restart/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Valheim-Restart': '1' },
+        cache: 'no-store',
+        body: JSON.stringify({ csrf: restart.csrf, reason: $('rsreason').value, nickname, ack_players: ack }),
+      });
+      try { body = await res.json(); } catch { body = null; }
     } catch (e) {
+      rsBusy = false; rsGate();
+      rsSay('The request never left the building — the network or the server refused it. Nothing was filed.', 'bad');
+      return;
+    }
+    rsBusy = false;
+    const why = (body && (body.why || body.error)) ? String(body.why || body.error) : '';
+    if (res.status === 202) {
+      rsSay('Filed. Someone in the hall has to approve it in Discord before anything happens — this page will follow along.', 'ok');
+      const box = $('rsack'); if (box) box.checked = false;
+      rsAckSig = null;
+      await refreshRestart();          // don't make the user wait 30 s to see their own request
+    } else if (res.status === 409) {
+      rsSay(why ? `Not taken: ${why}` : 'Not taken — either a request is already in hand or the server was restarted too recently.', 'bad');
+      await refreshRestart();
+    } else if (res.status === 429) {
+      rsSay(why ? `Too many requests in too short a time: ${why}` : 'Too many requests in too short a time. Wait a few minutes and ask again.', 'bad');
+      await refreshRestart();
+    } else if (res.status === 403) {
+      rsSay('The page\'s token was refused, usually because it went stale. Reload the page and ask again.', 'bad');
+      await refreshRestart();
+    } else if (res.status === 400) {
+      rsSay(why ? `The server could not read the request: ${why}` : 'The server could not read the request. Nothing was filed.', 'bad');
+    } else {
+      rsSay(`The server answered ${res.status} and nothing was filed.${why ? ' ' + why : ''}`, 'bad');
+    }
+    rsGate();
+  }
+
+  async function refreshRestart() {
+    const r = await soft('restart-state.json');
+    restartSeen = restartSeen || !!r;
+    if (r && typeof r === 'object') restart = r;
+    if (view === 'server') safe(renderRestart);
+    if (view === 'now') safe(renderDownCall);
+  }
+
+  // ==================================== routes ====================================
+  // Six hash routes over the one set of sections. Only the visible view's renderers run on a poll;
+  // the map and the two chart canvases are the expensive part of every tick and are usually hidden.
+  const ROUTES = [
+    ['/', 'now', 'Now'],
+    ['/world', 'world', 'The world'],
+    ['/vikings', 'vikings', 'Vikings'],
+    ['/trends', 'trends', 'Trends'],
+    ['/hall', 'hall', 'Hall of fame'],
+    ['/server', 'server', 'The machine'],
+  ];
+  const VIEW_OF = Object.fromEntries(ROUTES.map(([r, v]) => [r, v]));
+  const ROUTE_OF = Object.fromEntries(ROUTES.map(([r, v]) => [v, r]));
+  const NAME_OF = Object.fromEntries(ROUTES.map(([, v, n]) => [v, n]));
+  let view = 'now';
+
+  const VIEW_RENDER = {
+    now: [renderHero, renderFacts, renderNowFeed, renderDownCall],
+    world: [renderProgress, renderWorldMap, renderRaids, renderWorldFacts],
+    vikings: [renderStats, renderRecords, renderTogether, renderCalendars, renderTimeline, renderHeat],
+    trends: [renderChart, renderPingChart],
+    hall: [renderHall],
+    server: [renderMachine, renderFeed, renderRestarts, renderSettings, renderAside, renderOffsite, renderRestart],
+  };
+
+  // An unknown or empty hash simply shows Now. It is never rewritten, so there is no way to loop.
+  function routeFromHash() {
+    let h = location.hash.replace(/^#/, '').trim();
+    if (!h) return 'now';
+    if (h[0] !== '/') h = '/' + h;
+    if (h.length > 1) h = h.replace(/\/+$/, '') || '/';
+    return VIEW_OF[h] || 'now';
+  }
+
+  function renderCurrentView() {
+    if (!status) return;
+    for (const fn of VIEW_RENDER[view] || []) safe(fn);
+  }
+
+  // Un-hides first and renders second: a canvas measured inside a hidden section has no size, so
+  // every view that owns one re-measures and redraws on the way in.
+  function applyView(next, announce) {
+    const changed = next !== view;
+    view = next;
+    for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.dataset.view !== view;
+    let active = null;
+    for (const a of document.querySelectorAll('#navlist a')) {
+      if (a.dataset.route === ROUTE_OF[view]) { a.setAttribute('aria-current', 'page'); active = a; }
+      else a.removeAttribute('aria-current');
+    }
+    // Under 520 px the boards scroll sideways; drag the lit one into view. Horizontal only, by
+    // hand -- scrollIntoView would also yank the page vertically.
+    if (active) {
+      const ul = $('navlist'), lr = active.getBoundingClientRect(), ur = ul.getBoundingClientRect();
+      if (lr.left < ur.left) ul.scrollLeft += lr.left - ur.left - 8;
+      else if (lr.right > ur.right) ul.scrollLeft += lr.right - ur.right + 8;
+    }
+    renderCurrentView();
+    if (changed && announce) $('viewsay').textContent = NAME_OF[view] + '.';
+  }
+
+  // Resolves to null rather than rejecting, so one missing file can never take the page with it.
+  const soft = (name) => fetch(base + name + '?t=' + Date.now(), { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null)).then((j) => j, () => null);
+
+  async function load() {
+    const [s, h, m, r] = await Promise.all([
+      soft('status.json'), soft('history.json'), soft('medals.json'), soft('restart-state.json'),
+    ]);
+    if (!s || !s.server || !s.players) {
       $('gen').textContent = 'Could not reach the server for a report. Retrying.';
       $('gen').className = 'stale';
+      return;
     }
+    status = s;
+    if (h) history = h;                                  // keep the last good history on a blip
+    medalsSeen = medalsSeen || !!m;
+    if (m && Array.isArray(m.catalog)) medals = m;
+    restartSeen = restartSeen || !!r;
+    if (r && typeof r === 'object') restart = r;
+    renderCurrentView();
+    safe(() => checkArrivals(s));
+    // Global on every view: the staleness footer and the document title.
+    const age = Date.now() / 1000 - s.generated;
+    const g = $('gen');
+    g.textContent = `Last report ${ago(s.generated)}.`;
+    g.className = age > 300 ? 'stale' : '';
+    if (age > 300) g.textContent += ' The reporter on the server has gone quiet; the numbers above may be old.';
+    document.title = (s.server.online ? (s.players.count ? `${s.players.count} online` : 'Open') : 'Down') + ' · Existence is Pain';
   }
 
   async function ping() {
@@ -1443,20 +1959,34 @@
     } catch { el.textContent = ''; }
   }
 
-  document.querySelectorAll('.range button').forEach((b) => b.addEventListener('click', () => {
+  document.querySelectorAll('.tide .range button').forEach((b) => b.addEventListener('click', () => {
     range = b.dataset.range;
-    document.querySelectorAll('.range button').forEach((x) => x.setAttribute('aria-pressed', x === b));
-    renderChart();
+    document.querySelectorAll('.tide .range button').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    safe(renderChart);
   }));
+  $('halltabs').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-tab]');
+    if (!b) return;
+    hallTab = b.dataset.tab;
+    try { localStorage.setItem(HKEY, hallTab); } catch {}
+    safe(renderHall);
+  });
+  // Whatever happens, the button must come back: a stuck rsBusy would lock the form for good.
+  $('rssend').addEventListener('click', () => {
+    rsSubmit().catch((e) => { console.error(e); rsBusy = false; safe(rsGate); rsSay('Something went wrong on this page. Nothing was filed. Reload and try again.', 'bad'); });
+  });
   $('copy').addEventListener('click', async (e) => {
     try { await navigator.clipboard.writeText('20.230.157.206:2456'); e.target.textContent = 'Copied'; setTimeout(() => e.target.textContent = 'Copy address', 1500); } catch {}
   });
   $('snaplink').href = base + 'snapshots/';
-  window.addEventListener('resize', () => { renderChart(); safe(renderPingChart); });
+  window.addEventListener('resize', () => { if (view === 'trends') { safe(renderChart); safe(renderPingChart); } });
+  window.addEventListener('hashchange', () => { applyView(routeFromHash(), true); window.scrollTo(0, 0); });
   renderNotify();
+  applyView(routeFromHash(), false);
   load(); ping();
   setInterval(load, 30000);
   setInterval(ping, 120000);
+  setInterval(() => safe(paintCountdown), 1000);
 })();
 </script>
 </body>
