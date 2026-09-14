@@ -118,9 +118,22 @@ the model's own knowledge, flagged as unverified.
 7. **Emit `wiki-records.jsonl`** — one JSON object per line, sorted by `(title, heading, source)`
    so a re-run produces a byte-stable file and `git diff` shows real content change.
 
-**Failure policy:** a page that fails to parse is **logged with its title and skipped, and the
-run's exit code reflects how many were skipped** — never silently dropped. If more than 5% of
-pages fail, exit non-zero and write nothing; a half-built corpus is worse than a stale one.
+**Failure policy — the exit code is a contract with W4's systemd unit, so it is precise:**
+
+- A page that fails to parse is **logged with its title and skipped**, never silently dropped,
+  and the run ends with a summary line giving the skip count and the skipped titles.
+- **Exit 0 whenever a corpus file was successfully written**, however many pages were skipped
+  below the threshold. The skip count lives in the log and the summary line, *not* in the exit
+  status.
+- **Exit non-zero only on the hard-failure path:** more than 5% of pages failed, or the run could
+  not write its output at all. In that case write nothing — a half-built corpus is worse than a
+  stale one.
+
+This matters because `valheim-wiki-refresh.service` chains ingest and index-build as two
+`ExecStart` lines: a non-zero ingest stops the rebuild. Encoding a benign skip count in the exit
+status would silently skip the weekly refresh while looking like it worked. (Corrected after W4
+flagged the original wording as ambiguous — the first draft said the exit code should "reflect
+how many were skipped", which contradicts the rule above.)
 
 **Verify:** run against a 20-page subset (`--limit 20`) and assert the `Boar` record contains
 `10`, `20`, `30`; that `Resistance` contains `200%`/`150%`/`25%`; that no record contains `{{` or
