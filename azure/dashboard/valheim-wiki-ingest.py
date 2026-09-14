@@ -499,6 +499,17 @@ def clean_wikicode(code) -> str:
       - File/Image/Category wikilinks are removed outright (not just their brackets --
         strip_code() alone leaves a File: link's caption text and a bare "Category:Foo" behind as
         visible prose); every other wikilink reduces to its display text.
+      - Every BARE/AUTOLINKED external URL (H3 review fix: `mwparserfromhell.ExternalLink` with
+        `.brackets is False`, e.g. a naked "http://example.com" sitting in running prose) is
+        removed outright, the same way File/Image/Category links are -- confirmed empirically
+        that strip_code() has no rule of its own for this shape and lets it straight through
+        verbatim into the corpus, into the model's prompt, and potentially into a Discord reply:
+        an anonymous wiki editor could otherwise get an arbitrary URL echoed by the bot, a
+        low-effort phishing path. A BRACKETED link with its own display text (`[URL text]`) needs
+        no special handling here -- strip_code() already keeps the display text and drops the URL
+        on its own (confirmed empirically: `[http://x.example/y click here]` -> "click here"); a
+        bracketed link with NO display text (`[URL]`, MediaWiki's auto-numbered-citation form)
+        also already renders as nothing extra. Only the un-bracketed, no-title case leaks a URL.
       - Every wikitable (a `table` Tag node -- mwparserfromhell has no dedicated Table node class,
         see render_wikitable()'s docstring) is replaced with its rendered "one self-describing
         line per row" prose BEFORE strip_code() runs, so a table never reaches strip_code() as
@@ -546,6 +557,18 @@ def clean_wikicode(code) -> str:
                 code.remove(link)
             except ValueError:
                 pass
+
+    for ext_link in list(code.filter_external_links(recursive=True)):
+        # `.brackets` is False only for a bare/autolinked URL sitting directly in prose (no
+        # `[...]` wrapper at all) -- see this function's own docstring for why the bracketed
+        # forms need no handling here. This is the entire H3 fix: remove it outright, exactly
+        # like the File/Image/Category wikilinks above, rather than let its raw URL text survive
+        # into the corpus.
+        if not ext_link.brackets:
+            try:
+                code.remove(ext_link)
+            except ValueError:
+                pass  # already consumed as part of a larger removal/replacement earlier in this pass
 
     for template in list(code.filter_templates(recursive=False)):
         try:
