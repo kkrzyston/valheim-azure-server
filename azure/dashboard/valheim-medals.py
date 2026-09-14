@@ -23,7 +23,9 @@ CLI modes:
                      from valheim-digest.py and call weekly_embed() directly)
   --board           upsert the pinned all-time hall of fame message
   --seed            record every all-time holder without posting (run once at deploy)
-  --dry-run         print embed JSON instead of posting, for any of the above
+  --web             write the full day/week/all medals.json for the dashboard's Hall page
+                    (pure file writer, never posts to Discord; run every 10 min)
+  --dry-run         print embed/JSON instead of posting or writing, for any of the above
 
 All paths take an env override so this can run against fixtures without touching /var:
   MEDALS_STATUS, MEDALS_EVENTS, MEDALS_SAMPLES, MEDALS_STATE, MEDALS_ALERTS, MEDALS_WEB_OUT, MEDALS_LOG
@@ -156,6 +158,11 @@ def fmt_date(d):
 
 def fmt_date_full(d):
     return f"{WEEKDAYS[d.weekday()]}, {MONTHS[d.month - 1]} {d.day}"
+
+
+# Mirrors valheim-status-collect.py's hardcoded players.tracking_since (both must move together
+# if tracking is ever reset); also what since_date_str()'s own fallback string below means.
+TRACKING_SINCE_FALLBACK = 1789080000
 
 
 def since_date_str(status):
@@ -875,117 +882,117 @@ def render(entry, res):
 # counts as "a new record" for that live subset.
 CATALOG = [
     # -- time & attendance
-    dict(key="longhouse_dweller", emoji="\U0001FA93", name="The Longhouse Dweller",
+    dict(key="longhouse_dweller", emoji="\U0001FA93", name="The Longhouse Dweller", category="time",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_longhouse_dweller,
          verb="has logged the most hours",
          howto="Most total seconds played across all sessions in the window."),
-    dict(key="ironman", emoji="⏳", name="Ironman",
+    dict(key="ironman", emoji="⏳", name="Ironman", category="time",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_ironman,
          verb="pulled the longest unbroken session",
          howto="Longest single unbroken session in the window; min 30 minutes."),
-    dict(key="first_light", emoji="\U0001F305", name="First Light",
+    dict(key="first_light", emoji="\U0001F305", name="First Light", category="time",
          windows=("day", "week", "all"), live=True, higher=False, fn=m_first_light,
          verb="logged in earliest",
          howto="Earliest local login time-of-day among logins in the window."),
-    dict(key="night_watch", emoji="\U0001F319", name="Night Watch",
+    dict(key="night_watch", emoji="\U0001F319", name="Night Watch", category="time",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_night_watch,
          verb="logged out latest",
          howto="Latest local logout time-of-day among logouts in the window."),
-    dict(key="the_regular", emoji="\U0001F501", name="The Regular",
+    dict(key="the_regular", emoji="\U0001F501", name="The Regular", category="time",
          windows=("all",), live=True, higher=True, fn=m_the_regular,
          verb="kept the longest daily streak",
          howto="All-time only. Longest run of consecutive calendar days played; min 2 days."),
-    dict(key="hall_opener", emoji="\U0001F6AA", name="Hall Opener",
+    dict(key="hall_opener", emoji="\U0001F6AA", name="Hall Opener", category="time",
          windows=("week", "all"), live=False, higher=True, fn=m_hall_opener,
          verb="was first in most often",
          howto="Week/all-time. Most days being first to join that day; min 2."),
-    dict(key="last_torch_out", emoji="\U0001F512", name="Last Torch Out",
+    dict(key="last_torch_out", emoji="\U0001F512", name="Last Torch Out", category="time",
          windows=("week", "all"), live=False, higher=True, fn=m_last_torch_out,
          verb="was last out most often",
          howto="Week/all-time. Most days being last to leave that day; min 2."),
     # -- deaths & survival
-    dict(key="frequent_flyer", emoji="\U0001F480", name="Valhalla Frequent Flyer",
+    dict(key="frequent_flyer", emoji="\U0001F480", name="Valhalla Frequent Flyer", category="death",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_frequent_flyer,
          verb="has died the most",
          howto="Most deaths recorded in the window; min 2."),
-    dict(key="the_unkillable", emoji="\U0001F6E1️", name="The Unkillable",
+    dict(key="the_unkillable", emoji="\U0001F6E1️", name="The Unkillable", category="death",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_the_unkillable,
          verb="went the longest between deaths",
          howto="Longest actual played-time gap between two of your own deaths; min 30 minutes."),
-    dict(key="red_wedding", emoji="\U0001FA78", name="Red Wedding",
+    dict(key="red_wedding", emoji="\U0001FA78", name="Red Wedding", category="death",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_red_wedding,
          verb="died the most in one sitting",
          howto="Most deaths suffered in a single session; min 2."),
-    dict(key="eager_for_valhalla", emoji="⚰️", name="Eager for Valhalla",
+    dict(key="eager_for_valhalla", emoji="⚰️", name="Eager for Valhalla", category="death",
          windows=("day", "week", "all"), live=False, higher=False, fn=m_eager_for_valhalla,
          verb="died fastest after logging in",
          howto="Shortest time from login to that session's first death."),
-    dict(key="statistically_unlucky", emoji="\U0001F4CA", name="Statistically Unlucky",
+    dict(key="statistically_unlucky", emoji="\U0001F4CA", name="Statistically Unlucky", category="death",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_statistically_unlucky,
          verb="has the worst deaths per hour",
          howto="Worst deaths-per-hour rate; only players with 2+ hours played count."),
     # -- social & co-op
-    dict(key="shield_brothers", emoji="\U0001F91D", name="Shield Brothers",
+    dict(key="shield_brothers", emoji="\U0001F91D", name="Shield Brothers", category="social",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_shield_brothers,
          verb="have spent the most time playing together",
          howto="Pair of players with the most overlapping online time together; min 30 minutes.",
          render=render_shield_brothers),
-    dict(key="full_hall", emoji="\U0001F389", name="Full Hall",
+    dict(key="full_hall", emoji="\U0001F389", name="Full Hall", category="social",
          windows=("day", "week", "all"), live=True, higher=True, fn=m_full_hall,
          verb="",
          howto="Most players online at the same instant, from per-minute samples; min 2. Names shown only when the sample count matches exactly.",
          render=render_full_hall),
-    dict(key="the_hermit", emoji="\U0001F9CD", name="The Hermit",
+    dict(key="the_hermit", emoji="\U0001F9CD", name="The Hermit", category="social",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_the_hermit,
          verb="spent the most hours playing alone",
          howto="Most time spent online while no one else was; min 30 minutes."),
-    dict(key="the_wingman", emoji="\U0001F37B", name="The Wingman",
+    dict(key="the_wingman", emoji="\U0001F37B", name="The Wingman", category="social",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_the_wingman,
          verb="keeps logging in right after someone else",
          howto="Most logins landing within 5 minutes of someone else's login; min 2."),
     # -- world & exploration
-    dict(key="far_from_home", emoji="\U0001F5FA️", name="Far From Home",
+    dict(key="far_from_home", emoji="\U0001F5FA️", name="Far From Home", category="world",
          windows=("all",), live=False, higher=True, fn=m_far_from_home,
          verb="has a tombstone furthest from spawn",
          howto="All-time only. Whoever has a tombstone furthest (straight-line) from spawn."),
-    dict(key="raid_magnet", emoji="\U0001F329️", name="Raid Magnet",
+    dict(key="raid_magnet", emoji="\U0001F329️", name="Raid Magnet", category="world",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_raid_magnet,
          verb="was present for the most raids",
          howto="Present online for the most raid events in the window; min 2."),
-    dict(key="stood_at_the_fall", emoji="\U0001F43A", name="Stood at the Fall",
+    dict(key="stood_at_the_fall", emoji="\U0001F43A", name="Stood at the Fall", category="world",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_stood_at_the_fall,
          verb="was online for the most boss falls",
          howto="Online for the most boss-defeat moments (from the boss log)."),
     # -- for fun / punny
-    dict(key="tourist_trap", emoji="\U0001FAA6", name="Tourist Trap",
+    dict(key="tourist_trap", emoji="\U0001FAA6", name="Tourist Trap", category="fun",
          windows=("all",), live=False, higher=False, fn=m_tourist_trap,
          verb="left two tombstones closest together",
          howto="All-time only. Your own two tombstones that ended up closest together; needs 2+."),
-    dict(key="the_yoyo", emoji="\U0001F3A3", name="The Yo-Yo",
+    dict(key="the_yoyo", emoji="\U0001F3A3", name="The Yo-Yo", category="fun",
          windows=("day",), live=False, higher=True, fn=m_the_yoyo,
          verb="joined and left the most in one day",
          howto="Day window only. Most join events in a single day; min 3."),
-    dict(key="lag_lord", emoji="\U0001F4F6", name="Lag Lord",
+    dict(key="lag_lord", emoji="\U0001F4F6", name="Lag Lord", category="fun",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_lag_lord,
          verb="has the worst average ping",
          howto="Worst average ping across samples, min 5 samples; at least 80 ms."),
-    dict(key="blink", emoji="\U0001F4A8", name="Blink and You'll Miss It",
+    dict(key="blink", emoji="\U0001F4A8", name="Blink and You'll Miss It", category="fun",
          windows=("day", "week", "all"), live=False, higher=False, fn=m_blink,
          verb="had the shortest session",
          howto="Shortest completed session (join to leave), 5 minutes or less."),
-    dict(key="the_3am_club", emoji="\U0001F550", name="The 3 AM Club",
+    dict(key="the_3am_club", emoji="\U0001F550", name="The 3 AM Club", category="fun",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_3am_club,
          verb="spent the most hours between midnight and 5 AM",
          howto="Most hours played between local midnight and 5 AM; min 30 minutes."),
-    dict(key="clockwork_viking", emoji="⏰", name="Clockwork Viking",
+    dict(key="clockwork_viking", emoji="⏰", name="Clockwork Viking", category="fun",
          windows=("week", "all"), live=False, higher=False, fn=m_clockwork_viking,
          verb="logs in at the steadiest time of day",
          howto="Week/all-time. Steadiest daily login time-of-day (lowest variance); 3+ sessions needed."),
-    dict(key="wrong_place_wrong_time", emoji="\U0001F9F2", name="Wrong Place, Wrong Time",
+    dict(key="wrong_place_wrong_time", emoji="\U0001F9F2", name="Wrong Place, Wrong Time", category="fun",
          windows=("day", "week", "all"), live=False, higher=True, fn=m_wrong_place_wrong_time,
          verb="faced the most raids alone",
          howto="Most raids faced while completely alone on the server; min 2."),
-    dict(key="overachiever", emoji="\U0001F3C6", name="Overachiever",
+    dict(key="overachiever", emoji="\U0001F3C6", name="Overachiever", category="fun",
          windows=("day", "week", "all"), live=False, higher=True, fn=None,
          verb="won the most other medals",
          howto="Meta-medal: won the most other medals in this same window; min 2."),
@@ -993,6 +1000,23 @@ CATALOG = [
 CATALOG_BY_KEY = {e["key"]: e for e in CATALOG}
 LIVE_KEYS = [e["key"] for e in CATALOG if e["live"]]
 NEEDS_SAMPLES = {"full_hall", "lag_lord"}
+
+CATEGORIES = ("time", "death", "social", "world", "fun")
+
+
+def _validate_catalog():
+    """Guards the "add a medal by adding one entry" property: every entry must have a category
+    from the fixed set (used for grouping on the web page) and a unique key."""
+    seen = set()
+    for e in CATALOG:
+        if e["key"] in seen:
+            raise ValueError(f"duplicate CATALOG key {e['key']!r}")
+        seen.add(e["key"])
+        if e.get("category") not in CATEGORIES:
+            raise ValueError(f"CATALOG entry {e['key']!r} has no valid category (got {e.get('category')!r})")
+
+
+_validate_catalog()
 
 
 # ---------------------------------------------------------------- compute()
@@ -1263,12 +1287,57 @@ def cmd_board(dry):
     st = load(STATE, {})
     update_board(embed, st)
     save(STATE, st)
+    # keep the web feed fresh on the same daily cadence; cmd_web() never raises outward
+    cmd_web(dry=False)
+
+
+def web_payload(now):
+    """The full /var/www/valheim/medals.json payload (see PLAN-v5's data contract). Computes all
+    three windows itself and emits the engine's own display/runners_up verbatim -- the page must
+    duplicate no medal logic. `now` is threaded through so tests can pin it."""
+    windows = {}
+    all_time = {}
+    status = {}
+    for w in ("day", "week", "all"):
+        results, ctx = compute(w, now=now)
+        windows[w] = {
+            key: {"names": list(res["winners"]), "value": res["value"], "display": res["display"],
+                  "runners_up": res["runners_up"]}
+            for key, res in results.items()
+        }
+        if w == "all":
+            all_time = {k: sig(v) for k, v in results.items()}
+            status = ctx["status"]
+
+    tracking_since = (status.get("players") or {}).get("tracking_since") or TRACKING_SINCE_FALLBACK
+    day_start, _ = window_bounds("day", now, tracking_since)
+    return {
+        "generated": int(now),
+        "tracking_since": int(tracking_since),
+        "day_label": fmt_date_full(local_date(day_start)),
+        "catalog": [
+            {"key": e["key"], "emoji": e["emoji"], "name": e["name"], "category": e["category"],
+             "verb": e["verb"], "howto": e["howto"], "windows": list(e["windows"]), "live": e["live"]}
+            for e in CATALOG
+        ],
+        "windows": windows,
+        "all_time": all_time,  # unchanged shape, kept for compatibility
+    }
+
+
+def cmd_web(dry):
+    t0 = time.time()
     try:
-        # near-free extra: a future dashboard trophy case has data waiting; best-effort only
-        results, _ = compute("all")
-        save(WEB_OUT, {"generated": int(time.time()), "all_time": {k: sig(v) for k, v in results.items()}})
-    except Exception:
-        pass
+        payload = web_payload(t0)
+        payload["cost_ms"] = int((time.time() - t0) * 1000)
+        if dry:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+        save(WEB_OUT, payload)
+        log(f"web: wrote {WEB_OUT} ({payload['cost_ms']} ms, {len(payload['catalog'])} medals)")
+    except Exception as e:
+        # non-negotiable: this runs on its own 10-min timer and must never fail the unit
+        log(f"web ERROR {e!r}")
 
 
 def main():
@@ -1280,6 +1349,7 @@ def main():
         ("--daily", cmd_daily),
         ("--weekly", cmd_weekly),
         ("--board", cmd_board),
+        ("--web", cmd_web),
     ]
     ran = False
     for flag, fn in modes:
@@ -1287,7 +1357,7 @@ def main():
             fn(dry)
             ran = True
     if not ran:
-        print("usage: valheim-medals.py --seed|--check-records|--daily|--weekly|--board [--dry-run]"
+        print("usage: valheim-medals.py --seed|--check-records|--daily|--weekly|--board|--web [--dry-run]"
               " (--daily and --board may combine)", file=sys.stderr)
         sys.exit(2)
 
