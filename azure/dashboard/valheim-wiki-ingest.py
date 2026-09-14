@@ -301,7 +301,16 @@ class Record:
 class RunStats:
     """Accumulated across the whole run so the final summary line (see module docstring's FAILURE
     POLICY) and the exit-code decision both read from one place instead of threading counters
-    through every function separately."""
+    through every function separately.
+
+    H2 review fix: record_skip() is the ONE place a dropped page is accounted for, called both by
+    raw_pages_to_records() (a page whose wikitext failed to parse) and by walk_allpages() (a page
+    the fetch layer itself never got usable content for -- missing/invalid/no revisions/no
+    content, see that function's own docstring). Routing both through the same method is what
+    makes skip_ratio() -- and therefore the 5% hard-failure threshold -- see fetch-layer drops at
+    all; before this fix those were bare `continue`s that never touched `attempted` or `skipped`,
+    so a MediaWiki response-shape change could silently shrink the corpus while this same SUMMARY
+    line still reported "0 skipped"."""
 
     attempted: int = 0
     succeeded: int = 0
@@ -319,9 +328,14 @@ class RunStats:
         self.succeeded += 1
 
     def record_skip(self, title: str, reason: str):
+        """Count one dropped page, whatever stage dropped it -- a parse failure
+        (raw_pages_to_records()) or a fetch-layer drop (walk_allpages(): missing/invalid/no
+        revisions/no content). Always logs at WARNING with the page's title, per this script's
+        FAILURE POLICY: a slowly-rising skip count is the only early warning that a wiki changed
+        shape under us, and that is useless if it is not in the journal."""
         self.attempted += 1
         self.skipped_titles.append(title)
-        _LOG.warning("skip: page %r failed to parse -- %s", title, reason)
+        _LOG.warning("skip: page %r -- %s", title, reason)
 
 
 def build_user_agent(contact: Optional[str]) -> str:
@@ -920,7 +934,9 @@ def _revision_content(rev: dict) -> Optional[str]:
     return main.get("content")
 
 
-def walk_allpages(client: "WikiClient", source: str, limit: Optional[int] = None) -> Iterator[RawPage]:
+def walk_allpages(
+    client: "WikiClient", source: str, stats: "RunStats", limit: Optional[int] = None
+) -> Iterator[RawPage]:
     """Batched, continuation-following walk over a wiki's live ns0 pages: `action=query&
     generator=allpages&gapnamespace=0&prop=revisions&rvprop=content|ids|timestamp`, GAP_LIMIT
     (500) pages per request. PLAN-v6.md specifies exactly this mechanism for BOTH the Fandom delta
@@ -931,7 +947,17 @@ def walk_allpages(client: "WikiClient", source: str, limit: Optional[int] = None
     Stops as soon as `limit` pages have been yielded (no further request is issued), regardless of
     how many more `continue` batches the wiki still has -- this is what makes `--limit 20` cheap
     against a live wiki with ~1,000+ pages rather than merely capping how much of a full walk gets
-    kept."""
+    kept.
+
+    H2 review fix: a page the API reports as `missing`/`invalid`, one with no revisions, or a
+    revision with no readable content, used to be a bare `continue` -- not logged, not counted in
+    `stats`, so it was invisible to both the journal and skip_ratio()'s 5% failure threshold. A
+    MediaWiki response-shape change could then silently shrink the corpus while the SUMMARY line
+    still reported "0 skipped". Every one of those drops now goes through `stats.record_skip()`
+    -- the SAME accounting a parse failure gets in raw_pages_to_records() -- so it is counted in
+    `attempted`, counted in `skipped`, feeds skip_ratio() exactly like a parse failure would, and
+    is logged at WARNING with its title (record_skip() already does this logging; see its own
+    docstring)."""
     params = {
         "action": "query",
         "generator": "allpages",
@@ -948,14 +974,21 @@ def walk_allpages(client: "WikiClient", source: str, limit: Optional[int] = None
         data = client.get({**params, **continue_params})
         pages = (data.get("query") or {}).get("pages") or []
         for page in pages:
-            if page.get("missing") or page.get("invalid"):
+            title = page.get("title") or "<untitled>"
+            if page.get("missing"):
+                stats.record_skip(title, "API reported this page as missing")
+                continue
+            if page.get("invalid"):
+                stats.record_skip(title, "API reported this page as invalid")
                 continue
             revisions = page.get("revisions") or []
             if not revisions:
+                stats.record_skip(title, "no revisions returned for this page")
                 continue
             rev = revisions[0]
             content = _revision_content(rev)
             if content is None:
+                stats.record_skip(title, "revision had no readable content (content/slots.main.content)")
                 continue
             yield RawPage(
                 title=page.get("title", ""),
@@ -973,7 +1006,7 @@ def walk_allpages(client: "WikiClient", source: str, limit: Optional[int] = None
 
 
 def ingest_fandom_delta(
-    client: "WikiClient", dump_timestamps: dict, limit: Optional[int] = None
+    client: "WikiClient", dump_timestamps: dict, stats: "RunStats", limit: Optional[int] = None
 ) -> Iterator[RawPage]:
     """PLAN-v6.md step 2: walk Fandom's live pages and yield only the ones worth overriding the
     dump's copy of -- a title whose live revision timestamp is strictly newer than what the dump
@@ -984,7 +1017,7 @@ def ingest_fandom_delta(
     taken as the oldest page's timestamp) or silently miss real changes to older, rarely-edited
     pages (if taken as the newest). ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" strings compare correctly with
     plain `<=`/`>`, so no date parsing is needed here."""
-    for page in walk_allpages(client, "fandom", limit=limit):
+    for page in walk_allpages(client, "fandom", stats, limit=limit):
         dump_ts = dump_timestamps.get(page.title)
         if dump_ts is not None and page.timestamp <= dump_ts:
             continue
@@ -1037,7 +1070,7 @@ def raw_pages_to_records(raw_pages: Iterator[RawPage], stats: RunStats) -> Itera
         try:
             sections = page_to_sections(raw.title, raw.wikitext)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
-            stats.record_skip(raw.title, repr(exc))
+            stats.record_skip(raw.title, f"failed to parse -- {exc!r}")
             continue
         stats.record_success()
         url = page_url(raw.source, raw.title)
@@ -1158,7 +1191,7 @@ def run(args: argparse.Namespace) -> int:
 
         try:
             delta_pages = list(
-                ingest_fandom_delta(fandom_client, dump_timestamps, limit=args.limit)
+                ingest_fandom_delta(fandom_client, dump_timestamps, stats, limit=args.limit)
             )
         except Exception as exc:
             _LOG.error("could not complete the Fandom delta walk: %r", exc)
@@ -1169,7 +1202,9 @@ def run(args: argparse.Namespace) -> int:
         fandom_raw = list(fandom_by_title.values())
 
         try:
-            weirdgloop_raw = list(walk_allpages(weirdgloop_client, "weirdgloop", limit=args.limit))
+            weirdgloop_raw = list(
+                walk_allpages(weirdgloop_client, "weirdgloop", stats, limit=args.limit)
+            )
         except Exception as exc:
             _LOG.error("could not complete the Weird Gloop walk: %r", exc)
             return 1
