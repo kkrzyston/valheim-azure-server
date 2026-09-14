@@ -214,6 +214,37 @@ non-commercial condition plainly — it constrains any future commercial use of 
 Update `azure/README.md`'s Hermóðr section: what the bot now knows, where it came from, how the
 refresh works, and how to run an ingest by hand.
 
+## W6 — Close the dropped-template gap (added after W1 landed)
+
+W1 shipped rendering only for templates whose name starts with `infobox`; everything else falls
+through to `strip_code()`, which drops templates entirely. `{{drop table}}`, `{{spawn table}}`,
+recipe and crafting templates therefore vanish without trace. W1 flagged this itself rather than
+letting it pass.
+
+That gap defeats the owner's stated requirement — a *full* understanding of game mechanics — because
+"what drops from a Fenring?", "where does X spawn?" and "what does Y cost to craft?" are among the
+most common questions a Valheim bot is asked.
+
+The second half of the same problem: raw wikitables (`{| class="wikitable" ... |}`) are how both
+wikis build the resistance tiers and food stats. `strip_code()` flattens a table into run-on text,
+so a number can lose the label saying what it applies to. **A number without its label is worse
+than no number, because it still reads as authoritative.**
+
+1. **Survey before generalizing** — sample real pages across creatures, items, food, crafting
+   stations and biomes; count which non-infobox templates and table shapes actually carry
+   mechanics data. Report the counts; do not guess a template list.
+2. Render data-bearing templates generally rather than by an `infobox` name prefix, with a small
+   exclusion list for presentational ones (navboxes, stubs, cleanup banners, `{{Work in progress}}`)
+   — those are noise in a retrieval corpus.
+3. Render wikitables so each row is self-describing: one line per row with its header labels
+   attached, never a flattened run of cells.
+4. Re-verify W1's existing checks, and add: a creature's drops are present and attached to that
+   creature; a table row keeps its label with its number; `{{`/`[[` still never appear; re-runs
+   stay byte-identical.
+
+A category that genuinely cannot be rendered sensibly may be left out — **documented in the code
+as a known gap**. A stated gap is acceptable; a silent one is not.
+
 ## What this plan deliberately does not do
 
 - **No embeddings.** Keyword + BM25 is the right power-to-complexity ratio for a corpus whose
