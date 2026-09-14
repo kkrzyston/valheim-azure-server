@@ -621,7 +621,7 @@
     const valid = pairs.filter((p) => p && p.seconds > 0);
     if (!valid.length) { el.innerHTML = '<p class="note">No two Vikings have been in the world at the same time yet.</p>'; return; }
     const names = [...new Set(valid.flatMap((p) => [p.a, p.b]))].sort((a, b) => a.localeCompare(b));
-    const key = (a, b) => a < b ? a + ' ' + b : b + ' ' + a;
+    const key = (a, b) => a < b ? a + '\0' + b : b + '\0' + a;
     const secs = new Map(valid.map((p) => [key(p.a, p.b), p.seconds]));
     const max = Math.max(...valid.map((p) => p.seconds));
     let html = '<div class="scroll"><table><thead><tr><th></th>' + names.map((n) => `<th scope="col">${esc(n)}</th>`).join('') + '</tr></thead><tbody>';
