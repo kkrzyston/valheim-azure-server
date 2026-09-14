@@ -600,6 +600,33 @@ JOIN_RE = re.compile("|".join(JOIN_PATTERNS), re.IGNORECASE)
 _join_cache = {"t": 0.0, "v": None}
 
 
+def decide_route(question):
+    """Pure routing decision for on_message(): which of the two answer paths `question` should
+    take, and whether the English escape hatch is active for it. Returns ("join", english) when
+    `question` is a join/password/connection question (see JOIN_RE and join_reply()'s docstring
+    for why that path bypasses the model entirely), or ("ai", english) otherwise. `english` is
+    `bool(ENGLISH_RE.search(question))` in both branches -- the join branch has to check it again
+    itself rather than relying on call_ai_sync() to have already done so, since it never calls
+    call_ai_sync() at all.
+
+    Extracted out of on_message() specifically so it can be exercised directly by --selftest.
+    on_message is defined as a closure inside run_bot(), which needs a live Discord token and
+    gateway connection and so cannot be reached by --selftest at all -- before this function
+    existed, the actual branching logic (JOIN_RE.search(...) then a separate ENGLISH_RE.search(...)
+    to decide join_reply()'s language) lived only in that unreachable closure, and --selftest's
+    "join + English interaction" check asserted only that JOIN_RE and ENGLISH_RE each matched a
+    shared string in isolation -- never that the routing code did anything with those two matches
+    together. That gap is exactly how a real bug shipped once: reverting the coordinator's
+    join/English routing fix left --selftest exiting 0, all green, because nothing it ran ever
+    called the code path that broke. Call this function from on_message instead of inlining the
+    checks there, so there is exactly one implementation of this decision and the one --selftest
+    exercises is the one that actually runs on the gateway."""
+    english = bool(ENGLISH_RE.search(question))
+    if JOIN_RE.search(question):
+        return "join", english
+    return "ai", english
+
+
 def _unit_arg(text, flag):
     """Pull one -flag value out of the valheim.service ExecStart line."""
     m = re.search(r"-" + flag + r"""\s+("([^"]*)"|'([^']*)'|(\S+))""", text)
@@ -1557,11 +1584,13 @@ def run_bot():
                 log(f"failed to send empty-question reply: {exc!r}", "warning")
             return
 
-        # join/password questions are answered from disk, before the model is consulted -- this
-        # bypasses call_ai_sync() entirely, so the English escape hatch (ENGLISH_RE) is checked
-        # again here rather than relying on call_ai_sync() to have done it.
-        if JOIN_RE.search(question):
-            join_english = bool(ENGLISH_RE.search(question))
+        # Routing decision (JOIN_RE vs. the model, and the English escape hatch) lives in
+        # decide_route() -- a pure, module-level function -- rather than inlined here, so
+        # --selftest can exercise the exact same code this closure runs. See decide_route()'s
+        # docstring for why that distinction matters.
+        route, is_english = decide_route(question)
+        if route == "join":
+            join_english = is_english
             try:
                 await message.reply(join_reply(english=join_english),
                                      allowed_mentions=discord.AllowedMentions.none())
@@ -1662,18 +1691,23 @@ def cmd_selftest():
         print(f"{'PASS' if not matched else 'FAIL'} (should NOT match): {phrase!r}")
         all_ok = all_ok and not matched
 
-    print("\n--- join + English interaction (both regexes must fire on the SAME message) ---")
-    # A join/password question is answered by join_reply(), a fixed template that bypasses
-    # call_ai_sync() entirely -- so ENGLISH_RE has to be (and now is, see on_message's JOIN_RE
-    # branch) checked again at that branch specifically, not just inside call_ai_sync(). Asserting
-    # the two regexes in isolation would not have caught the original bug (each matched fine on
-    # its own); the message that has to route to English is one BOTH regexes fire on together.
-    join_and_english_phrase = "how do i join, in english please"
-    join_matched = bool(JOIN_RE.search(join_and_english_phrase))
-    english_matched = bool(ENGLISH_RE.search(join_and_english_phrase))
-    print(f"{'PASS' if join_matched else 'FAIL'} JOIN_RE matches:    {join_and_english_phrase!r}")
-    print(f"{'PASS' if english_matched else 'FAIL'} ENGLISH_RE matches: {join_and_english_phrase!r}")
-    all_ok = all_ok and join_matched and english_matched
+    print("\n--- decide_route() (the actual on_message routing code, not just its regexes) ---")
+    # This exercises decide_route() itself -- the pure function on_message calls -- rather than
+    # JOIN_RE and ENGLISH_RE in isolation. Asserting the two regexes separately would not have
+    # caught the original bug (each matched fine on its own; the bug was in how on_message's
+    # closure combined them, which --selftest could not reach at all before decide_route() was
+    # pulled out of it). See decide_route()'s own docstring for the full story.
+    route_a, english_a = decide_route("how do i join, in english please")
+    route_a_ok = route_a == "join" and english_a is True
+    print(f"{'PASS' if route_a_ok else 'FAIL'} decide_route('how do i join, in english please') "
+          f"== ('join', True): got {(route_a, english_a)!r}")
+    all_ok = all_ok and route_a_ok
+
+    route_b, english_b = decide_route("how do i join")
+    route_b_ok = route_b == "join" and english_b is False
+    print(f"{'PASS' if route_b_ok else 'FAIL'} decide_route('how do i join') == ('join', False): "
+          f"got {(route_b, english_b)!r}")
+    all_ok = all_ok and route_b_ok
 
     print("\n--- to_futhark() carve-outs (must survive byte-for-byte) ---")
     carveouts = [
