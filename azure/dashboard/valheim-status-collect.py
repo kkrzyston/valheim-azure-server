@@ -14,7 +14,7 @@ only when the world file changes), deaths, raids, outdated clients, newcomers, r
 history, uptime %, NIC throughput, pairwise "together" time, heat map, records, Steam news (1 h cache),
 Discord counts (10 min cache). Network calls have 5 s timeouts and never abort the run.
 """
-import json, os, re, socket, struct, subprocess, time, shutil, glob, zlib, urllib.request
+import json, os, re, socket, struct, subprocess, sys, time, shutil, glob, zlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, date, timedelta
 try:
@@ -384,15 +384,50 @@ if live_count is not None and live_count == 0 and state["online"]:
     state["online"] = {}
 
 # ---------------------------------------------------------------- player ping (server -> player, ICMP)
-# Players connect directly to UDP 2456, so a short capture reveals their addresses. Each is pinged
-# from the VM; routers that drop ICMP show as no reply. Addresses never leave this machine.
+# Players connect directly to the game port, so whoever is sending to it is a player. Each address
+# is pinged from the VM; routers that drop ICMP show as no reply. Addresses never leave this machine.
+#
+# This used to be `tcpdump -i any -c 80 'udp and dst port 2456'` for three seconds, once a minute,
+# every minute that anyone was online -- an AF_PACKET tap copying packets out of the game's hot
+# receive path purely to learn a handful of addresses we already had a cheaper way to know. The
+# `peers` set in the `inet valheim_meter` nftables table (see valheim-meter-nft.sh) collects the
+# same addresses in the packet path itself, with a 15-minute element timeout so it prunes itself.
+# Reading it is one short-lived `nft` call against an in-kernel set.
+def _nft_set_elements(blob):
+    """Addresses out of `nft -j list set ...`. Elements of a set with `flags timeout` come back as
+    {"elem": {"val": "1.2.3.4", "timeout": 900, "expires": 812}} rather than a bare string, and an
+    empty set has no "elem" key at all -- handle both shapes."""
+    out = set()
+    for node in blob.get("nftables", []):
+        s = node.get("set") if isinstance(node, dict) else None
+        if not isinstance(s, dict):
+            continue
+        for e in s.get("elem", []):
+            if isinstance(e, dict):
+                e = e.get("elem", e)
+                e = e.get("val") if isinstance(e, dict) else e
+            if isinstance(e, str):
+                out.add(e)
+    return out
+
+
 def peer_ips():
     try:
-        out = subprocess.run(["timeout", "3", "tcpdump", "-nn", "-q", "-i", "any", "-c", "80", "udp and dst port 2456"],
-                             capture_output=True, text=True, timeout=10).stdout
-    except Exception:
+        out = subprocess.run(["nft", "-j", "list", "set", "inet", "valheim_meter", "peers"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            raise RuntimeError((out.stderr or "").strip()[:200] or f"nft exit {out.returncode}")
+        return _nft_set_elements(json.loads(out.stdout)) - {"127.0.0.1"}
+    except Exception as e:
+        # Not silent, but not once a minute forever either: losing the peer set costs the dashboard
+        # its per-player ping column, which is worth a line in the journal -- and worth exactly one
+        # line an hour while it stays broken. The usual cause is that valheim-egress.service (whose
+        # ExecStartPre= installs the table) has not run, or something flushed the table.
+        if now - state.get("peer_src_warn", 0) > 3600:
+            state["peer_src_warn"] = now
+            print(f"peer_ips: cannot read the nftables peers set ({e}); per-player ping is off. "
+                  "Check: systemctl status valheim-egress; valheim-meter-nft.sh show", file=sys.stderr)
         return set()
-    return set(re.findall(r"IP (\d+\.\d+\.\d+\.\d+)\.\d+ > ", out)) - {"127.0.0.1"}
 
 def icmp_ping(ip):
     try:

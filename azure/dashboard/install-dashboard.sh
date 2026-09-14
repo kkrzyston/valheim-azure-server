@@ -33,7 +33,10 @@ test -f /etc/valheim-alert.env || install -m 0600 valheim-alert.env /etc/valheim
 # Hermodr reads its own env now that it runs as valheim-bot, so the bot process never holds the
 # Discord WEBHOOK credential that alert/medals/digest still use. Never overwritten once present.
 test -f /etc/valheim-bot.env || install -o root -g valheim-bot -m 0640 valheim-bot.env /etc/valheim-bot.env
-command -v tcpdump >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y tcpdump
+# nftables, not tcpdump: the collector learns peer addresses from the `peers` set in the
+# `inet valheim_meter` table (installed by valheim-egress.service's ExecStartPre=), which
+# replaced a once-a-minute AF_PACKET tap on the game's own receive path.
+command -v nft >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y nftables
 install -m 0644 valheim-status.service valheim-status.timer /etc/systemd/system/
 # Let the caddy user reach /home/valheim/backups (the snapshots listing) without opening
 # /home/valheim to everyone: an ACL granting traversal of the home dir and read of backups only.
