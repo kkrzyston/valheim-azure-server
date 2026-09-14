@@ -25,9 +25,9 @@ MATCH. That result is then passed to sqlite3 as a bound `?` parameter, never str
 into SQL text -- belt-and-suspenders: the quoting protects FTS5's own grammar, the parameter
 binding protects the surrounding SQL statement.
 
-Stdlib only: sqlite3, json, os, re, sys, difflib, threading, argparse. All standard library.
-Imported directly by valheim-bot.py (via importlib, like valheim-medals.py, because of the
-hyphenated filename) and valheim-bot.py must stay stdlib-only per PLAN-v6's hard rules -- so
+Stdlib only: sqlite3, json, os, re, sys, difflib, threading, argparse, time. All standard
+library. Imported directly by valheim-bot.py (via importlib, like valheim-medals.py, because of
+the hyphenated filename) and valheim-bot.py must stay stdlib-only per PLAN-v6's hard rules -- so
 this module must too.
 
 All paths take an env override (VALHEIM_WIKI_ROOT), matching the VALHEIM_RESTART_ROOT /
@@ -44,6 +44,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 
 
 # ---------------------------------------------------------------- paths & config
@@ -138,14 +139,69 @@ def _build_match_expression(query):
 _cache_lock = threading.Lock()
 _cache = {"path": None, "mtime": None, "conn": None}
 
+# ---------------------------------------------------------------- H1: observable failures
+# search() must never raise (see its own docstring) -- but "never raise" and "never log" are
+# different promises, and the original code kept only the first one. A sqlite3.OperationalError
+# from a stale/foreign wiki.db (wrong or missing schema), a disk error, or any other genuine
+# failure was degrading to a bare [], byte-for-byte identical to an honest "nothing matched".
+# Nobody could ever tell the index was broken from the log, because there was nothing IN the log.
+#
+# The fix keeps the no-raise contract (still catch-and-return-[]) but adds one thing: an ERROR
+# line to stderr before returning, so a broken index is finally distinguishable from an empty
+# result. It is rate-limited per DISTINCT error signature (exception type + message) rather than
+# per call, so a persistent failure -- the same broken wiki.db answering every Discord question --
+# logs loudly once and then stays quiet for _ERROR_LOG_COOLDOWN_SECONDS instead of flooding the
+# log once per question. A genuinely NEW/different failure (a different exception type or
+# message) is never suppressed by an earlier, unrelated one already being on cooldown.
+_ERROR_LOG_COOLDOWN_SECONDS = 300  # re-announce an unchanged failure at most once per 5 minutes
+_logged_errors_lock = threading.Lock()
+_logged_errors = {}  # error signature ("Type: message") -> time.monotonic() last logged
+
+
+def _log_search_failure(exc):
+    """Emit a rate-limited ERROR line for a search()-path failure. See the module-level comment
+    above for the full rationale. Never raises itself -- a logging call must not be the thing
+    that turns a handled failure into an unhandled one."""
+    signature = f"{type(exc).__name__}: {exc}"
+    now = time.monotonic()
+    try:
+        with _logged_errors_lock:
+            last = _logged_errors.get(signature)
+            if last is not None and now - last < _ERROR_LOG_COOLDOWN_SECONDS:
+                return
+            _logged_errors[signature] = now
+        print(
+            "valheim-wiki-index: search() failed, degrading to [] per its no-raise contract "
+            "(this is a bug in the index or its storage, NOT a legitimate no-match -- see H1): "
+            + signature,
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _reset_error_log_for_tests():
+    """Test-only helper: clear the rate-limit state so a --selftest run doesn't have its second
+    assertion suppressed by the first. Not part of the module's public contract."""
+    with _logged_errors_lock:
+        _logged_errors.clear()
+
 
 def _get_connection(db_path):
     """Return a live sqlite3 connection to db_path, reopening it whenever the file's mtime has
     changed since the last call (step 6: a refresh takes effect without restarting the bot).
-    Returns None -- never raises -- if the file is missing or cannot be opened."""
+    Returns None -- never raises -- if the file is missing or cannot be opened.
+
+    "Missing" (FileNotFoundError) is the normal, silent, expected state before the first index
+    build has ever run, or between a rebuild and the next -- NOT logged. Anything else that keeps
+    the file from being opened (permissions, a disk error, a corrupt/foreign file that connects
+    but fails PRAGMA) is a genuine failure per H1 and IS logged, via _log_search_failure()."""
     try:
         mtime = os.stat(db_path).st_mtime
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _log_search_failure(exc)
         return None
 
     with _cache_lock:
@@ -160,7 +216,8 @@ def _get_connection(db_path):
         try:
             new_conn = sqlite3.connect(db_path, check_same_thread=False)
             new_conn.execute("PRAGMA query_only = ON")
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _log_search_failure(exc)
             return None
 
         _cache["conn"] = new_conn
@@ -196,13 +253,23 @@ def search(query, k=3, max_chars=4000):
     total <= max_chars. Each record:
         {"title": str, "heading": str, "text": str,
          "source": "weirdgloop" | "fandom", "revid": int, "url": str}
-    Returns [] when the index is missing, unreadable, or nothing matches. Never raises."""
+    Returns [] when the index is missing, unreadable, or nothing matches. Never raises.
+
+    "Missing" and "nothing matches" are both legitimate, silent [] outcomes -- but "unreadable"
+    (a stale/foreign wiki.db with the wrong schema, a corrupt file, a disk error) is a genuine
+    bug and, per H1, must not look identical to those in the log. See _log_search_failure()'s
+    module-level comment for the full rationale; this is the other half of it (the first half is
+    _get_connection() failing to even open the file -- this one is everything that can go wrong
+    once it IS open, most commonly `sqlite3.OperationalError: no such table` against an old or
+    wrong-shaped wiki.db)."""
     try:
         return _search_impl(query, k, max_chars)
-    except Exception:
-        # Any failure here degrades to "no game knowledge for this question" -- per PLAN-v6,
-        # [] is a normal outcome, not an error, and W3 falls back to the model's own (flagged
-        # unverified) knowledge. A broken index must never take the whole bot down with it.
+    except Exception as exc:
+        # Any failure here still degrades to "no game knowledge for this question" -- per
+        # PLAN-v6, [] is a normal outcome, not an error, and W3 falls back to the model's own
+        # (flagged unverified) knowledge. A broken index must never take the whole bot down with
+        # it -- but it must show up in the log, which is what H1's fix actually was.
+        _log_search_failure(exc)
         return []
 
 
