@@ -1,0 +1,30 @@
+# Valheim status dashboard. HTTPS certificate is obtained automatically from Let's Encrypt.
+# Two logins: `viking` opens the dashboard; `owner` (and only `owner`) opens /snapshots/.
+# install-dashboard.sh substitutes __HASH__ and __OWNER_HASH__ with bcrypt hashes.
+valheim-1g49ye.westus2.cloudapp.azure.com {
+	encode gzip
+	header Cache-Control "no-store"
+	header X-Content-Type-Options nosniff
+	header Referrer-Policy no-referrer
+
+	# /snapshots -> /snapshots/ so the listing below matches
+	redir /snapshots /snapshots/ 308
+
+	# World snapshots (the .tgz files in /home/valheim/backups), owner login only.
+	handle_path /snapshots/* {
+		basic_auth {
+			owner __OWNER_HASH__
+		}
+		root * /home/valheim/backups
+		file_server browse
+	}
+
+	# Everything else: the dashboard, viewer login.
+	handle {
+		basic_auth {
+			viking __HASH__
+		}
+		root * /var/www/valheim
+		file_server
+	}
+}

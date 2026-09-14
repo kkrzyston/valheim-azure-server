@@ -1,0 +1,10 @@
+# Everything in this repo is deployed to a Linux VM. CRLF in a shell script gives
+# "bad interpreter: /usr/bin/env bash^M", and systemd unit files are equally unforgiving,
+# so line endings are LF in the working tree on every platform -- including Windows,
+# where this repo is edited.
+* text=auto eol=lf
+
+# Binaries: never touch.
+*.png  binary
+*.zip  binary
+*.pdf  binary

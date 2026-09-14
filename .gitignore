@@ -1,0 +1,18 @@
+# World archives and vendor docs -- large binaries, not source.
+*.zip
+*.pdf
+
+# Python bytecode (the scripts are run on the VM, never imported as a package here).
+__pycache__/
+*.pyc
+
+# Session scratch from the Remember plugin.
+.remember/
+
+# Local-only Claude Code permissions.
+.claude/settings.local.json
+
+# Secrets never belong here. The real env file lives at /etc/valheim-alert.env on the VM,
+# mode 0600, root-only. azure/dashboard/valheim-alert.env is the TEMPLATE and is tracked --
+# keep every credential value in it empty.
+*.env.local

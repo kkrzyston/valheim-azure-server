@@ -1,0 +1,24 @@
+[Unit]
+Description=Hermodr, Valheim Discord Q&A bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/hermodr/venv/bin/python /usr/local/sbin/valheim-bot.py
+EnvironmentFile=-/etc/valheim-alert.env
+Restart=always
+RestartSec=10
+Nice=10
+
+# Hardening. The bot only ever reads the dashboard's own on-disk state and writes its own log --
+# nothing else, so it gets a strict, mostly read-only sandbox.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log
+ReadOnlyPaths=/var/www/valheim /var/lib/valheim-status
+
+[Install]
+WantedBy=multi-user.target

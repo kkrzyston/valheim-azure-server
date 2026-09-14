@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly Valheim Discord digest, Sundays 18:00 local
+
+[Timer]
+OnCalendar=Sun *-*-* 18:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Steam for a Valheim server update every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Valheim dashboard: collect server status into /var/www/valheim
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-status-collect.py
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-alert.py
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-medals.py --check-records
+EnvironmentFile=-/etc/valheim-alert.env
+Nice=10
