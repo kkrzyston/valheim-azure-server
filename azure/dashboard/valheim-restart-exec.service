@@ -1,0 +1,43 @@
+[Unit]
+Description=Valheim: carry out an approved restart request (the only unit allowed to stop the game)
+Documentation=file:/usr/local/sbin/valheim-restart-exec.py
+After=network-online.target valheim.service
+Wants=network-online.target
+# No start rate limiting. The .path unit can trigger this many times in a row, and systemd's
+# default (5 starts / 10 s) would park the caretaker in `failed` -- which would leave a request
+# half-executed with nothing left to resume it. Runaway triggering is harmless here: a tick with
+# nothing to do is a few milliseconds, and the 30-minute / 3-per-day / one-in-flight rails live in
+# the request files, not in how often this runs.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-restart-exec.py
+
+# MANDATORY. Type=oneshot inherits the 90 s default, which would SIGTERM the executor in the middle
+# of a restart: valheim.service alone allows 180 s to stop and 900 s to start (ExecStartPre runs
+# steamcmd +app_update on every start). 1800 s covers backup + stop + save verification + start +
+# A2S verification with room to spare.
+TimeoutStartSec=1800
+
+# DISCORD_WEBHOOK_URL and DASHBOARD_URL come from here, as they do for valheim-alert.py.
+EnvironmentFile=-/etc/valheim-alert.env
+
+# Arm it only after a full day of rehearsal: with this line present the executor does every check
+# and every Discord post but prints the systemctl calls instead of running them. Comment it out (or
+# drop it via `systemctl edit`) to go live.
+Environment=VR_DRY_RUN=1
+
+# Deliberately light hardening. This must be root, must talk to PID 1, must read the journal, must
+# run /home/valheim/backup.sh over the world directory and must reach Discord. The realistic risk
+# here is the executor dying half way through a restart, not the executor being exploited -- so
+# only the sandboxing that cannot interfere with any of that is applied.
+NoNewPrivileges=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelModules=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+Nice=0

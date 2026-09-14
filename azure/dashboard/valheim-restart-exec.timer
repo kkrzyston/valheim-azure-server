@@ -1,0 +1,21 @@
+[Unit]
+Description=Tick the Valheim restart caretaker every 15 seconds
+Documentation=file:/usr/local/sbin/valheim-restart-exec.py
+
+[Timer]
+OnBootSec=2min
+# OnUnitInactiveSec, NOT OnUnitActiveSec: the next tick is measured from when the previous one
+# FINISHED. A single execution can legitimately run for twenty minutes (backup, stop, save
+# verification, steamcmd, start, A2S), and with OnUnitActiveSec systemd would queue ticks on top of
+# a run in progress -- two processes advancing the same state machine is exactly the bug that
+# double-restarts a server.
+OnUnitInactiveSec=15s
+# Without this systemd coalesces timers to the nearest minute, which would make the countdown
+# milestones (T-300/120/60/30/10) land wherever they liked.
+AccuracySec=1s
+# Nothing to catch up on after downtime: every deadline lives in the request files, and a missed
+# tick is simply a later tick.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
