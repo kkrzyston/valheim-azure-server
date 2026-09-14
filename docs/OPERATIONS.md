@@ -351,6 +351,9 @@ Budgets.)
   aware that with `core.encrypt_token_cache=false` the login token sits unencrypted in
   `%USERPROFILE%\.azure\msal_token_cache.json`; run `az logout` if you'd rather not keep it,
   and prefer leaving the cache encrypted (the default) unless you hit the same broker issue.
+- **Restart-executor tuning is optional.** `valheim-restartd.py`/`valheim-restart-exec.py`
+  expose about 47 `RESTARTD_*`/`VR_*` environment-variable overrides (paths, timeouts, safety
+  limits), every one with a working default — see [`RESTART-TUNING.md`](RESTART-TUNING.md).
 
 ## Files in this folder
 

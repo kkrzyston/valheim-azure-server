@@ -25,7 +25,8 @@ group.
   single allow-listed channel and authenticated to Azure with no stored API key.
 - A **Discord restart-approval flow** (`valheim-restartd.py`, `valheim-restart-exec.py`, and
   their systemd units) that lets the Discord community approve a server restart from chat,
-  gated to a specific guild and an approver role. The bot no longer runs as root.
+  gated to a specific guild and an approver role. The bot no longer runs as root. Advanced
+  tuning for these two scripts is documented in [`docs/RESTART-TUNING.md`](docs/RESTART-TUNING.md).
 - **Daily off-site world backups** to Azure Blob Storage, independent of the local snapshot
   directory on the VM, with a 30-day retention lifecycle.
 - An **auto-updater** that checks Steam for a new build every 30 minutes and only restarts
