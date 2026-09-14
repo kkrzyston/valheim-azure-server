@@ -543,19 +543,42 @@ EVERYONE_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
 # a model hard-instructed to never use English will otherwise second-guess or refuse its own
 # stated exception, so the decision is made here in Python and handed to the model as a one-turn
 # override (see call_ai_sync()), never left for the model to decide on its own from the prompt
-# text alone. Matches only an explicit ask -- "in english", "speak english", "say that/it in
-# english", "english please", "translate that/it/this", "what does that/it/this mean in english",
-# and the Old Norse phrase "á ensku" ("in English") -- never a question that merely contains the
-# word "English" on its own (e.g. "did the Vikings speak Old English?" does not match, since
-# "speak" and "english" are not adjacent there).
+# text alone.
+#
+# A match requires an actual request to change language, not just the word "english" appearing
+# near other words -- a bare "\bin english\b" or "\btranslate (?:that|it|this)\b" used to match
+# far too eagerly:
+#   "how far is that in english units"                    -- "English units" is a real unit
+#                                                              system (imperial-ish), not a
+#                                                              language request
+#   "is Bonemass weak to fire in english patch notes"      -- "in English" modifies "patch notes"
+#   "can you translate that height into meters"            -- a unit-conversion question; "that"
+#                                                              is a determiner on "height", not a
+#                                                              pronoun referring to the reply
+# All three are ordinary Valheim questions that happen to contain "english"/"translate" as part
+# of a noun phrase, not a request. A real request either (a) names an imperative/request verb
+# (say/speak/answer/reply/write/tell/repeat/explain/put) near the phrase, or (b) has the phrase
+# stand alone as the whole message or trail it as its own clause with nothing meaningful after --
+# "in English", "in english?", "..., in English please". "translate that/it/this" is treated the
+# same way: a bare request (optionally with "please"/"for me"/"for us" filler) matches, but not
+# when something else is actually being translated ("translate that height into meters").
 ENGLISH_PATTERNS = [
-    r"\bin english\b",
     r"\bspeak english\b",
-    r"\bsay (?:that|it) in english\b",
     r"\benglish please\b",
-    r"\btranslate (?:that|it|this)\b",
     r"\bwhat does (?:that|it|this) mean in english\b",
     r"\bá ensku\b",
+    # a request/imperative verb within a few words of "in english" -- covers "say/tell/answer/
+    # reply/... (that/it/please/...) in english" without also matching "...in english units" or
+    # "...in english patch notes", neither of which has a request verb anywhere nearby.
+    r"\b(?:say|speak|answer|reply|write|tell|repeat|explain|put)\b(?:\s+\S+){0,3}\s+in english\b",
+    # "in english" standing alone as the whole message, or trailing it as its own clause -- only
+    # optional punctuation/whitespace may follow. This is exactly what "in english units" and
+    # "in english patch notes" fail: real words follow "in english" there.
+    r"\bin english\b(?=[\s,.!?]*$)",
+    # "translate that/it/this" as a bare request -- only when it stands alone (with optional
+    # "please"/"for me"/"for us" filler), never when the object of translation is spelled out
+    # afterward.
+    r"\btranslate (?:that|it|this)\b(?=\s*(?:please|for me|for us)?[\s,.!?]*$)",
 ]
 ENGLISH_RE = re.compile("|".join(ENGLISH_PATTERNS), re.IGNORECASE)
 
@@ -1624,6 +1647,11 @@ def cmd_selftest():
         "is there an English translation of njals saga",
         "how many players are online",
         "what does bjorn mean",
+        # Regression fixtures for Fix 3: ordinary Valheim questions that happen to contain
+        # "english"/"translate" as part of an ordinary noun phrase, not a language-switch request.
+        "how far is that in english units",
+        "is Bonemass weak to fire in english patch notes",
+        "can you translate that height into meters",
     ]
     for phrase in should_match:
         matched = bool(ENGLISH_RE.search(phrase))
