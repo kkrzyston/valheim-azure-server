@@ -36,10 +36,13 @@ the original wording as self-contradictory):
     the index build as two ExecStart lines in one unit; systemd stops at the first non-zero exit,
     so encoding a benign skip count as a non-zero exit would silently cancel the weekly index
     rebuild while the unit still looked healthy.
-  - The run exits non-zero ONLY on the hard-failure path: more than 5% of the pages it attempted
-    failed to parse, or the output file could not be written. Either way it writes nothing --
-    a half-built corpus is worse than a stale one, and this is the one case where stopping the
-    downstream index build is exactly correct.
+  - The run exits non-zero ONLY on the hard-failure path: fewer pages were attempted than
+    required_page_floor() says is plausible evidence of a real run (see its own comment -- this
+    is what catches a run that fetched NOTHING, or next to nothing, which a skip-ratio check
+    alone cannot: 0 skipped / 0 attempted is not "over 5%"), more than 5% of the pages it DID
+    attempt failed to parse, or the output file could not be written. Either way it writes
+    nothing -- a half-built (or empty) corpus is worse than a stale one, and this is the one case
+    where stopping the downstream index build is exactly correct.
   - The final summary line is always emitted, at INFO on a clean run and WARNING when any page
     was skipped, and always includes the literal token "SUMMARY" so `journalctl -u
     valheim-wiki-refresh | grep SUMMARY` finds it -- a slowly-rising skip count across weekly runs
@@ -139,6 +142,42 @@ BACKOFF_BASE_S = 2.0  # doubles each retry: 2, 4, 8, 16, 32s, capped by MAX_RETR
 MIN_REQUEST_INTERVAL_S = 1.0  # serialized: never more than one request/second to either wiki
 
 FAILURE_THRESHOLD = 0.05  # >5% of attempted pages failing to parse => hard failure, write nothing
+
+# ---------------------------------------------------------------- evidence floor (C1 review fix)
+# skip_ratio() alone cannot catch a run that fetched NOTHING: 0 skipped / 0 attempted is 0.0,
+# comfortably under FAILURE_THRESHOLD, so a TOTAL fetch failure (every source silently returning
+# zero pages -- see WikiClient.get()'s "error" key handling below for one concrete way that
+# happens with no exception ever raised) sailed straight through the ratio check and
+# os.replace()'d an EMPTY corpus over the last good one. That is strictly worse than doing
+# nothing: a stale corpus still answers questions; an empty one makes the bot say "I don't know"
+# forever, on a weekly unattended timer, while every signal (exit 0, INFO-level SUMMARY) reports
+# success.
+#
+# The fix is a POSITIVE check -- did this run produce real EVIDENCE of success -- not another
+# negative one (did we see enough failure). Inferring success from the absence of a failure
+# signal is exactly the bug above. The floor is scaled to what the run itself declared it was
+# trying to do:
+#   - A genuine unrestricted run against the live wikis should see something in the neighborhood
+#     of the real corpus: ~2,200 articles total (~1,034 Weird Gloop + Fandom's ~1,179, per
+#     PLAN-v6.md's source table). MIN_LIVE_RUN_PAGES (500) sits comfortably below even the
+#     SMALLER of the two wikis alone, so any healthy run -- including one where a whole source
+#     temporarily degrades -- clears it with room to spare, while a run that silently fetched
+#     nothing (or next to nothing) from every source never does.
+#   - --limit and --offline exist specifically to fetch far fewer pages than that ON PURPOSE (see
+#     their own --help text above -- exercising this script's parsing/failure-policy logic
+#     without pulling the whole corpus, including in CI). Holding those to the live-run floor
+#     would make the very flags built for testing this script unusable for testing this script.
+#     They are held to a much lower floor instead: at least ONE page attempted -- exactly the
+#     evidence the zero-fetch bug above was missing, without defeating either flag's own purpose.
+MIN_LIVE_RUN_PAGES = 500
+MIN_TEST_RUN_PAGES = 1
+
+
+def required_page_floor(args: argparse.Namespace) -> int:
+    """The minimum number of pages `run()` must have ATTEMPTED before it is allowed to write a
+    corpus at all -- see the constants' comment above for why this number depends on whether the
+    run declared itself a full live run or a deliberately-scoped --limit/--offline one."""
+    return MIN_TEST_RUN_PAGES if (args.offline or args.limit is not None) else MIN_LIVE_RUN_PAGES
 
 # Sections rendered from an infobox template ("infobox creature", "infobox armor", ...) are never
 # the wrapper template itself -- that one only carries positional (label, content) pairs, no
@@ -307,7 +346,14 @@ class WikiClient:
         maxlag-exceeded error (mirrored in the JSON body, not just the status line -- MediaWiki
         answers maxlag breaches with HTTP 200 and an `error.code == "maxlag"` payload). Raises
         requests.RequestException (or, if `requests` itself failed to import, RuntimeError) after
-        MAX_RETRIES exhausted -- callers decide whether that page counts as a skip."""
+        MAX_RETRIES exhausted -- callers decide whether that page counts as a skip.
+
+        Also raises RuntimeError IMMEDIATELY (no retry) on any OTHER MediaWiki API error body
+        (HTTP 200 with `{"error": {...}}`, code != "maxlag" -- e.g. readapidenied, or a
+        deprecated/removed parameter after an API version bump): retrying a malformed or
+        forbidden request cannot succeed, and letting it through as an ordinary-looking response
+        is exactly how a caller like walk_allpages() silently turns "the API refused this
+        request" into "this wiki has zero pages" with no exception anywhere to catch."""
         if self._session is None:
             raise RuntimeError(
                 "the 'requests' package is not installed in this environment -- see "
@@ -355,6 +401,23 @@ class WikiClient:
                 )
                 time.sleep(delay)
                 continue
+            if error:
+                # Any OTHER MediaWiki error (readapidenied, a deprecated/removed param after an
+                # API version bump, etc.) comes back as HTTP 200 with an {"error": {...}} body --
+                # raise_for_status() never fires for this. Left unhandled, walk_allpages()'s own
+                # `(data.get("query") or {}).get("pages") or []` would quietly turn this into ZERO
+                # pages, indistinguishable from "this wiki really has no more pages" -- exactly
+                # the silent-empty-result shape C1 exists to catch, but at the source instead of
+                # after the fact. Retrying will not help (the request is malformed/forbidden, not
+                # transient), so this fails hard immediately rather than burning MAX_RETRIES.
+                _LOG.error(
+                    "%s returned a MediaWiki API error (code=%r): %s",
+                    self.base_url, error.get("code"), error.get("info") or error,
+                )
+                raise RuntimeError(
+                    f"{self.base_url}: MediaWiki API error {error.get('code')!r}: "
+                    f"{error.get('info') or error!r}"
+                )
             return data
 
         raise last_exc or RuntimeError(
@@ -1095,6 +1158,16 @@ def run(args: argparse.Namespace) -> int:
         _LOG.info("Weird Gloop: %d pages", len(weirdgloop_raw))
 
     records = list(raw_pages_to_records(iter(fandom_raw + weirdgloop_raw), stats))
+
+    floor = required_page_floor(args)
+    if stats.attempted < floor:
+        _LOG.error(
+            "SUMMARY: hard failure -- only %d page(s) attempted (minimum plausible for this run "
+            "is %d, see required_page_floor()); writing nothing. A run that fetches almost "
+            "nothing is worse than a stale corpus.",
+            stats.attempted, floor,
+        )
+        return 1
 
     skip_ratio = stats.skip_ratio()
     if skip_ratio > FAILURE_THRESHOLD:
