@@ -600,20 +600,27 @@ def read_join_info():
 
 
 def join_reply():
-    """Fixed template. Never goes near the model."""
+    """Fixed template. Never goes near the model. Old Norse prose by default, like everything
+    else Hermodr says -- but the address/password stay verbatim in their own code fences (literal
+    values, never translated), and the in-game menu labels stay in English inside backticks
+    because a player has to match those exact strings on their own screen; to_futhark() already
+    skips every backticked span, so nothing here needs any special-casing beyond the backticks
+    themselves."""
     i = read_join_info()
     if not i.get("address") and not i.get("password"):
-        return "I cannot read the join details just now -- ask whoever keeps the server."
-    lines = ["**Getting onto Vancouver Island**",
-             "In Valheim: *Start Game* -> pick your character -> *Join Game* -> *Join IP*"]
+        return norse_reply(
+            "Ek fæ ekki lesit inngönguskilríkin núna -- spyr þann sem heldr þjóninum."
+        )
+    lines = ["**Að komast til `Vancouver Island`**",
+             "Í Valheim: `Start Game` -> vel þér persónu -> `Join Game` -> `Join IP`"]
     if i.get("address"):
-        lines.append("Address: `%s`" % i["address"])
+        lines.append("Vistfang: `%s`" % i["address"])
     if i.get("password"):
-        lines.append("Password: `%s`" % i["password"])
+        lines.append("Lykilorð: `%s`" % i["password"])
     if not i.get("crossplay"):
-        lines.append("_Crossplay is off, so join by IP -- the server will not appear in the "
-                     "Steam browser. Keep this within the hall._")
-    return "\n".join(lines)
+        lines.append("_`Crossplay` er af, svá gakk inn eptir `IP`-tölu -- þjónninn birtisk ekki í "
+                     "leit `Steam`. Haf þetta innan hallar._")
+    return norse_reply("\n".join(lines))
 
 
 # ---------------------------------------------------------------- Old Norse -> Elder Futhark
