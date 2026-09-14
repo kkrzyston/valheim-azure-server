@@ -1,0 +1,1 @@
+2026-09-14T21:37:01Z	~28	Fix1 (english_mode on AI-failure path) and Fix2 (to_futhark fail-closed + norse_reply trim-to-balanced) committed, selftest green	Fix3 (ENGLISH_RE false positives), Fix4 (decide_route extraction), Fix5 (empty-reply guard + canned-reply assertions)
