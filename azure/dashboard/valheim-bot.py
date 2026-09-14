@@ -1410,9 +1410,71 @@ def run_bot():
 
 # ---------------------------------------------------------------- CLI (testable with no bot token)
 def cmd_selftest():
+    """Builds the context (as before), then runs three more checks that need no Discord, no AI,
+    and no spool access: what the four canned replies look like on screen, that ENGLISH_RE fires
+    on explicit asks only, and that to_futhark()'s carve-outs actually hold. This is a real check,
+    not just a print -- a failed assertion exits non-zero."""
     context = build_context()
     print(f"--- context ({len(context)} chars) ---")
     print(context)
+
+    all_ok = True
+
+    print("\n--- canned replies (as they will appear on Discord) ---")
+    for label, text in (
+        ("empty-question nudge", EMPTY_QUESTION_REPLY),
+        ("rate-limit notice", RATE_LIMIT_REPLY),
+        ("AI-failure notice", AI_FAILURE_REPLY),
+        ("join_reply()", join_reply()),
+    ):
+        print(f"[{label}]")
+        print(text)
+        print()
+
+    print("--- ENGLISH_RE (explicit-ask matches only) ---")
+    should_match = [
+        "can you say that in english",
+        "speak english please",
+        "say that in english",
+        "english please",
+        "translate that",
+        "translate it",
+        "what does that mean in english",
+        "á ensku",
+    ]
+    should_not_match = [
+        "did the vikings speak Old English",
+        "is there an English translation of njals saga",
+        "how many players are online",
+        "what does bjorn mean",
+    ]
+    for phrase in should_match:
+        matched = bool(ENGLISH_RE.search(phrase))
+        print(f"{'PASS' if matched else 'FAIL'} (should match):     {phrase!r}")
+        all_ok = all_ok and matched
+    for phrase in should_not_match:
+        matched = bool(ENGLISH_RE.search(phrase))
+        print(f"{'PASS' if not matched else 'FAIL'} (should NOT match): {phrase!r}")
+        all_ok = all_ok and not matched
+
+    print("\n--- to_futhark() carve-outs (must survive byte-for-byte) ---")
+    carveouts = [
+        ("backticked name", "Sá sigraði var `Bjorn`.", "`Bjorn`"),
+        ("IP address", "Vistfang: 20.230.157.206", "20.230.157.206"),
+        ("timestamp", "Hann kom klukkan 17:42.", "17:42"),
+        ("markdown bullet", "- fyrsti hlutr", "- "),
+    ]
+    for label, text, must_survive in carveouts:
+        out = to_futhark(text)
+        survived = must_survive in out
+        print(f"{'PASS' if survived else 'FAIL'} ({label}): {must_survive!r} in {out!r}")
+        all_ok = all_ok and survived
+
+    print()
+    if not all_ok:
+        print("SELFTEST FAILED -- see FAIL lines above", file=sys.stderr)
+        sys.exit(1)
+    print("selftest: all assertions passed")
 
 
 def cmd_ask(question):
