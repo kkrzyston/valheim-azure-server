@@ -1,0 +1,1 @@
+2026-09-14T20:55:30Z	39	Items 1-5 done and committed (to_futhark/norse_reply, SYSTEM_PROMPT LANGUAGE block, ENGLISH_RE + call_ai_sync override, canned replies + join_reply, MAX_TOKENS+docs)	Item 6: extend cmd_selftest() with assertions; then verification pass
