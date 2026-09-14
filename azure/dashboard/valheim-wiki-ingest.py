@@ -766,15 +766,26 @@ def render_wikitable(table_tag) -> str:
     `th` cells is treated as a header row too (a table can redefine its columns partway through),
     replacing the current header set for rows after it.
 
-    Column alignment is POSITIONAL (header index N labels data-cell index N) and does NOT account
-    for colspan/rowspan -- a cell's own colspan/rowspan attribute is not inspected. KNOWN, STATED
-    GAP (PLAN-v6.md W6 explicitly allows this): most Valheim wiki data tables (resistances, food
-    stats, drop tables rendered as tables) are simple colspan-free grids in practice, and exact
-    colspan/rowspan-aware alignment is a materially larger effort for a corpus that already gets
-    the common case's numbers correctly labelled. When a row's cell count does not match the
-    current header count, generic "Column N: value" labels are used instead of mis-attributing a
-    header to the wrong cell -- a wrong label would be worse than a generic one."""
+    Column alignment is POSITIONAL (header index N labels data-cell index N) and does NOT attempt
+    true colspan/rowspan-aware alignment -- that remains a materially larger effort for a corpus
+    that already gets the common, colspan-free case's numbers correctly labelled (most Valheim
+    wiki data tables -- resistances, food stats, drop tables rendered as tables -- are simple
+    grids in practice). What changed (H4 review fix): a colspan/rowspan attribute IS now
+    inspected, specifically to detect when positional zipping would be UNSAFE rather than merely
+    imprecise. The original gap "failed safe" only by accident: `len(headers) != len(values)`
+    already degrades to generic "Column N: value" labels whenever counts disagree, but a header
+    row using colspan can produce a `<th>` COUNT that coincidentally equals a later row's `<td>`
+    count (colspan changes a cell's rendered WIDTH, not how many `<th>`/`<td>` elements exist) --
+    and the old code then confidently zipped header i to value i, silently mis-attaching a real
+    number to the wrong label. A wrong label is worse than a generic one, so any `th` in the
+    active header set, or any cell in the current data row, carrying a `colspan`/`rowspan`
+    attribute now forces that row to the generic "Column N" fallback regardless of whether the
+    counts happen to match. KNOWN REMAINING GAP: a `rowspan` cell's carry-over into a LATER row
+    that does not itself repeat the attribute is not tracked here -- but that later row's own
+    cell count will then almost always disagree with the header count anyway, which the
+    pre-existing count check already catches."""
     headers = []
+    headers_reliable = True  # False once colspan/rowspan is seen on the active header set
     lines = []
     for child in table_tag.contents.filter_tags(recursive=False):
         tag_name = str(child.tag).strip().lower()
@@ -782,6 +793,8 @@ def render_wikitable(table_tag) -> str:
             label = clean_wikicode(child.contents).strip()
             if label:
                 headers.append(label)
+            if _cell_has_span(child):
+                headers_reliable = False
             continue
         if tag_name != "tr":
             continue  # e.g. "caption" -- not a data row, nothing to attach a label to
@@ -791,17 +804,26 @@ def render_wikitable(table_tag) -> str:
         ]
         if cells and all(str(c.tag).strip().lower() == "th" for c in cells):
             headers = [clean_wikicode(c.contents).strip() for c in cells]
+            headers_reliable = not any(_cell_has_span(c) for c in cells)
             continue
         values = [clean_wikicode(c.contents).strip() for c in cells]
         if not any(values):
             continue
-        if headers and len(headers) == len(values):
+        row_alignment_safe = headers_reliable and not any(_cell_has_span(c) for c in cells)
+        if row_alignment_safe and headers and len(headers) == len(values):
             bits = [f"{h}: {v}" for h, v in zip(headers, values) if v]
         else:
             bits = [f"Column {i + 1}: {v}" for i, v in enumerate(values) if v]
         if bits:
             lines.append("- " + ", ".join(bits))
     return "\n".join(lines)
+
+
+def _cell_has_span(tag) -> bool:
+    """True if a `th`/`td` Tag carries a `colspan` or `rowspan` attribute -- either one means the
+    wikitext's physical cell/header COUNT no longer matches the table's VISUAL column count, which
+    is exactly the gap render_wikitable() positionally zips over. See its H4 fix comment above."""
+    return tag.has("colspan") or tag.has("rowspan")
 
 
 def heading_and_body(section):
