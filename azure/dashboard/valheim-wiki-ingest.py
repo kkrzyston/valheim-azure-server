@@ -53,8 +53,9 @@ USAGE:
     python valheim-wiki-ingest.py [--out PATH] [--limit N] [--offline DIR] [--dump-path PATH]
                                    [--contact TEXT] [-v]
 
-    --out PATH        Output path for the JSONL corpus. Default: wiki-records.jsonl next to this
-                       script.
+    --out PATH        Output path for the JSONL corpus. Default: wiki-records.jsonl under
+                       $VALHEIM_WIKI_ROOT (default /var/lib/valheim-wiki), matching
+                       valheim-wiki-index.py's own default -- see WIKI_ROOT below.
     --limit N         Cap the number of pages read from EACH of the three sources (dump stream,
                        Fandom delta walk, Weird Gloop walk) at N. Exists so this script can be
                        exercised, including against the live wikis, without pulling the full
@@ -228,6 +229,23 @@ ROW_TABLE_TEMPLATES = {
     "spawn table": "spawn row",
     "loot table": "loot row",
 }
+
+# ---------------------------------------------------------------- output location (C2 review fix)
+# Matches valheim-wiki-index.py's own convention exactly (see that script's module docstring:
+# "All paths take an env override (VALHEIM_WIKI_ROOT) ... so this can run against fixtures
+# without touching /var") so the two scripts agree on where the corpus lives without either one
+# having to know about the other's argv -- a bare `python valheim-wiki-ingest.py` and a bare
+# `python valheim-wiki-index.py`, run by the same operator in the same shell with no flags, now
+# land in the same place by default.
+#
+# Previously this script's own --out default was the SCRIPT'S OWN directory
+# (os.path.dirname(__file__)) -- harmless run from a checkout, but install-dashboard.sh installs
+# this script to /usr/local/sbin/, and valheim-wiki-refresh.service's ProtectSystem=strict makes
+# /usr read-only except for ReadWritePaths=/var/lib/valheim-wiki. So the unit's first (unattended,
+# operator-supervised-in-theory) run raised PermissionError on its very first write, run()
+# returned 1, and the non-dash-prefixed second ExecStart line -- the index build -- never ran, no
+# matter how many times the timer fired. See this task's report (C2) for the full chain.
+WIKI_ROOT = os.environ.get("VALHEIM_WIKI_ROOT", "/var/lib/valheim-wiki").rstrip("/")
 
 _LOG = logging.getLogger("valheim-wiki-ingest")
 
@@ -1064,7 +1082,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Ingest the Valheim Fandom + Weird Gloop wikis into wiki-records.jsonl.",
     )
-    default_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wiki-records.jsonl")
+    default_out = os.path.join(WIKI_ROOT, "wiki-records.jsonl")
     p.add_argument("--out", default=default_out, help="output JSONL path (default: %(default)s)")
     p.add_argument(
         "--limit", type=int, default=None, metavar="N",

@@ -7,23 +7,28 @@ Wants=network-online.target
 Type=oneshot
 # Two steps, deliberately NOT dash-prefixed: if the ingest step fails, the index-build step must
 # not run at all, so a bad or half-written wiki-records.jsonl is never read into a rebuilt wiki.db.
-# This relies on an exit-code contract with valheim-wiki-ingest.py (PLAN-v6 W1) that is not yet
-# nailed down in code: PLAN-v6 says a per-page parse failure is "logged ... and the run's exit code
-# reflects how many were skipped" for the ordinary case, and separately "if more than 5% of pages
-# fail, exit non-zero and write nothing" for the hard-failure case. Read literally, that means a
-# GOOD run with a couple of benign, logged skips could still exit non-zero -- which would make
-# systemd skip the reindex below even though a perfectly good wiki-records.jsonl was just written.
-# W4 cannot fix this from here (valheim-wiki-ingest.py is W1's file and does not exist yet); this
-# unit assumes the standard convention instead: exit 0 whenever wiki-records.jsonl was written
-# (skips logged to the journal are fine), non-zero ONLY on the >5%/wrote-nothing hard failure.
-# CONFIRM THIS against the real script once W1 lands. If it turns out exit codes double as a skip
-# counter even on success, add `SuccessExitStatus=` here listing the acceptable non-zero codes (or
-# have W1 move the skip count into a log line/metric instead) -- do not dash-prefix ExecStart to
-# paper over it, since that would also hide a real hard failure from `systemctl status`/journal.
-ExecStart=/opt/valheim-wiki/venv/bin/python /usr/local/sbin/valheim-wiki-ingest.py
+# The exit-code contract with valheim-wiki-ingest.py (PLAN-v6 W1) IS nailed down in code now
+# (confirmed against the real script, see its module docstring's FAILURE POLICY section): exit 0
+# whenever a corpus file was successfully written, however many pages were logged as skipped
+# (skips never affect the exit code on a successful write -- only the journal/SUMMARY line does);
+# non-zero ONLY on a hard failure -- too few pages attempted to be plausible evidence of a real
+# run, more than 5% of attempted pages failing to parse, or the output file itself being
+# unwritable -- and in every one of those cases nothing is written. Do not dash-prefix either
+# ExecStart line to "fix" a future non-zero exit: that would hide a real hard failure from
+# `systemctl status`/the journal instead of correctly skipping the reindex below.
+#
+# Both paths are passed EXPLICITLY here rather than relying on either script's own default (C2
+# review fix): valheim-wiki-ingest.py's --out used to default to its own install directory
+# (/usr/local/sbin, read-only under ProtectSystem=strict below), which made the very first write
+# of every run raise PermissionError -- silently skipping the index-build line below every single
+# time, forever, with no unit-level symptom beyond "the corpus never updates." The ingest script
+# also now supports the same VALHEIM_WIKI_ROOT env-var convention valheim-wiki-index.py already
+# used (see both scripts' own comments near their default paths), so these explicit flags and
+# that env var agree even if one of them is ever dropped by accident.
+ExecStart=/opt/valheim-wiki/venv/bin/python /usr/local/sbin/valheim-wiki-ingest.py --out=/var/lib/valheim-wiki/wiki-records.jsonl --dump-path=/var/lib/valheim-wiki/fandom-dump.xml
 # Stdlib only (sqlite3/json/re per PLAN-v6 W2), so this runs under the system interpreter, not the
 # ingest venv -- same split as the collector scripts vs. Hermodr's own venv below.
-ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-wiki-index.py
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-wiki-index.py /var/lib/valheim-wiki/wiki-records.jsonl --db /var/lib/valheim-wiki/wiki.db
 Nice=10
 # The ordinary walk is ~2,200 pages (1,179 Weird Gloop + Fandom's delta) fetched serially with
 # maxlag=5 and backoff on 429/503, plus downloading and decompressing Fandom's ~1.16 MB dump and
