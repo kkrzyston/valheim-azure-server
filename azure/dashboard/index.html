@@ -1,0 +1,2000 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Valheim Server Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23e3a54a'/></svg>">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1a1512">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Almendra:wght@700&family=Alegreya:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --soot: #1a1512;       /* page ground: charred longhouse timber */
+    --char: #120e0b;       /* recessed */
+    --timber: #261d17;     /* raised panels */
+    --seam: #3e3028;       /* rules and borders */
+    --parchment: #ead9bb;  /* primary text */
+    --ash: #a5927a;        /* secondary text */
+    --torch: #e3a54a;      /* the one glowing thing */
+    --moss: #93b06e;       /* fine */
+    --blood: #c9513c;      /* trouble */
+    --display: "Almendra", "Alegreya", Georgia, serif;
+    --body: "Alegreya", Georgia, "Times New Roman", serif;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0; font-family: var(--body); font-size: 18px; line-height: 1.5;
+    color: var(--parchment); font-variant-numeric: lining-nums tabular-nums;
+    background: var(--soot);
+    background-image:
+      radial-gradient(ellipse 70% 40% at 50% -5%, rgba(227,165,74,.13), transparent 70%),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.012) 0 2px, transparent 2px 7px);
+  }
+  a { color: var(--torch); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--torch); outline-offset: 3px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px 64px; }
+
+  /* masthead: the name of the hall */
+  .mast { padding: 34px 0 14px; border-bottom: 1px solid var(--seam); display: grid; grid-template-columns: 1fr auto; gap: 8px 24px; align-items: end; }
+  .mast .name { font-family: var(--display); font-weight: 700; font-size: clamp(38px, 6vw, 64px); line-height: 1; letter-spacing: .01em; color: var(--parchment); margin: 0; text-shadow: 0 0 28px rgba(227,165,74,.22); }
+  .mast .name span { color: var(--torch); }
+  .mast .sub { color: var(--ash); margin: 6px 0 0; font-size: 17px; }
+  .mast .sub b { color: var(--parchment); font-weight: 500; }
+  .mast .side { text-align: right; color: var(--ash); font-size: 17px; line-height: 1.7; }
+  .mast .side b { color: var(--parchment); font-weight: 500; }
+  @media (max-width: 640px) { .mast { grid-template-columns: 1fr; } .mast .side { text-align: left; } }
+
+  /* hero: the state of the hall, as a sentence */
+  .hero { padding: 40px 0 34px; border-bottom: 1px solid var(--seam); }
+  .hero h1 { margin: 0; font-size: clamp(30px, 4.4vw, 48px); line-height: 1.12; font-weight: 500; max-width: 24ch; }
+  .hero h1 .lamp { display: inline-block; width: .5em; height: .5em; border-radius: 50%; vertical-align: .1em; margin-right: .32em; background: var(--ash); }
+  .hero.online h1 .lamp { background: var(--torch); box-shadow: 0 0 18px 5px rgba(227,165,74,.45); animation: flicker 3.6s ease-in-out infinite; }
+  .hero.offline h1 .lamp { background: var(--blood); }
+  @keyframes flicker { 40% { box-shadow: 0 0 22px 7px rgba(227,165,74,.3); } 70% { box-shadow: 0 0 16px 4px rgba(227,165,74,.5); } }
+  @media (prefers-reduced-motion: reduce) { .hero.online h1 .lamp { animation: none; } .meter .bar i { transition: none; } }
+  .hero .who { margin: 22px 0 0; display: flex; flex-wrap: wrap; gap: 10px 12px; padding: 0; list-style: none; }
+  .hero .who li { border: 1px solid var(--seam); border-radius: 4px; padding: 7px 14px; background: var(--timber); font-size: 19px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .hero .who li span { color: var(--ash); margin-left: 10px; font-size: 16px; }
+  .hero .who li span.ping { color: var(--parchment); }
+  .hero .who li span.ping.slow { color: var(--torch); }
+  .hero .invite { margin: 22px 0 0; color: var(--ash); }
+  .hero .invite code { font-family: var(--body); color: var(--parchment); background: var(--timber); padding: 2px 8px; border-radius: 4px; font-size: 17px; }
+  .hero .invite button { font: inherit; font-size: 16px; color: var(--torch); background: none; border: 1px solid var(--seam); border-radius: 4px; padding: 2px 10px; margin-left: 8px; cursor: pointer; }
+  .hero .invite button:hover { border-color: var(--torch); }
+
+  /* the tide: player count over time */
+  .tide { padding: 30px 0 24px; border-bottom: 1px solid var(--seam); }
+  .tide .head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+  h2 { margin: 0 0 14px; font-family: var(--display); font-weight: 700; font-size: 26px; letter-spacing: .01em; }
+  .tide h2 { margin: 0; }
+  .tide .range { display: flex; gap: 4px; }
+  .tide .range button { font: inherit; font-size: 16px; color: var(--ash); background: none; border: 1px solid transparent; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
+  .tide .range button[aria-pressed="true"] { color: var(--parchment); border-color: var(--seam); background: var(--timber); }
+  .tide canvas { width: 100%; height: 190px; display: block; }
+  .tide .note { color: var(--ash); font-size: 16px; margin: 8px 0 0; }
+  .tide .pingwrap { margin-top: 26px; }
+  .tide .pingwrap h3 { margin: 0 0 8px; }
+  .tide #pingchart { height: 150px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 20px; list-style: none; margin: 8px 0 0; padding: 0; color: var(--ash); font-size: 16px; }
+  .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 8px; border-radius: 2px; }
+
+  /* facts strip */
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); border-bottom: 1px solid var(--seam); }
+  .facts > div { padding: 22px 20px 20px 0; }
+  .facts > div + div { border-left: 1px solid var(--seam); padding-left: 20px; }
+  .facts .v { font-size: 28px; line-height: 1.15; font-weight: 500; }
+  .facts .v small { font-size: 17px; color: var(--ash); font-weight: 400; margin-left: 6px; }
+  .facts .k { color: var(--ash); font-size: 16px; margin-top: 4px; }
+  .ok { color: var(--moss); } .warn { color: var(--torch); } .bad { color: var(--blood); }
+  @media (max-width: 700px) { .facts > div + div { border-left: 0; padding-left: 0; border-top: 1px solid var(--seam); } }
+
+  /* bands: the sections below the facts */
+  .band { padding: 30px 0 28px; border-bottom: 1px solid var(--seam); }
+  .band .head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .band .head h2 { margin: 0 0 14px; }
+  .band .head .count { color: var(--ash); font-size: 17px; }
+  .note { color: var(--ash); font-size: 16px; margin: 10px 0 0; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }
+  .two > *, .cols > *, .progress > * { min-width: 0; }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; gap: 28px; } }
+
+  /* progress: bosses and what has been built */
+  .progress { display: grid; grid-template-columns: 1.3fr 1fr; gap: 48px; }
+  @media (max-width: 860px) { .progress { grid-template-columns: 1fr; gap: 28px; } }
+  .bosses { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
+  .bosses li { border: 1px solid var(--seam); border-radius: 4px; padding: 7px 14px; background: var(--timber); color: var(--ash); font-size: 18px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .bosses li::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--seam); margin-right: 10px; vertical-align: 1px; }
+  .bosses li.lit { color: var(--parchment); border-color: rgba(227,165,74,.55); }
+  .bosses li.lit::before { background: var(--torch); box-shadow: 0 0 8px 2px rgba(227,165,74,.45); }
+  .built { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 16px; }
+  .built .v { font-size: 26px; font-weight: 500; line-height: 1.15; }
+  .built .k { color: var(--ash); font-size: 16px; }
+
+  /* lists with a time column: raids, restarts, updates */
+  .list { list-style: none; margin: 0; padding: 0; font-size: 17px; }
+  .list li { display: grid; grid-template-columns: 190px 1fr; gap: 12px; padding: 8px 0; border-top: 1px solid var(--seam); }
+  .list li:first-child { border-top: 0; }
+  .list time { color: var(--ash); font-size: 16px; padding-top: 2px; }
+  .list .dim { color: var(--ash); }
+  .list b { font-weight: 500; }
+  .list .empty { display: block; }
+  @media (max-width: 520px) { .list li { grid-template-columns: 1fr; gap: 0; } }
+
+  /* two columns */
+  .cols { display: grid; grid-template-columns: 1.3fr 1fr; gap: 48px; padding-top: 30px; border-bottom: 1px solid var(--seam); padding-bottom: 28px; }
+  @media (max-width: 860px) { .cols { grid-template-columns: 1fr; gap: 32px; } }
+  h3 { font-size: 20px; font-weight: 500; margin: 28px 0 8px; }
+
+  .feed { list-style: none; margin: 0; padding: 0; }
+  .feed li { display: grid; grid-template-columns: 82px 1fr; gap: 12px; padding: 7px 0; border-top: 1px solid var(--seam); }
+  .feed li:first-child { border-top: 0; }
+  .feed time { color: var(--ash); font-size: 16px; padding-top: 2px; white-space: nowrap; }
+  .feed .day { grid-column: 1 / -1; color: var(--ash); font-size: 16px; padding-top: 14px; }
+  .feed .join b { color: var(--torch); font-weight: 500; }
+  .feed .leave b, .feed .start b, .feed .update b, .feed .death b, .feed .raid b { font-weight: 500; }
+  .feed .update { color: var(--moss); }
+  .feed .denied, .feed .outdated, .feed .newcomer { color: var(--ash); }
+  .feed .death b { color: var(--blood); }
+  .feed .raid b { color: var(--torch); }
+
+  .meter { margin: 10px 0 14px; }
+  .meter .row { display: flex; justify-content: space-between; gap: 12px; font-size: 17px; }
+  .meter .row span:last-child { color: var(--ash); }
+  .meter .bar { height: 6px; background: var(--char); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .meter .bar i { display: block; height: 100%; background: var(--ash); border-radius: 3px; transition: width .6s ease; }
+  .meter.hot .bar i { background: var(--torch); }
+  .meter.crit .bar i { background: var(--blood); }
+
+  dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; font-size: 17px; }
+  dt { color: var(--ash); } dd { margin: 0; }
+  @media (max-width: 420px) { dl { grid-template-columns: 1fr; gap: 0 } dd { margin-bottom: 8px; } }
+
+  /* aside cards */
+  .card { border: 1px solid var(--seam); border-radius: 4px; background: var(--timber); padding: 14px 16px 16px; margin-top: 10px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .card .big { font-size: 22px; font-weight: 500; line-height: 1.2; }
+  .card .k { color: var(--ash); font-size: 16px; margin-top: 4px; }
+  .card p { margin: 8px 0 0; }
+  .btn { font: inherit; font-size: 16px; color: var(--torch); background: none; border: 1px solid var(--seam); border-radius: 4px; padding: 4px 12px; cursor: pointer; }
+  .btn:hover { border-color: var(--torch); }
+  .news { list-style: none; margin: 0; padding: 0; font-size: 17px; }
+  .news li { padding: 6px 0; border-top: 1px solid var(--seam); }
+  .news li:first-child { border-top: 0; }
+  .news time { color: var(--ash); font-size: 16px; display: block; }
+
+  /* the hall: who plays, records, who plays together */
+  .hall { padding-top: 30px; padding-bottom: 28px; border-bottom: 1px solid var(--seam); }
+  .hall .scroll, .scroll { overflow-x: auto; }
+  .hall table { border-collapse: collapse; width: 100%; font-size: 17px; }
+  .hall th { text-align: left; font-weight: 400; color: var(--ash); padding: 6px 18px 8px 0; border-bottom: 1px solid var(--seam); white-space: nowrap; }
+  .hall td { padding: 8px 18px 8px 0; border-bottom: 1px solid var(--seam); white-space: nowrap; }
+  .hall td:first-child { font-weight: 500; }
+  .hall tr.online td:first-child::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--torch); margin-right: 9px; vertical-align: 1px; box-shadow: 0 0 8px 2px rgba(227,165,74,.4); }
+  .hall td.dim { color: var(--ash); }
+  .hall .note { color: var(--ash); font-size: 16px; margin: 10px 0 0; }
+  .together table { border-collapse: collapse; font-size: 16px; }
+  .together th, .together td { padding: 6px 10px; border: 1px solid var(--seam); text-align: center; white-space: nowrap; font-weight: 400; }
+  .together th { color: var(--ash); }
+  .together tbody th { text-align: left; }
+  .together td { color: var(--parchment); }
+  .together td.self { background: var(--char); }
+
+  /* when people are around */
+  .heat { display: grid; grid-template-columns: 40px repeat(24, minmax(0, 1fr)); gap: 3px; align-items: center; max-width: 900px; }
+  .heat .lbl { color: var(--ash); font-size: 15px; }
+  .heat .hr { color: var(--ash); font-size: 13px; white-space: nowrap; overflow: visible; height: 20px; line-height: 20px; }
+  .heat .cell { aspect-ratio: 1; border-radius: 2px; background: var(--char); }
+
+  .foot { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--seam); color: var(--ash); font-size: 16px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .stale { color: var(--blood); }
+  .empty { color: var(--ash); }
+
+  /* steam join link, next to the copy button */
+  .hero .invite a.btn { margin-left: 8px; text-decoration: none; display: inline-block; }
+
+  /* session timeline: a row per Viking, bars over the last 7 days */
+  .timeline .row { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: center; padding: 5px 0; }
+  .timeline .row .name { font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .timeline .track { position: relative; height: 18px; background: var(--char); border-radius: 3px; overflow: hidden; min-width: 480px; }
+  .timeline .track i.grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--seam); }
+  .timeline .track i.bar { position: absolute; top: 3px; bottom: 3px; background: var(--ash); border-radius: 2px; min-width: 2px; }
+  .timeline .track i.bar.live { background: var(--torch); box-shadow: 0 0 6px 1px rgba(227,165,74,.5); }
+  .timeline .axis { display: grid; grid-template-columns: 110px 1fr; gap: 12px; margin-top: 2px; }
+  .timeline .axis .days { position: relative; height: 18px; min-width: 480px; }
+  .timeline .axis .days span { position: absolute; top: 0; color: var(--ash); font-size: 14px; transform: translateX(-50%); }
+  .timeline .scroll { padding-bottom: 4px; }
+
+  /* calendars: a year of play per Viking */
+  .calendars details { border-top: 1px solid var(--seam); padding: 10px 0; }
+  .calendars details:first-of-type { border-top: 0; }
+  .calendars summary { cursor: pointer; font-size: 17px; display: flex; justify-content: space-between; gap: 12px; }
+  .calendars summary::-webkit-details-marker { display: none; }
+  .calendars summary::before { content: "\25B8"; color: var(--ash); margin-right: 10px; display: inline-block; width: .7em; }
+  .calendars details[open] summary::before { content: "\25BE"; }
+  .calendars summary:focus-visible { outline: 2px solid var(--torch); outline-offset: 3px; }
+  .calendars summary .k { color: var(--ash); font-weight: 400; font-size: 16px; }
+  .calgrid { overflow-x: auto; max-width: 100%; margin: 10px 0 2px; padding-bottom: 4px; }
+  .calgrid .inner { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 10px); gap: 2px; width: max-content; }
+  .calgrid i { width: 10px; height: 10px; border-radius: 2px; background: var(--char); display: block; }
+
+  /* world map */
+  .mapgrid { display: grid; grid-template-columns: 1fr 236px; gap: 10px 24px; align-items: start; }
+  @media (max-width: 860px) { .mapgrid { grid-template-columns: 1fr; gap: 20px; } }
+  .maptools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .maptools button { font: inherit; font-size: 16px; color: var(--torch); background: none; border: 1px solid var(--seam); border-radius: 4px; padding: 4px 12px; cursor: pointer; }
+  .maptools button:hover { border-color: var(--torch); }
+  .mapstage { position: relative; touch-action: none; }
+  #mapcanvas { width: 100%; height: clamp(320px, 64vh, 720px); display: block; background: var(--char); border-radius: 4px; cursor: grab; }
+  #mapcanvas:active { cursor: grabbing; }
+  #mapcanvas:focus-visible { outline: 2px solid var(--torch); outline-offset: 3px; }
+  .mapread { position: absolute; left: 10px; bottom: 10px; padding: 4px 10px; border-radius: 4px; background: rgba(18,14,11,.78); border: 1px solid var(--seam); color: var(--ash); font-size: 15px; pointer-events: none; max-width: calc(100% - 20px); }
+  .mapread b { color: var(--parchment); font-weight: 500; }
+  .maplegend { list-style: none; margin: 8px 0 0; padding: 0; font-size: 16px; }
+  .maplegend li { margin: 0; }
+  .maplegend button { display: flex; align-items: center; gap: 8px; width: 100%; font: inherit; font-size: 16px; color: var(--parchment); background: none; border: 0; border-radius: 4px; padding: 5px 4px; cursor: pointer; text-align: left; }
+  .maplegend button:hover:not(:disabled) { background: var(--timber); }
+  .maplegend button[aria-pressed="false"] { color: var(--ash); text-decoration: line-through; text-decoration-color: var(--seam); }
+  .maplegend button:disabled { color: var(--seam); cursor: default; }
+  .maplegend i { display: inline-block; width: 13px; height: 13px; border-radius: 3px; flex: none; }
+  .maplegend .n { margin-left: auto; color: var(--ash); font-variant-numeric: tabular-nums; }
+  .mapfoot { margin-top: 22px; }
+  .tombs { list-style: none; margin: 0; padding: 0; font-size: 17px; }
+  .tombs li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--seam); }
+  .tombs li:first-child { border-top: 0; }
+  .tombs li button { font: inherit; font-size: 15px; color: var(--torch); background: none; border: 1px solid var(--seam); border-radius: 4px; padding: 2px 12px; cursor: pointer; flex: none; }
+  .tombs li button:hover { border-color: var(--torch); }
+  .mapfoot details { border-top: 1px solid var(--seam); padding-top: 10px; margin-top: 14px; }
+  .mapfoot summary { cursor: pointer; font-size: 17px; }
+  .mapfoot summary:focus-visible { outline: 2px solid var(--torch); outline-offset: 3px; }
+  .mapfoot details div { margin: 8px 0 0; color: var(--ash); font-size: 16px; }
+  .mapfoot details ul { margin: 8px 0 0; padding-left: 20px; color: var(--ash); font-size: 15px; }
+  .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+  /* off-site backups / azure / os update rows reuse .card and dl, no new selectors needed */
+
+  /* ---------------- v5: navigation, the hall of fame, the restart request ---------------- */
+
+  /* .facts/.cols/.two/.progress/.mapgrid all set `display`, which beats the UA's [hidden] rule.
+     The router toggles el.hidden, so [hidden] has to win everywhere. */
+  [hidden] { display: none !important; }
+
+  /* carved boards nailed across the top, not a tab bar */
+  .nav { border-bottom: 1px solid var(--seam); }
+  .nav ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
+  .nav li { flex: none; }
+  .nav a { display: block; font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: .01em; text-decoration: none; color: var(--ash); white-space: nowrap; padding: 11px 20px 9px; border-right: 1px solid var(--seam); border-bottom: 2px solid transparent; background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(0,0,0,.16)); }
+  .nav li:first-child a { border-left: 1px solid var(--seam); }
+  .nav a:hover { color: var(--parchment); }
+  .nav a:focus-visible { outline: 2px solid var(--torch); outline-offset: -3px; }
+  .nav a[aria-current="page"] { color: var(--torch); background: var(--timber); border-bottom-color: var(--torch); text-shadow: 0 0 16px rgba(227,165,74,.4); }
+  @media (max-width: 520px) { .nav a { font-size: 18px; padding: 10px 14px 8px; } }
+
+  a.btn { text-decoration: none; display: inline-block; }
+  .btn.primary { color: var(--soot); background: var(--torch); border-color: var(--torch); font-weight: 500; }
+  .btn.primary:hover { background: #efb962; }
+  .btn[disabled] { color: var(--ash); background: none; border-color: var(--seam); cursor: default; }
+  .btn.primary[disabled] { background: var(--seam); color: var(--ash); }
+  .note b { color: var(--parchment); font-weight: 500; }
+
+  /* medals and records */
+  #hallband h3 { font-family: var(--display); font-weight: 700; font-size: 24px; margin: 30px 0 4px; }
+  #hallband h4 { font-family: var(--body); font-weight: 500; font-size: 19px; color: var(--ash); margin: 22px 0 10px; }
+  .medals { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+  .medal { border: 1px solid var(--seam); border-radius: 4px; background: var(--timber); padding: 12px 14px 13px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .medal .t { display: flex; gap: 10px; align-items: baseline; }
+  .medal .t .em { font-size: 22px; line-height: 1.1; flex: none; }
+  .medal .t b { font-weight: 500; font-size: 19px; }
+  .medal .win { margin: 8px 0 0; }
+  .medal .win b { color: var(--torch); font-weight: 500; }
+  .medal .win .val { color: var(--parchment); font-weight: 500; }
+  .medal .run, .medal .how { color: var(--ash); font-size: 16px; margin: 6px 0 0; }
+  .medal.unwon { background: none; }
+  .medal.unwon .t b, .medal.unwon .t .em { opacity: .6; }
+  .medal.unwon .win { color: var(--ash); }
+
+  /* the restart request */
+  .rsform { display: grid; gap: 14px; }
+  .rsform > div > label { display: block; color: var(--ash); font-size: 16px; margin-bottom: 5px; }
+  .rsform select, .rsform input[type="text"] { font: inherit; font-size: 17px; color: var(--parchment); background: var(--char); border: 1px solid var(--seam); border-radius: 4px; padding: 6px 10px; width: 100%; max-width: 400px; }
+  .rsform select:focus-visible, .rsform input:focus-visible { outline: 2px solid var(--torch); outline-offset: 2px; }
+  .rsform .note { margin-top: 6px; }
+  .rsack { display: flex; gap: 11px; align-items: flex-start; border: 1px solid rgba(201,81,60,.55); border-radius: 4px; padding: 11px 13px; background: rgba(201,81,60,.08); }
+  .rsack input { flex: none; width: 18px; height: 18px; margin: .3em 0 0; accent-color: #e3a54a; }
+  .rsack label { display: block; color: var(--parchment); font-size: 17px; }
+  .rsmsg { margin: 8px 0 0; font-size: 17px; }
+  .rsmsg.bad { color: var(--blood); } .rsmsg.ok { color: var(--moss); }
+  .rsprog { border: 1px solid rgba(227,165,74,.5); border-radius: 4px; background: rgba(227,165,74,.07); padding: 13px 15px 15px; margin: 14px 0 18px; }
+  .rsprog .big { font-size: 22px; font-weight: 500; line-height: 1.25; }
+  .rsprog .k { color: var(--ash); font-size: 16px; margin-top: 5px; }
+  .rsprog .cd { font-size: 34px; color: var(--torch); font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 8px; }
+  .rsprog.done { border-color: var(--seam); background: var(--timber); }
+  .downcall .card { border-color: rgba(201,81,60,.6); background: rgba(201,81,60,.08); }
+  .downcall .card .big { font-size: 24px; }
+  .downcall .card p { margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="mast">
+    <div>
+      <p class="name">Existence <span>is</span> Pain</p>
+      <p class="sub">The hall <b id="srvname">Loading…</b> on the world <b id="wldname">Loading…</b></p>
+    </div>
+    <div class="side">
+      <div id="discordlink" hidden><a id="discordlinka" href="#" rel="noopener">The mead hall on Discord</a></div>
+      <div id="ping">Measuring your ping…</div>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Parts of the hall">
+    <ul id="navlist">
+      <li><a href="#/" data-route="/">Now</a></li>
+      <li><a href="#/world" data-route="/world">The world</a></li>
+      <li><a href="#/vikings" data-route="/vikings">Vikings</a></li>
+      <li><a href="#/trends" data-route="/trends">Trends</a></li>
+      <li><a href="#/hall" data-route="/hall">Hall of fame</a></li>
+      <li><a href="#/server" data-route="/server">The machine</a></li>
+    </ul>
+  </nav>
+  <p class="sr" id="viewsay" role="status" aria-live="polite"></p>
+
+  <!-- ======================= #/ ======================= -->
+  <section class="hero" id="hero" data-view="now">
+    <h1 id="headline"><span class="lamp"></span>Looking for the server…</h1>
+    <ul class="who" id="who"></ul>
+    <p class="invite" id="invite" hidden>Join in Valheim with <code id="invaddr"></code><button type="button" id="copy">Copy address</button><a class="btn" id="steamlink" href="#">Open in Steam (may just launch the game)</a></p>
+  </section>
+
+  <section class="band downcall" id="downcall" data-view="now" hidden>
+    <div class="card" id="downcallbody"></div>
+  </section>
+
+  <section class="facts" id="facts" data-view="now"></section>
+
+  <section class="band" data-view="now">
+    <div class="head"><h2>Lately</h2><span class="count"><a href="#/server">Everything that has happened</a></span></div>
+    <ul class="feed" id="nowfeed"><li class="empty">Nothing recorded yet.</li></ul>
+  </section>
+
+  <!-- ======================= #/world ======================= -->
+  <section class="band" data-view="world">
+    <div class="head"><h2>Progress</h2><span class="count" id="bosscount"></span></div>
+    <div class="progress">
+      <div>
+        <ul class="bosses" id="bosses"></ul>
+        <p class="note" id="bossnote"></p>
+      </div>
+      <div>
+        <div class="built" id="built"></div>
+        <p class="note" id="builtnote"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="mapband" data-view="world">
+    <div class="head"><h2><span id="mapwldname">The world</span>, mapped</h2><span class="count" id="mapexplored"></span></div>
+    <div class="mapgrid">
+      <div>
+        <div class="maptools" role="group" aria-label="Map controls">
+          <button type="button" id="mapzoomin" aria-label="Zoom in">+</button>
+          <button type="button" id="mapzoomout" aria-label="Zoom out">&minus;</button>
+          <button type="button" id="mapfitcontent">Where we've built</button>
+          <button type="button" id="mapfitworld">Whole world</button>
+        </div>
+        <div class="mapstage" id="mapstage">
+          <canvas id="mapcanvas" tabindex="0" aria-label="Map of structures built in the world" role="img"></canvas>
+          <div class="mapread" id="mapread" hidden></div>
+        </div>
+        <p class="note" id="mapnote">The world file has not been scanned yet.</p>
+        <p class="note">Drag to move, scroll or pinch to zoom, tap a mark to name it. With the map in focus, the arrow keys move it and + and &minus; zoom.</p>
+        <p class="sr" id="mapstatus" role="status" aria-live="polite"></p>
+      </div>
+      <div>
+        <h3>What's on the map</h3>
+        <ul class="maplegend" id="maplegend"></ul>
+        <p class="note" id="maplegendnote"></p>
+      </div>
+    </div>
+    <div class="mapfoot">
+      <h3>Tombstones</h3>
+      <ul class="tombs" id="tombstones"><li class="empty">None found.</li></ul>
+      <details>
+        <summary>How the map is made</summary>
+        <div id="mapdetails"></div>
+      </details>
+    </div>
+  </section>
+
+  <section class="band" data-view="world">
+    <div class="head"><h2>Raids</h2><span class="count" id="raidcount"></span></div>
+    <ul class="list" id="raids"><li class="empty">Raids are not recorded yet.</li></ul>
+  </section>
+
+  <section class="band" data-view="world">
+    <h2>The world file itself</h2>
+    <dl id="worldfacts"></dl>
+  </section>
+
+  <!-- ======================= #/vikings ======================= -->
+  <section class="hall" data-view="vikings">
+    <h2>Vikings of the hall</h2>
+    <div class="scroll">
+      <table id="stats">
+        <thead><tr><th>Viking</th><th>This session</th><th>Average session</th><th>Sessions</th><th>Total time</th><th>Deaths</th><th>Ping avg / worst, 24 h</th><th>Last seen</th></tr></thead>
+        <tbody><tr><td colspan="8" class="empty">No one has played yet.</td></tr></tbody>
+      </table>
+    </div>
+    <p class="note" id="statsnote"></p>
+    <div class="two" style="margin-top: 10px">
+      <div>
+        <h3>Records</h3>
+        <div id="records"></div>
+      </div>
+      <div class="together">
+        <h3>Who plays together</h3>
+        <div id="together"></div>
+      </div>
+    </div>
+    <h3>A year in the hall</h3>
+    <div id="calendars" class="calendars"></div>
+  </section>
+
+  <section class="band timeline" id="timelineband" data-view="vikings">
+    <div class="head"><h2>Who was in the hall, last 7 days</h2><span class="count" id="timelinecount"></span></div>
+    <div class="scroll">
+      <div id="timeline"></div>
+      <div class="axis" id="timelineaxis"></div>
+    </div>
+    <p class="note" id="timelinenote">Not recorded yet.</p>
+  </section>
+
+  <section class="band" data-view="vikings">
+    <h2>When people are around</h2>
+    <div class="scroll"><div class="heat" id="heat"></div></div>
+    <p class="note" id="heatnote"></p>
+  </section>
+
+  <!-- ======================= #/trends ======================= -->
+  <section class="tide" data-view="trends">
+    <div class="head">
+      <h2 id="tidetitle">Vikings in the world, last 24 hours</h2>
+      <div class="range" role="group" aria-label="Time range">
+        <button type="button" data-range="day" aria-pressed="true">24 hours</button>
+        <button type="button" data-range="week" aria-pressed="false">7 days</button>
+      </div>
+    </div>
+    <canvas id="chart" height="190" aria-label="Player count over time" role="img"></canvas>
+    <p class="note" id="tidenote"></p>
+    <div class="pingwrap" id="pingwrap" hidden>
+      <h3>Ping to each Viking, last 24 hours</h3>
+      <canvas id="pingchart" height="150" aria-label="Ping to each player over the last 24 hours" role="img"></canvas>
+      <ul class="legend" id="pinglegend"></ul>
+    </div>
+  </section>
+
+  <!-- ======================= #/hall ======================= -->
+  <section class="band" id="hallband" data-view="hall">
+    <div class="head">
+      <h2>The hall of fame</h2>
+      <div class="range" id="halltabs" role="group" aria-label="Which board">
+        <button type="button" data-tab="medals" aria-pressed="true">Medals</button>
+        <button type="button" data-tab="fame" aria-pressed="false">Hall of Fame</button>
+      </div>
+    </div>
+    <p class="note" id="hallnote"></p>
+    <div id="medalspanel"></div>
+    <div id="famepanel" hidden></div>
+  </section>
+
+  <!-- ======================= #/server ======================= -->
+  <section class="band" id="restartband" data-view="server">
+    <h2>Ask the hall to restart the server</h2>
+    <p class="note">This files a request. It does not restart anything. The request goes to Discord, where someone with the keys has to approve it — nothing happens until they do.</p>
+    <div id="rsprog"></div>
+    <div class="card">
+      <div class="rsform">
+        <div>
+          <label for="rsreason">What is wrong?</label>
+          <select id="rsreason">
+            <option value="not_responding">The server is not answering</option>
+            <option value="cannot_join">I cannot get in</option>
+            <option value="lag">It is lagging badly</option>
+            <option value="stuck_after_update">It looks stuck after an update</option>
+            <option value="other">Something else</option>
+          </select>
+        </div>
+        <div>
+          <label for="rsnick">Your name, so the hall knows who asked</label>
+          <input type="text" id="rsnick" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Optional — leave blank to stay unnamed">
+          <p class="note">Nothing checks this. The page cannot prove who you are, and whoever approves it is told as much.</p>
+        </div>
+        <div id="rsplayers"></div>
+        <div>
+          <button type="button" class="btn primary" id="rssend">File the request</button>
+          <p class="note" id="rsgate"></p>
+          <p class="rsmsg" id="rsmsg" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+    </div>
+    <p class="note">The world is saved before the server stops, so nothing anyone built is lost. It is usually back within a couple of minutes, though it can take up to about fifteen if Steam has an update waiting to install. <b>Anyone in the world gets no warning at all</b> — this server runs no mods and vanilla Valheim gives the server no way to speak to players, so the countdown only reaches Discord and this page.</p>
+    <h3>Restarts asked for lately</h3>
+    <ul class="list" id="rsrecent"><li class="empty">Nothing asked for yet.</li></ul>
+  </section>
+
+  <div class="cols" data-view="server">
+    <section>
+      <h2>What's been happening</h2>
+      <ul class="feed" id="feed"><li class="empty">Nothing recorded yet.</li></ul>
+    </section>
+    <aside>
+      <h2>The machine</h2>
+      <div id="meters"></div>
+      <h3>Updates</h3>
+      <dl id="updates"></dl>
+      <h3 id="discordh3">The mead hall on Discord</h3>
+      <div class="card" id="discord"></div>
+      <h3>Be told when someone arrives</h3>
+      <div class="card">
+        <button type="button" class="btn" id="notify">Notify me when someone joins</button>
+        <p class="k" id="notifynote">Your browser will show a note when the count of Vikings rises, for as long as this page stays open.</p>
+      </div>
+      <h3>Patch notes from Iron Gate</h3>
+      <ul class="news" id="news"><li class="empty">Not fetched yet.</li></ul>
+      <h3>For the owner</h3>
+      <div class="card" id="offsite"></div>
+      <p><a id="snaplink" href="snapshots/">World snapshots (owner login)</a></p>
+    </aside>
+  </div>
+
+  <section class="band" data-view="server">
+    <div class="two">
+      <div>
+        <h2>Restarts and updates</h2>
+        <dl id="nexts"></dl>
+        <h3>Restarts</h3>
+        <ul class="list" id="restarts"></ul>
+        <h3>Game updates installed</h3>
+        <ul class="list" id="updhist"></ul>
+      </div>
+      <div>
+        <h2>How this world is set up</h2>
+        <dl id="settings"></dl>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span id="gen">Waiting for the first report…</span>
+    <span>Refreshes on its own every 30 seconds. Existence is pain anyway.</span>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let status = null, history = null, range = 'day';
+  // medals.json and restart-state.json are optional extras. Neither exists before its backend is
+  // deployed, and neither may ever be able to blank the page: they are fetched softly and the last
+  // good copy is kept, so a single failed poll changes nothing on screen.
+  let medals = null, restart = null, medalsSeen = false, restartSeen = false;
+  // Fetch from the bare origin: a page opened via https://user:pass@host/ cannot use relative URLs.
+  const base = location.origin + location.pathname.replace(/[^/]*$/, '');
+
+  const fmtDur = (s) => {
+    s = Math.max(0, Math.round(s));
+    const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    if (d) return `${d} day${d > 1 ? 's' : ''} ${h} h`;
+    if (h) return m ? `${h} h ${m} min` : `${h} h`;
+    if (m) return `${m} min`;
+    return `${s} s`;
+  };
+  const ago = (t) => t ? fmtDur(Date.now() / 1000 - t) + ' ago' : '—';
+  const until = (t) => { if (!t) return 'not scheduled'; const d = t - Date.now() / 1000; return d <= 30 ? 'any moment now' : 'in ' + fmtDur(d); };
+  const bytes = (b) => b == null ? '—' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(0) + ' MB' : (b / 1e3).toFixed(0) + ' kB';
+  const rate = (b) => b == null ? '—' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB/s' : (b / 1e3).toFixed(b >= 1e4 ? 0 : 1) + ' kB/s';
+  const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const dateShort = (t) => new Date(t * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' });
+  const dayName = (t) => {
+    const d = new Date(t * 1000), now = new Date();
+    const same = (a, b) => a.toDateString() === b.toDateString();
+    if (same(d, now)) return 'Today';
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    if (same(d, y)) return 'Yesterday';
+    return d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
+  };
+  const when = (t) => `${dayName(t)}, ${clock(t)}`;
+  const words = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const list = (names) => names.length <= 1 ? names.join('') : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+  // One failing section must not take the rest of the page with it.
+  const safe = (f) => { try { f(); } catch (e) { console.error(e); } };
+
+  // Header + join-address strip: not tied to any single route, so it is called once from load()
+  // rather than from VIEW_RENDER. Hides elements whose data is absent instead of showing a
+  // placeholder -- SERVER_ADDRESS / DISCORD_INVITE are optional in /etc/valheim-server.env.
+  function renderMast() {
+    const s = status.server || {}, d = status.discord || {};
+    $('srvname').textContent = s.name || 'the server';
+    $('wldname').textContent = s.world || 'the world';
+    $('mapwldname').textContent = s.world || 'The world';
+    const dl = $('discordlink');
+    if (d.invite) { dl.hidden = false; $('discordlinka').href = d.invite; }
+    else dl.hidden = true;
+    const inv = $('invite');
+    if (s.address) {
+      inv.hidden = false;
+      $('invaddr').textContent = s.address;
+      $('steamlink').href = 'steam://run/892970//+connect%20' + encodeURIComponent(s.address);
+    } else {
+      inv.hidden = true;
+    }
+  }
+
+  function renderHero() {
+    const s = status.server, p = status.players, hero = $('hero'), h = $('headline');
+    hero.classList.toggle('online', s.online);
+    hero.classList.toggle('offline', !s.online);
+    let text;
+    if (!s.online) text = s.service_active ? 'The server is waking up. Give it a minute.' : 'Existence is pain. The server is down.';
+    else if (p.count === 0) text = 'The hall is open. No one is inside right now.';
+    else if (p.count === 1) text = 'The hall is open. One Viking is in the world.';
+    else text = `The hall is open. ${words[p.count] ? words[p.count][0].toUpperCase() + words[p.count].slice(1) : p.count} Vikings are in the world.`;
+    h.innerHTML = '<span class="lamp"></span>' + text;
+    const who = $('who');
+    who.innerHTML = '';
+    for (const pl of p.online) {
+      const li = document.createElement('li');
+      li.textContent = pl.name;
+      const t = document.createElement('span');
+      t.textContent = fmtDur(Date.now() / 1000 - pl.since);
+      li.appendChild(t);
+      const pg = document.createElement('span');
+      pg.className = 'ping';
+      if (pl.ping_ms != null) { pg.textContent = pl.ping_ms + ' ms'; if (pl.ping_ms > 120) pg.classList.add('slow'); pg.title = 'Round trip from the server to this player, measured a moment ago.'; }
+      else if (pl.ping_checked) { pg.textContent = 'ping: no reply'; pg.className = ''; pg.title = 'Their router does not answer pings, so the server cannot measure their latency.'; }
+      else { pg.textContent = 'measuring ping'; pg.className = ''; }
+      li.appendChild(pg);
+      who.appendChild(li);
+    }
+    if (s.online && p.count > p.online.length) {
+      const li = document.createElement('li');
+      li.textContent = `${p.count - p.online.length} still loading in`;
+      who.appendChild(li);
+    }
+  }
+
+  function renderFacts() {
+    const s = status.server, w = status.world, u = status.updates;
+    const up = s.started_at ? fmtDur(Date.now() / 1000 - s.started_at) : '—';
+    const verCls = u.status === 'current' ? 'ok' : u.status === 'pending' ? 'warn' : '';
+    const verNote = u.status === 'current' ? 'current' : u.status === 'pending' ? 'update waiting' : u.status === 'updating' ? 'updating now' : '';
+    const save = w.last_save ? ago(w.last_save.t) : '—';
+    const upPct = s.uptime_30d_pct != null ? (Math.round(s.uptime_30d_pct * 10) / 10) + '%' : '—';
+    const day = w.day != null ? 'Day ' + w.day : '—';
+    $('facts').innerHTML = `
+      <div><div class="v">${esc(s.version || '—')}<small class="${verCls}">${verNote}</small></div><div class="k">Valheim version on the server</div></div>
+      <div><div class="v">${up}</div><div class="k">since the server last started</div></div>
+      <div><div class="v">${upPct}</div><div class="k">uptime over the last 30 days</div></div>
+      <div><div class="v">${save}</div><div class="k">world last saved</div></div>
+      <div><div class="v">${day}</div><div class="k">in the world, by the sun</div></div>
+      <div><div class="v">${s.zdos ? s.zdos.toLocaleString() : '—'}</div><div class="k">objects in the world</div></div>
+      <div><div class="v">${status.players.peak_7d}<small>of ${s.max_players}</small></div><div class="k">most Vikings at once this week</div></div>`;
+  }
+
+  function renderFeed() { paintFeed($('feed'), status.events || []); }
+  // The Now view carries a short tail of the same feed; the whole thing lives on #/server.
+  function renderNowFeed() { paintFeed($('nowfeed'), (status.events || []).slice(0, 8)); }
+
+  function paintFeed(ul, events) {
+    ul.innerHTML = '';
+    if (!events.length) { ul.innerHTML = '<li class="empty">Nothing recorded yet.</li>'; return; }
+    let lastDay = '';
+    for (const e of events) {
+      const dn = dayName(e.t);
+      if (dn !== lastDay) { const d = document.createElement('li'); d.className = 'day'; d.textContent = dn; ul.appendChild(d); lastDay = dn; }
+      const li = document.createElement('li');
+      li.className = e.kind;
+      const tm = document.createElement('time'); tm.textContent = clock(e.t);
+      const body = document.createElement('div');
+      if (e.kind === 'join') body.innerHTML = `<b>${esc(e.name)}</b> arrived`;
+      else if (e.kind === 'leave') body.innerHTML = `<b>${esc(e.name)}</b> left${e.played ? ' after ' + fmtDur(e.played) : ''}${e.note ? ' (' + esc(e.note) + ')' : ''}`;
+      else if (e.kind === 'denied') body.innerHTML = `${esc(e.name)} ${esc(e.text)}`;
+      else if (e.kind === 'death') body.innerHTML = `<b>${esc(e.name)}</b> died`;
+      else if (e.kind === 'raid') body.innerHTML = `Raid: <b>${esc(e.label || e.name)}</b>`;
+      else if (e.kind === 'outdated') body.innerHTML = `Someone tried to join with game version ${esc(e.their ?? '?')} vs ours ${esc(e.mine ?? '?')}`;
+      else if (e.kind === 'newcomer') body.innerHTML = `A new Steam account (…${esc(e.steamid_suffix || '')}) connected`;
+      else body.innerHTML = `<b>${esc(e.text ?? e.name ?? '')}</b>`;
+      li.append(tm, body);
+      ul.appendChild(li);
+    }
+  }
+
+  function meter(label, used, total, valueText, hot = 70, crit = 90) {
+    const pct = total ? Math.min(100, 100 * used / total) : 0;
+    const cls = pct >= crit ? 'crit' : pct >= hot ? 'hot' : '';
+    return `<div class="meter ${cls}"><div class="row"><span>${label}</span><span>${valueText}</span></div><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div></div>`;
+  }
+  function renderMachine() {
+    const m = status.machine;
+    const net = m.net && (m.net.rx_bps != null || m.net.tx_bps != null) ? `${rate(m.net.rx_bps)} in, ${rate(m.net.tx_bps)} out` : 'not recorded yet';
+    $('meters').innerHTML =
+      meter('Processor', m.cpu_pct ?? 0, 100, m.cpu_pct == null ? 'measuring' : m.cpu_pct.toFixed(0) + '% busy') +
+      meter('Memory', m.mem_used, m.mem_total, `${bytes(m.mem_used)} of ${bytes(m.mem_total)}`) +
+      meter('Disk', m.disk_used, m.disk_total, `${bytes(m.disk_used)} of ${bytes(m.disk_total)}`) +
+      `<dl><dt>Game process</dt><dd>${bytes(m.valheim_rss)} in memory</dd>
+        <dt>Swap in use</dt><dd>${bytes(m.swap_used)}</dd>
+        <dt>Network</dt><dd>${net}</dd>
+        <dt>Machine up</dt><dd>${fmtDur(m.uptime_s)}</dd></dl>`;
+    const u = status.updates;
+    const st = u.status === 'current' ? '<span class="ok">Up to date with Steam</span>'
+      : u.status === 'pending' ? '<span class="warn">Update waiting</span>, installs once everyone has left'
+      : u.status === 'updating' ? '<span class="warn">Installing an update now</span>'
+      : u.status === 'error' ? '<span class="bad">Last check had a problem</span>' : 'No check yet';
+    const os = m.os_updates;
+    const osLine = !os ? 'not recorded yet'
+      : os.pending ? `${os.pending} update${os.pending === 1 ? '' : 's'} pending${os.security ? `, ${os.security} security` : ''}${os.reboot_required ? ', reboot required' : ''}`
+      : os.reboot_required ? 'reboot required' : os.pending == null ? 'not recorded yet' : 'up to date';
+    $('updates').innerHTML = `<dt>Status</dt><dd>${st}</dd><dt>Last check</dt><dd>${ago(u.last_check)}</dd><dt>Steam build</dt><dd>${esc(status.server.build || '—')}</dd><dt>System updates</dt><dd>${osLine}</dd><dt>How</dt><dd>Checks Steam every 30 minutes. Never restarts while someone is playing. Discord hears about downtime and updates.</dd>`;
+  }
+
+  // Lives on #/world: what the save file itself says about the world.
+  function renderWorldFacts() {
+    const w = status.world, s = status.server, bks = w.backups || [];
+    const bk = bks.length ? `${bks.length} kept, newest ${ago(bks[bks.length - 1].t)}` : 'none yet';
+    const growth = w.growth_7d_bytes == null ? 'not recorded yet' : w.growth_7d_bytes < 0 ? `shrank by ${bytes(-w.growth_7d_bytes)}` : `grew by ${bytes(w.growth_7d_bytes)}`;
+    $('worldfacts').innerHTML = `<dt>Save file</dt><dd>${bytes(w.bytes)}${w.save_number ? ', save #' + w.save_number : ''}</dd>
+      <dt>This week</dt><dd>${growth}</dd>
+      <dt>Last save took</dt><dd>${w.last_save ? w.last_save.ms + ' ms' : '—'}</dd>
+      <dt>Snapshots</dt><dd>${bk}</dd>
+      <dt>Settings</dt><dd>${esc(s.modifiers || 'default')}; ${s.crossplay ? 'crossplay on' : 'Steam only, no crossplay'}</dd>
+      <dt>Restarts</dt><dd>${s.restarts_since_boot ?? 0} unplanned since the machine booted</dd>`;
+  }
+
+  function renderStats() {
+    const tb = $('stats').querySelector('tbody');
+    const rows = status.players.stats || [];
+    tb.innerHTML = '';
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">No one has played yet.</td></tr>'; return; }
+    for (const p of rows) {
+      const tr = document.createElement('tr');
+      if (p.online) tr.className = 'online';
+      const cur = p.online ? fmtDur(Date.now() / 1000 - (status.generated - p.current)) : '';
+      const deaths = p.deaths == null ? '<span class="dim">—</span>' : p.deaths;
+      const pg = p.avg_ping_24h != null ? `${Math.round(p.avg_ping_24h)} / ${Math.round(p.worst_ping_24h ?? p.avg_ping_24h)} ms` : '<span class="dim">—</span>';
+      tr.innerHTML = `<td>${esc(p.name)}</td><td class="${p.online ? '' : 'dim'}">${p.online ? cur : 'not in the world'}</td><td>${fmtDur(p.avg)}</td><td>${p.sessions}</td><td>${fmtDur(p.total)}</td><td>${deaths}</td><td>${pg}</td><td class="dim">${p.online ? 'now' : ago(p.last_seen)}</td>`;
+      tb.appendChild(tr);
+    }
+    const since = new Date(status.players.tracking_since * 1000).toLocaleDateString([], { month: 'long', day: 'numeric' });
+    $('statsnote').textContent = `Counted from every arrival and departure the server has logged since ${since}, when the world moved to this server. A session is one stretch from joining to leaving. Ping is the round trip from the server, averaged over the last 24 hours.`;
+  }
+
+  function renderRecords() {
+    const r = status.players.records, el = $('records');
+    if (!r) { el.innerHTML = '<p class="note">Not recorded yet.</p>'; return; }
+    const ls = r.longest_session, bg = r.biggest_gathering, st = r.longest_streak, md = r.most_deaths;
+    el.innerHTML = `<dl>
+      <dt>Longest session</dt><dd>${ls ? `${esc(ls.name)}, ${fmtDur(ls.seconds)} on ${dateShort(ls.t)}` : 'nothing yet'}</dd>
+      <dt>Biggest gathering</dt><dd>${bg ? `${bg.count} Viking${bg.count === 1 ? '' : 's'} at once on ${dateShort(bg.t)}` : 'nothing yet'}</dd>
+      <dt>Longest streak</dt><dd>${st ? `${esc(st.name)}, ${st.days} day${st.days === 1 ? '' : 's'} in a row ending ${dateShort(st.end_t)}` : 'nothing yet'}</dd>
+      <dt>Most deaths</dt><dd>${md ? `${esc(md.name)}, ${md.deaths} death${md.deaths === 1 ? '' : 's'}` : 'no one has died yet'}</dd></dl>
+      <p class="note">Counted over ${status.players.records_window === 'all' ? 'all time' : 'the last 30 days'}.</p>`;
+  }
+
+  function renderTogether() {
+    const el = $('together'), pairs = status.players.together;
+    if (!pairs) { el.innerHTML = '<p class="note">Not recorded yet.</p>'; return; }
+    const valid = pairs.filter((p) => p && p.seconds > 0);
+    if (!valid.length) { el.innerHTML = '<p class="note">No two Vikings have been in the world at the same time yet.</p>'; return; }
+    const names = [...new Set(valid.flatMap((p) => [p.a, p.b]))].sort((a, b) => a.localeCompare(b));
+    const key = (a, b) => a < b ? a + '\0' + b : b + '\0' + a;
+    const secs = new Map(valid.map((p) => [key(p.a, p.b), p.seconds]));
+    const max = Math.max(...valid.map((p) => p.seconds));
+    let html = '<div class="scroll"><table><thead><tr><th></th>' + names.map((n) => `<th scope="col">${esc(n)}</th>`).join('') + '</tr></thead><tbody>';
+    for (const a of names) {
+      html += `<tr><th scope="row">${esc(a)}</th>`;
+      for (const b of names) {
+        if (a === b) { html += '<td class="self"></td>'; continue; }
+        const s = secs.get(key(a, b));
+        if (!s) { html += '<td></td>'; continue; }
+        const alpha = (0.08 + 0.55 * s / max).toFixed(2);
+        html += `<td style="background:rgba(227,165,74,${alpha})" title="${esc(a)} and ${esc(b)}: ${fmtDur(s)} in the world together">${(s / 3600).toFixed(1)} h</td>`;
+      }
+      html += '</tr>';
+    }
+    html += `</tbody></table></div><p class="note">Hours the two were in the world at the same time, over ${status.players.records_window === 'all' ? 'all time' : 'the last 30 days'}.</p>`;
+    el.innerHTML = html;
+  }
+
+  // A year of play per Viking, as a contribution-style grid: 52 weeks x 7 weekdays.
+  function renderCalendars() {
+    const cal = status.players.calendar, el = $('calendars');
+    if (!cal || typeof cal !== 'object' || !Object.keys(cal).length) { el.innerHTML = '<p class="note">Not recorded yet. A year of history builds up day by day.</p>'; return; }
+    const names = Object.keys(cal);
+    const totals = names.map((n) => [n, Object.values(cal[n] || {}).reduce((a, b) => a + (b || 0), 0)]);
+    totals.sort((a, b) => b[1] - a[1]);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const days = [];
+    for (let i = 364; i >= 0; i--) { const d = new Date(today); d.setDate(today.getDate() - i); days.push(d); }
+    // pad the front so the grid starts on a Monday column
+    const lead = (days[0].getDay() + 6) % 7;
+    const maxSec = Math.max(1, ...totals.map(([n]) => Math.max(0, ...Object.values(cal[n] || {}))));
+    const cellColor = (secs) => { if (!secs) return ''; const alpha = (0.12 + 0.8 * Math.min(1, secs / maxSec)).toFixed(2); return ` style="background:rgba(227,165,74,${alpha})"`; };
+    const iso = (d) => d.toISOString().slice(0, 10);
+    el.innerHTML = totals.map(([name, total], idx) => {
+      let grid = '';
+      for (let i = 0; i < lead; i++) grid += '<i></i>';
+      for (const d of days) {
+        const key = iso(d);
+        const secs = (cal[name] || {})[key] || 0;
+        const title = `${d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}: ${secs ? fmtDur(secs) : 'no time in the world'}`;
+        grid += `<i${cellColor(secs)} title="${esc(title)}"></i>`;
+      }
+      const open = idx < 2 ? ' open' : '';
+      return `<details${open}><summary><span>${esc(name)}</span><span class="k">${fmtDur(total)} this year</span></summary><div class="calgrid"><div class="inner">${grid}</div></div></details>`;
+    }).join('');
+  }
+
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const hourLabel = (h) => new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: 'numeric' });
+  function renderHeat() {
+    const h = status.players.heatmap, el = $('heat'), note = $('heatnote');
+    if (!h || !Array.isArray(h.busy) || h.busy.length !== 7) { el.innerHTML = ''; note.textContent = 'Not recorded yet. A week or so of samples is needed before a pattern shows.'; return; }
+    let html = '<div></div>';
+    for (let hr = 0; hr < 24; hr++) html += `<div class="hr">${hr % 6 === 0 ? hourLabel(hr) : ''}</div>`;
+    for (let d = 0; d < 7; d++) {
+      html += `<div class="lbl">${DAYS[d]}</div>`;
+      for (let hr = 0; hr < 24; hr++) {
+        const busy = Math.max(0, Math.min(1, (h.busy[d] || [])[hr] || 0));
+        const avg = ((h.avg || [])[d] || [])[hr];
+        const alpha = busy ? (0.06 + 0.86 * busy).toFixed(2) : 0;
+        const title = `${DAYS[d]} ${hourLabel(hr)}: someone here ${Math.round(busy * 100)} % of weeks${avg != null ? `, avg ${Number(avg).toFixed(1)}` : ''}`;
+        html += `<div class="cell" style="${alpha ? `background:rgba(227,165,74,${alpha})` : ''}" title="${title}"></div>`;
+      }
+    }
+    el.innerHTML = html;
+    const wk = h.weeks ?? 0;
+    note.textContent = `How often someone was in the world at that hour, from ${wk >= 1 ? `${wk} week${wk === 1 ? '' : 's'}` : 'less than a week'} of data. Brighter is busier.`;
+  }
+
+  // One row per Viking, bars for each session over the last 7 days.
+  function renderTimeline() {
+    const sessions = status.players.sessions_7d, body = $('timeline'), axis = $('timelineaxis'), note = $('timelinenote'), cnt = $('timelinecount');
+    if (!Array.isArray(sessions) || !sessions.length) { body.innerHTML = ''; axis.innerHTML = ''; cnt.textContent = ''; note.textContent = 'Not recorded yet.'; return; }
+    // "now" from the report itself, not the browser clock: some collectors stamp an ongoing
+    // session's end with the report time rather than leaving it null, so a currently-online
+    // Viking's last session is also treated as live when it ends within a minute of "now".
+    const t1 = status.generated || Date.now() / 1000, t0 = t1 - 7 * 86400, span = t1 - t0;
+    const onlineNames = new Set((status.players.online || []).map((p) => p.name));
+    const pct = (t) => Math.max(0, Math.min(100, 100 * (t - t0) / span));
+    const byName = new Map();
+    for (const s of sessions) { if (!byName.has(s.name)) byName.set(s.name, []); byName.get(s.name).push(s); }
+    const rows = [...byName.entries()].map(([name, list]) => {
+      const online = onlineNames.has(name) || list.some((s) => s.end == null);
+      const total = list.reduce((a, s) => a + Math.max(0, Math.min(s.end ?? t1, t1) - Math.max(s.start, t0)), 0);
+      return { name, list, online, total };
+    });
+    rows.sort((a, b) => (b.online - a.online) || (b.total - a.total));
+    let html = '';
+    for (const r of rows) {
+      let bars = '';
+      for (let d = 1; d < 7; d++) bars += `<i class="grid" style="left:${(d / 7 * 100).toFixed(3)}%"></i>`;
+      const lastIdx = r.list.length - 1;
+      r.list.forEach((s, i) => {
+        const start = Math.max(s.start, t0), rawEnd = s.end == null ? t1 : s.end;
+        const live = r.online && i === lastIdx && (s.end == null || rawEnd >= t1 - 60);
+        const end = Math.min(live ? t1 : rawEnd, t1);
+        if (end <= start) return;
+        const dayAbbr = new Date(s.start * 1000).toLocaleDateString([], { weekday: 'short' });
+        const title = `${dayAbbr} ${clock(s.start)} to ${live ? 'now' : clock(s.end)} (${fmtDur(end - start)})`;
+        bars += `<i class="bar${live ? ' live' : ''}" style="left:${pct(start).toFixed(2)}%;width:${Math.max(0.3, pct(end) - pct(start)).toFixed(2)}%" title="${esc(title)}"></i>`;
+      });
+      html += `<div class="row"><div class="name" title="${esc(r.name)}">${esc(r.name)}</div><div class="track">${bars}</div></div>`;
+    }
+    body.innerHTML = html;
+    let axisHtml = '<div></div><div class="days">';
+    for (let d = 0; d < 7; d++) axisHtml += `<span style="left:${(d / 7 * 100 + 100 / 14).toFixed(3)}%">${new Date((t0 + d * 86400 + 43200) * 1000).toLocaleDateString([], { weekday: 'short' })}</span>`;
+    axis.innerHTML = axisHtml + '</div>';
+    cnt.textContent = `${rows.length} Viking${rows.length === 1 ? '' : 's'}`;
+    note.textContent = 'One row per Viking. The current session, if any, runs in torch gold to the right edge.';
+  }
+
+  const BOSSES = [['eikthyr', 'Eikthyr'], ['elder', 'The Elder'], ['bonemass', 'Bonemass'], ['moder', 'Moder'], ['yagluth', 'Yagluth'], ['queen', 'The Queen'], ['fader', 'Fader']];
+  function renderProgress() {
+    const w = status.world || {}, b = w.bosses;
+    const ul = $('bosses');
+    ul.innerHTML = '';
+    let lit = 0;
+    for (const [k, label] of BOSSES) {
+      const li = document.createElement('li');
+      const done = !!(b && b[k]);
+      if (done) { li.className = 'lit'; lit++; }
+      li.textContent = label;
+      li.title = done ? `${label} has been defeated` : `${label} still stands`;
+      ul.appendChild(li);
+    }
+    $('bosscount').textContent = b && b.source && b.source !== 'unknown' ? `${lit} of ${BOSSES.length} bosses defeated` : '';
+    $('bossnote').textContent = !b || !b.source || b.source === 'unknown' ? 'The world file has not been read yet, so no torch is lit.'
+      : b.source === 'keys' ? 'Read from the world file.' : 'Inferred from the raids the server has seen.';
+    const bt = w.built, el = $('built');
+    if (!bt) { el.innerHTML = ''; $('builtnote').textContent = 'The world file has not been scanned yet, so nothing built has been counted.'; return; }
+    const ships = (bt.karves || 0) + (bt.rafts || 0) + (bt.longships || 0);
+    const item = (v, k) => `<div><div class="v">${v ?? '—'}</div><div class="k">${k}</div></div>`;
+    const ex = w.extra;
+    let extraItems = '';
+    if (ex && ex.wards != null) extraItems += item(ex.wards, ex.wards === 1 ? 'ward' : 'wards');
+    if (ex && ex.tamed) {
+      const tv = Object.values(ex.tamed).filter((n) => typeof n === 'number');
+      const tt = tv.reduce((a, b) => a + b, 0);
+      const detail = Object.entries(ex.tamed).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(', ');
+      extraItems += `<div><div class="v" title="${esc(detail)}">${tt}</div><div class="k">tame animals</div></div>`;
+    }
+    el.innerHTML = item(bt.portals, 'portals') + item(bt.beds, 'beds') + item(bt.workbenches, 'workbenches') + item(bt.chests, 'chests')
+      + item(ships, ships === 1 ? 'ship' : 'ships') + item(bt.tombstones, 'tombstones') + extraItems;
+    $('builtnote').textContent = `Counted from the world file ${bt.scanned_at ? ago(bt.scanned_at) : 'at the last save'}.${ships ? ` Ships: ${[bt.karves ? bt.karves + ' karve' + (bt.karves > 1 ? 's' : '') : '', bt.rafts ? bt.rafts + ' raft' + (bt.rafts > 1 ? 's' : '') : '', bt.longships ? bt.longships + ' longship' + (bt.longships > 1 ? 's' : '') : ''].filter(Boolean).join(', ')}.` : ''}${ex && ex.tamed == null && ex.notes ? ` ${esc(ex.notes)}` : ''}`;
+  }
+
+  // ---- world map: view state is {cx, cz, s} -- world point at canvas centre + CSS px per metre ----
+  const MAP_KINDS = [['build', 'building', '#a5927a'], ['portal', 'portal', '#e3a54a'], ['bed', 'bed', '#93b06e'], ['ship', 'ship', '#ead9bb'], ['tomb', 'tombstone', '#c9513c'], ['ward', 'ward', '#8fa9c9']];
+  const MAP_LABELS = Object.fromEntries(MAP_KINDS.map(([k, l]) => [k, l]));
+  const MAP_COLORS = Object.fromEntries(MAP_KINDS.map(([k, , c]) => [k, c]));
+  const MKEY = 'valheim.mapHidden';
+  let mapHidden = new Set();
+  try { mapHidden = new Set(JSON.parse(localStorage.getItem(MKEY) || '[]')); } catch {}
+  let mapData = null, mapSig = '', mapExtent = 10000, mapGrid = 16;
+  const mapView = { cx: 0, cz: 0, s: 1 };
+  let mapMoved = false, mapRaf = 0, mapPointerPos = null, mapDpr = window.devicePixelRatio || 1;
+
+  function mapAriaSummary() {
+    if (!mapData) return 'Map of structures built in the world';
+    const plural = { build: ['building', 'buildings'], portal: ['portal', 'portals'], bed: ['bed', 'beds'], ship: ['ship', 'ships'], tomb: ['tombstone', 'tombstones'], ward: ['ward', 'wards'] };
+    const parts = MAP_KINDS.map(([k]) => {
+      const n = mapData.counts[k] || 0;
+      if (!n) return null;
+      const [one, many] = plural[k];
+      return `${n.toLocaleString()} ${n === 1 ? one : many}`;
+    }).filter(Boolean);
+    return `Map of structures built in the world: ${parts.join(', ') || 'nothing yet'}`;
+  }
+
+  // Once per scan (signature scanned_at + ':' + points.length). Splits the array-of-arrays into a
+  // per-kind Float32Array so drawing never re-parses or string-compares the raw JSON per frame.
+  function mapIngest(ex) {
+    const bm = ex.basemap, sig = ex.scanned_at + ':' + bm.points.length;
+    if (sig === mapSig && mapData) return mapData;
+    mapSig = sig;
+    mapExtent = bm.extent || 10000;
+    mapGrid = bm.grid || 16;
+    const byKind = {}, counts = {};
+    for (const [k] of MAP_KINDS) { byKind[k] = []; counts[k] = 0; }
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const [x, z, kind] of bm.points) {
+      const k = byKind[kind] ? kind : 'build';
+      byKind[k].push(x, z);
+      counts[k] = (counts[k] || 0) + 1;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const arrays = {};
+    for (const [k] of MAP_KINDS) arrays[k] = Float32Array.from(byKind[k]);
+    const tombstones = Array.isArray(ex.tombstones) ? ex.tombstones : [];
+    const tombIndex = new Map();
+    for (const t of tombstones) tombIndex.set(Math.round(t.x) + ',' + Math.round(t.z), t);
+    mapData = { arrays, counts, bbox: minX <= maxX ? { minX, maxX, minZ, maxZ } : null, tombstones, tombIndex, total: bm.points.length };
+    return mapData;
+  }
+
+  function mapFindTomb(x, z) {
+    if (!mapData) return null;
+    const kx = Math.round(x), kz = Math.round(z);
+    for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
+      const t = mapData.tombIndex.get((kx + dx) + ',' + (kz + dz));
+      if (t) return t;
+    }
+    return null;
+  }
+
+  function mapWorldScale(w, h) { return Math.min(w, h) / (2 * mapExtent); }
+
+  // 'content' fits the built-up bbox padded 8%; 'world' fits the whole 2*extent square.
+  // Bails while the view is hidden: a canvas in a display:none section measures 0x0, and fitting
+  // to that would bake a wrong scale in. renderWorldMap and the ResizeObserver both fit again the
+  // moment #/world becomes visible.
+  function mapFitTo(mode) {
+    const c = $('mapcanvas'), w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;
+    if (mode === 'content' && mapData && mapData.bbox) {
+      const bb = mapData.bbox;
+      const padX = Math.max(50, (bb.maxX - bb.minX) * 0.08), padZ = Math.max(50, (bb.maxZ - bb.minZ) * 0.08);
+      const bw = (bb.maxX - bb.minX) + padX * 2, bh = (bb.maxZ - bb.minZ) + padZ * 2;
+      mapView.cx = (bb.minX + bb.maxX) / 2; mapView.cz = (bb.minZ + bb.maxZ) / 2;
+      mapView.s = Math.max(mapWorldScale(w, h) * 0.8, Math.min(w / bw, h / bh));
+    } else {
+      mapView.cx = 0; mapView.cz = 0; mapView.s = mapWorldScale(w, h);
+    }
+    mapClamp();
+  }
+
+  // s clamps to [sWorld*0.8, 2]; centre clamps into the content bbox expanded by 40% of the
+  // viewport (in world metres), hard-capped at +/- the world extent.
+  function mapClamp() {
+    const c = $('mapcanvas'), w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;   // hidden view: leave the user's view state exactly as it was
+    const sWorld = mapWorldScale(w, h);
+    mapView.s = Math.max(sWorld * 0.8, Math.min(2, mapView.s));
+    const bb = (mapData && mapData.bbox) || { minX: -mapExtent, maxX: mapExtent, minZ: -mapExtent, maxZ: mapExtent };
+    const padX = 0.4 * (w / mapView.s), padZ = 0.4 * (h / mapView.s);
+    const clampAxis = (v, lo, hi) => { lo = Math.max(-mapExtent, lo); hi = Math.min(mapExtent, hi); if (lo > hi) { const m = (lo + hi) / 2; lo = hi = m; } return Math.min(hi, Math.max(lo, v)); };
+    mapView.cx = clampAxis(mapView.cx, bb.minX - padX, bb.maxX + padX);
+    mapView.cz = clampAxis(mapView.cz, bb.minZ - padZ, bb.maxZ + padZ);
+  }
+
+  // Keeps the world point under (px,py) fixed on screen while s changes by factor k.
+  function mapZoomAt(px, py, k) {
+    const c = $('mapcanvas'), w = c.clientWidth || 300, h = c.clientHeight || 300;
+    const wx = mapView.cx + (px - w / 2) / mapView.s, wz = mapView.cz - (py - h / 2) / mapView.s;
+    mapView.s *= k;
+    mapClamp();
+    mapView.cx = wx - (px - w / 2) / mapView.s;
+    mapView.cz = wz + (py - h / 2) / mapView.s;
+    mapClamp();
+  }
+
+  // Assigns width/height only when size or dpr actually changed -- reallocating the backing
+  // store on every rAF thrashes a pinch gesture.
+  function mapSizeCanvas() {
+    const c = $('mapcanvas'), w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
+    const pw = Math.round(w * dpr), ph = Math.round(h * dpr);
+    if (c.width !== pw || c.height !== ph || mapDpr !== dpr) { c.width = pw; c.height = ph; mapDpr = dpr; }
+  }
+
+  function mapNiceScale(target) {
+    if (target <= 0) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(target)));
+    for (const m of [1, 2, 5]) if (mag * m >= target) return mag * m;
+    return mag * 10;
+  }
+  const mapNeg = (n) => (n < 0 ? '−' : '') + Math.abs(Math.round(n)).toLocaleString();
+  const mapCoord = (n) => (n < 0 ? '−' : '') + Math.abs(Math.round(n));
+
+  function mapLabelFor(kind) {
+    return ({ portal: 'A portal', bed: 'A bed', ship: 'A ship', ward: 'A ward', build: 'A building' })[kind] || 'A landmark';
+  }
+
+  // Nearest non-build landmark within 14 CSS px; else the build cell under the cursor.
+  function mapHit(px, py) {
+    if (!mapData) return null;
+    const c = $('mapcanvas'), w = c.clientWidth || 300, h = c.clientHeight || 300, s = mapView.s;
+    const wx = mapView.cx + (px - w / 2) / s, wz = mapView.cz - (py - h / 2) / s;
+    let bestKind = null, bestX = 0, bestZ = 0, bestD = 14;
+    for (const [kind] of MAP_KINDS) {
+      if (kind === 'build' || mapHidden.has(kind)) continue;
+      const arr = mapData.arrays[kind];
+      for (let i = 0; i < arr.length; i += 2) {
+        const gx = (arr[i] - mapView.cx) * s + w / 2, gy = h / 2 - (arr[i + 1] - mapView.cz) * s;
+        const d = Math.hypot(gx - px, gy - py);
+        if (d < bestD) { bestD = d; bestKind = kind; bestX = arr[i]; bestZ = arr[i + 1]; }
+      }
+    }
+    if (bestKind) {
+      let label;
+      if (bestKind === 'tomb') {
+        const t = mapFindTomb(bestX, bestZ);
+        if (t) { bestX = t.x; bestZ = t.z; label = (t.owner && t.owner !== 'unknown') ? `${t.owner}'s tombstone` : 'An unmarked tombstone'; }
+        else label = 'An unmarked tombstone';
+      } else label = mapLabelFor(bestKind);
+      return { kind: bestKind, x: bestX, z: bestZ, label };
+    }
+    if (!mapHidden.has('build')) {
+      const arr = mapData.arrays.build, gcx = Math.floor(wx / mapGrid), gcz = Math.floor(wz / mapGrid);
+      for (let i = 0; i < arr.length; i += 2) {
+        if (Math.floor(arr[i] / mapGrid) === gcx && Math.floor(arr[i + 1] / mapGrid) === gcz) {
+          return { kind: 'build', x: arr[i], z: arr[i + 1], label: mapLabelFor('build') };
+        }
+      }
+    }
+    return { kind: null, x: wx, z: wz, label: null };
+  }
+
+  function mapUpdateReadout() {
+    const el = $('mapread');
+    if (!el) return;
+    if (!mapPointerPos || !mapData) { el.hidden = true; return; }
+    const hit = mapHit(mapPointerPos.x, mapPointerPos.y);
+    if (!hit) { el.hidden = true; return; }
+    const dist = Math.round(Math.hypot(hit.x, hit.z)).toLocaleString();
+    const coord = `X ${mapCoord(hit.x)}, Z ${mapCoord(hit.z)} · ${dist} m from spawn`;
+    el.hidden = false;
+    el.innerHTML = hit.label ? `<b>${esc(hit.label)}</b> · ${coord}` : coord;
+  }
+
+  // Graticule -> world circle -> each visible kind -> spawn -> scale bar -> north -> readout.
+  // Plain Canvas 2D, full redraw in a rAF -- no spatial index, no tiles (see plan A6).
+  function mapDraw() {
+    mapRaf = 0;
+    const c = $('mapcanvas');
+    if (!c || !mapData) return;
+    // Measure before resizing: while #/world is hidden the canvas is 0x0, and re-sizing to that
+    // would throw away the bitmap the user left behind. Bail first, keep the picture.
+    const w = c.clientWidth, h = c.clientHeight;
+    if (!w || !h) return;
+    mapSizeCanvas();
+    const ctx = c.getContext('2d');
+    ctx.setTransform(mapDpr, 0, 0, mapDpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const s = mapView.s;
+    const px = (x) => (x - mapView.cx) * s + w / 2;
+    const py = (z) => h / 2 - (z - mapView.cz) * s;
+
+    // coordinate graticule, spacing auto-picked so grid lines land >= 70 px apart
+    const step = mapNiceScale(70 / s);
+    ctx.strokeStyle = 'rgba(165,146,122,.15)'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#a5927a'; ctx.font = '11px Alegreya, Georgia, serif';
+    const x0 = Math.floor((mapView.cx - w / 2 / s) / step) * step, x1 = mapView.cx + w / 2 / s;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    for (let x = x0; x <= x1; x += step) {
+      const gx = Math.round(px(x)) + .5;
+      ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke();
+      const lbl = mapNeg(x), half = ctx.measureText(lbl).width / 2;
+      if (gx - half >= 2 && gx + half <= w - 2) ctx.fillText(lbl, gx, h - 6);
+    }
+    const z0 = Math.floor((mapView.cz - h / 2 / s) / step) * step, z1 = mapView.cz + h / 2 / s;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    for (let z = z0; z <= z1; z += step) {
+      const gy = Math.round(py(z)) + .5;
+      ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+      ctx.fillText(mapNeg(z), 4, gy + 2);
+    }
+
+    // world circle
+    ctx.strokeStyle = 'rgba(165,146,122,.3)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(px(0), py(0), mapExtent * s, 0, Math.PI * 2); ctx.stroke();
+
+    // each visible kind -- build renders true footprint, everything else a circle
+    const cell = Math.max(2, mapGrid * s), half = cell / 2;
+    for (const [kind] of MAP_KINDS) {
+      if (mapHidden.has(kind)) continue;
+      const arr = mapData.arrays[kind];
+      if (!arr || !arr.length) continue;
+      ctx.fillStyle = MAP_COLORS[kind];
+      if (kind === 'build') {
+        for (let i = 0; i < arr.length; i += 2) {
+          const gx = px(arr[i]), gy = py(arr[i + 1]);
+          if (gx < -half || gx > w + half || gy < -half || gy > h + half) continue;
+          ctx.fillRect(gx - half, gy - half, cell, cell);
+        }
+      } else {
+        const r = Math.max(2.5, Math.min(7, 2.5 + s * 4));
+        const stroke = r > 3.5;
+        for (let i = 0; i < arr.length; i += 2) {
+          const gx = px(arr[i]), gy = py(arr[i + 1]);
+          if (gx < -r || gx > w + r || gy < -r || gy > h + r) continue;
+          ctx.beginPath(); ctx.arc(gx, gy, r, 0, Math.PI * 2); ctx.fill();
+          if (stroke) { ctx.strokeStyle = 'rgba(18,14,11,.6)'; ctx.lineWidth = 1; ctx.stroke(); }
+        }
+      }
+    }
+
+    // spawn ring
+    ctx.strokeStyle = '#e3a54a'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(px(0), py(0), 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#e3a54a'; ctx.font = '12px Alegreya, Georgia, serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText('spawn', px(0), py(0) + 9);
+
+    // scale bar, zoom-tracking
+    const barM = mapNiceScale(90 / s), barPx = barM * s, bx = w - barPx - 16, by = h - 16;
+    ctx.strokeStyle = '#ead9bb'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + barPx, by); ctx.stroke();
+    ctx.fillStyle = '#ead9bb'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(barM >= 1000 ? (barM / 1000) + ' km' : barM + ' m', bx + barPx / 2, by - 4);
+
+    // static north indicator
+    ctx.fillStyle = '#a5927a'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('N ↑', 10, 10);
+
+    mapUpdateReadout();
+  }
+
+  // rAF coalescing -- every gesture handler calls this, never mapDraw directly.
+  function mapSchedule() { if (!mapRaf) mapRaf = requestAnimationFrame(mapDraw); }
+
+  function mapSay(msg) { const el = $('mapstatus'); if (el) el.textContent = msg; }
+
+  function mapLegend() {
+    const el = $('maplegend'), note = $('maplegendnote');
+    if (!mapData) { el.innerHTML = ''; if (note) note.textContent = ''; return; }
+    el.innerHTML = MAP_KINDS.map(([kind, label, col]) => {
+      const n = mapData.counts[kind] || 0, pressed = !mapHidden.has(kind);
+      return `<li><button type="button" data-kind="${kind}" aria-pressed="${pressed}"${n ? '' : ' disabled'}><i style="background:${col}"></i>${esc(label)}<span class="n">${n.toLocaleString()}</span></button></li>`;
+    }).join('');
+    if (note) note.textContent = `Each building mark is a ${mapGrid} m patch of ground with something built on it, not a single piece.`;
+  }
+
+  function mapTombs() {
+    const el = $('tombstones'), stones = (mapData && mapData.tombstones) || [];
+    if (!stones.length) { el.innerHTML = '<li class="empty">No tombstones. Either no one has died, or everyone got their things back.</li>'; return; }
+    el.innerHTML = stones.map((t) => {
+      const ns = t.z >= 0 ? 'north' : 'south', ew = t.x >= 0 ? 'east' : 'west';
+      const name = t.owner && t.owner !== 'unknown' ? t.owner : 'An unmarked grave';
+      return `<li><span><b>${esc(name)}</b> — ${Math.round(Math.abs(t.x)).toLocaleString()} m ${ew}, ${Math.round(Math.abs(t.z)).toLocaleString()} m ${ns} of spawn</span><button type="button" data-x="${t.x}" data-z="${t.z}" data-name="${esc(name)}">Show</button></li>`;
+    }).join('');
+  }
+
+  function mapCopy(ex) {
+    const note = $('mapnote'), exp = $('mapexplored'), details = $('mapdetails'), e = ex.explored;
+    exp.textContent = e && e.pct != null ? `${e.zones_generated.toLocaleString()} of ${e.zones_total.toLocaleString()} zones seen · ${e.pct.toFixed(1)}% of the world` : '';
+    note.textContent = `Drawn from the world save ${ex.scanned_at ? ago(ex.scanned_at) : 'at the last save'} — the server saves about every half hour, so anything raised since then is not here yet. North is up; the faint circle is the edge of the world, 10 km out, and the ring at the middle is spawn.`;
+    if (details) {
+      const bullets = (ex.notes || '').split('; ').filter(Boolean);
+      details.innerHTML = `<div>The dashboard reads the world's own save files after each save — no mod, and nothing from anyone's in-game map. It finds each piece a player placed by its prefab name and reads the position stored beside it. What the last read reported:</div><ul>${bullets.map((b) => `<li>${esc(b)}</li>`).join('')}</ul>`;
+    }
+  }
+
+  // One-time listeners. Every canvas gesture is also reachable from a real <button>, which is
+  // what makes it keyboard- and AT-conformant.
+  function bindMap() {
+    const c = $('mapcanvas'), stage = $('mapstage');
+    if (!c || c.dataset.bound) return;
+    c.dataset.bound = '1';
+    const pointers = new Map();
+    let dragLast = null, pinchDist = null;
+    const rectPos = (e) => { const r = c.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+
+    c.addEventListener('pointerdown', (e) => {
+      c.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, rectPos(e));
+      if (pointers.size === 1) { dragLast = rectPos(e); }
+      else if (pointers.size === 2) {
+        const pts = [...pointers.values()];
+        pinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        dragLast = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      }
+    });
+    c.addEventListener('pointermove', (e) => {
+      const pos = rectPos(e);
+      if (pointers.has(e.pointerId)) pointers.set(e.pointerId, pos);
+      mapPointerPos = pos;
+      if (pointers.size === 1 && dragLast) {
+        mapView.cx -= (pos.x - dragLast.x) / mapView.s; mapView.cz += (pos.y - dragLast.y) / mapView.s;
+        mapClamp(); dragLast = pos; mapMoved = true;
+      } else if (pointers.size === 2) {
+        const pts = [...pointers.values()];
+        const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        if (dragLast) { mapView.cx -= (mid.x - dragLast.x) / mapView.s; mapView.cz += (mid.y - dragLast.y) / mapView.s; mapClamp(); }
+        if (pinchDist) mapZoomAt(mid.x, mid.y, dist / pinchDist);
+        dragLast = mid; pinchDist = dist; mapMoved = true;
+      }
+      mapSchedule();
+    });
+    const endPointer = (e) => {
+      pointers.delete(e.pointerId);
+      try { c.releasePointerCapture(e.pointerId); } catch {}
+      if (pointers.size === 1) { dragLast = [...pointers.values()][0]; pinchDist = null; }
+      else { dragLast = null; pinchDist = null; }
+    };
+    c.addEventListener('pointerup', endPointer);
+    c.addEventListener('pointercancel', endPointer);
+    c.addEventListener('pointerleave', () => { if (!pointers.size) { mapPointerPos = null; mapSchedule(); } });
+
+    c.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const pos = rectPos(e);
+      let dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 18; else if (e.deltaMode === 2) dy *= c.clientHeight;
+      mapZoomAt(pos.x, pos.y, Math.exp(-dy * 0.0018));
+      mapMoved = true; mapPointerPos = pos;
+      mapSchedule();
+    }, { passive: false });
+
+    c.addEventListener('dblclick', (e) => { mapZoomAt.apply(null, [...Object.values(rectPos(e)), 1.6]); mapMoved = true; mapSchedule(); });
+
+    c.addEventListener('keydown', (e) => {
+      const step = (e.shiftKey ? 200 : 60) / mapView.s;
+      const cx = c.clientWidth / 2, cy = c.clientHeight / 2;
+      switch (e.key) {
+        case 'ArrowLeft': mapView.cx -= step; mapMoved = true; break;
+        case 'ArrowRight': mapView.cx += step; mapMoved = true; break;
+        case 'ArrowUp': mapView.cz += step; mapMoved = true; break;
+        case 'ArrowDown': mapView.cz -= step; mapMoved = true; break;
+        case '+': case '=': mapZoomAt(cx, cy, 1.3); mapMoved = true; break;
+        case '-': case '_': mapZoomAt(cx, cy, 1 / 1.3); mapMoved = true; break;
+        case '0': mapFitTo('content'); mapMoved = false; mapSay('Fit to what has been built.'); break;
+        case 'Home': mapFitTo('world'); mapMoved = false; mapSay('Showing the whole world.'); break;
+        default: return;
+      }
+      e.preventDefault(); mapClamp(); mapSchedule();
+    });
+
+    $('mapzoomin').addEventListener('click', () => { mapZoomAt(c.clientWidth / 2, c.clientHeight / 2, 1.4); mapMoved = true; mapSchedule(); });
+    $('mapzoomout').addEventListener('click', () => { mapZoomAt(c.clientWidth / 2, c.clientHeight / 2, 1 / 1.4); mapMoved = true; mapSchedule(); });
+    $('mapfitcontent').addEventListener('click', () => { mapFitTo('content'); mapMoved = false; mapSchedule(); mapSay('Fit to what has been built.'); });
+    $('mapfitworld').addEventListener('click', () => { mapFitTo('world'); mapMoved = false; mapSchedule(); mapSay('Showing the whole world.'); });
+
+    $('maplegend').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-kind]');
+      if (!btn || btn.disabled) return;
+      const kind = btn.dataset.kind;
+      if (mapHidden.has(kind)) mapHidden.delete(kind); else mapHidden.add(kind);
+      try { localStorage.setItem(MKEY, JSON.stringify([...mapHidden])); } catch {}
+      mapLegend(); mapSchedule();
+      mapSay(`${MAP_LABELS[kind] || kind}${mapHidden.has(kind) ? ' hidden.' : ' shown.'}`);
+    });
+    $('tombstones').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-x]');
+      if (!btn) return;
+      mapView.cx = parseFloat(btn.dataset.x); mapView.cz = parseFloat(btn.dataset.z);
+      mapView.s = Math.max(mapView.s, 1.2); mapMoved = true;
+      mapClamp(); mapSchedule();
+      c.focus();
+      mapSay(`Showing ${btn.dataset.name || 'the tombstone'}.`);
+    });
+
+    new ResizeObserver(() => { if (!mapMoved) mapFitTo('content'); else mapClamp(); mapSchedule(); }).observe(stage);
+
+    // Catches monitor changes and browser zoom so the map never goes blurry.
+    const watchDpr = () => {
+      matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`).addEventListener('change', () => { mapSchedule(); watchDpr(); }, { once: true });
+    };
+    watchDpr();
+  }
+
+  // Degrades quietly when world.extra/basemap is missing or empty. A mapMoved flag set by every
+  // gesture and cleared only by the fit buttons/keys keeps the 30 s poll from yanking the view.
+  function renderWorldMap() {
+    const ex = status.world && status.world.extra, c = $('mapcanvas'), note = $('mapnote'), exp = $('mapexplored'), legend = $('maplegend'), legendNote = $('maplegendnote'), tomb = $('tombstones'), details = $('mapdetails'), read = $('mapread');
+    bindMap();
+    const hasPoints = ex && ex.basemap && Array.isArray(ex.basemap.points) && ex.basemap.points.length;
+    if (!hasPoints) {
+      mapData = null; mapSig = '';
+      const ctx = c.getContext('2d'); if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+      c.setAttribute('aria-label', 'Map of structures built in the world');
+      legend.innerHTML = ''; if (legendNote) legendNote.textContent = '';
+      if (read) read.hidden = true;
+      if (details) details.innerHTML = '';
+      exp.textContent = '';
+      note.textContent = 'Nothing mapped yet. The world file is read after each save, about every half hour; the map appears once that has happened.';
+      tomb.innerHTML = '<li class="empty">No tombstones. Either no one has died, or everyone got their things back.</li>';
+      return;
+    }
+    mapIngest(ex);
+    c.setAttribute('aria-label', mapAriaSummary());
+    mapCopy(ex);
+    mapLegend();
+    mapTombs();
+    if (!mapMoved) mapFitTo('content'); else mapClamp();
+    mapSchedule();
+  }
+
+  function renderRaids() {
+    const r = status.world && status.world.raids, ul = $('raids'), cnt = $('raidcount');
+    if (!r) { ul.innerHTML = '<li class="empty">Raids are not recorded yet.</li>'; cnt.textContent = ''; return; }
+    cnt.textContent = r.count_7d ? `${r.count_7d} this week` : 'none this week';
+    const items = (r.list || []).slice(0, 15);
+    if (!items.length) { ul.innerHTML = '<li class="empty">No raids yet. The forest is quiet.</li>'; return; }
+    ul.innerHTML = items.map((x) => {
+      const who = Array.isArray(x.online) && x.online.length ? `${list(x.online.map(esc))} ${x.online.length === 1 ? 'was' : 'were'} in the world` : 'No one was in the world';
+      return `<li><time>${when(x.t)}</time><div><b>${esc(x.label || x.name || 'Unknown raid')}</b><div class="dim">${who}</div></div></li>`;
+    }).join('');
+  }
+
+  const CAUSES = { update: 'Restarted for a game update', crash: 'Crashed and came back', manual: 'Restarted by hand', boot: 'The machine booted' };
+  function renderRestarts() {
+    const s = status.server, u = status.updates || {};
+    const az = status.azure && status.azure.maintenance;
+    const azEvents = az && Array.isArray(az.events) ? az.events : [];
+    const azLine = !az ? 'not recorded yet'
+      : azEvents.length ? azEvents.map((e) => {
+          const nb = e.not_before ? Date.parse(e.not_before) / 1000 : NaN;
+          return `${esc(e.type || 'maintenance')}${e.description ? ': ' + esc(e.description) : ''}, ${isNaN(nb) ? 'time unknown' : until(nb)}`;
+        }).join('; ')
+      : 'No Azure maintenance scheduled';
+    $('nexts').innerHTML = `<dt>Next Steam check</dt><dd>${s.next_update_check === undefined ? 'not recorded yet' : until(s.next_update_check)}</dd>
+      <dt>Next world snapshot</dt><dd>${s.next_backup === undefined ? 'not recorded yet' : until(s.next_backup)}</dd>
+      <dt>Azure maintenance</dt><dd>${azLine}</dd>`;
+    const rs = $('restarts');
+    if (!s.restarts) rs.innerHTML = '<li class="empty">Not recorded yet.</li>';
+    else if (!s.restarts.length) rs.innerHTML = '<li class="empty">No restarts recorded. The fire has not gone out.</li>';
+    else rs.innerHTML = s.restarts.slice(0, 10).map((r) => `<li><time>${when(r.t)}</time><div>${esc(CAUSES[r.cause] || r.cause || 'Restarted')}${r.version ? `<span class="dim">, Valheim ${esc(r.version)}</span>` : ''}</div></li>`).join('');
+    const uh = $('updhist');
+    if (!u.history) uh.innerHTML = '<li class="empty">Not recorded yet.</li>';
+    else if (!u.history.length) uh.innerHTML = '<li class="empty">No updates installed since the log began.</li>';
+    else uh.innerHTML = u.history.slice(0, 10).map((h) => `<li><time>${when(h.t)}</time><div>Build ${esc(h.from_build ?? '?')} to <b>${esc(h.to_build ?? '?')}</b></div></li>`).join('');
+  }
+
+  function renderSettings() {
+    const st = status.server.settings, el = $('settings');
+    if (!st) { el.innerHTML = '<dt>Settings</dt><dd>Not recorded yet.</dd>'; return; }
+    const m = st.modifiers || {};
+    const mods = [['combat', 'combat'], ['deathpenalty', 'death penalty'], ['resources', 'resources'], ['raids', 'raids'], ['portals', 'portals']]
+      .map(([k, l]) => `${l} ${esc(m[k] ?? 'default')}`).join(', ');
+    const yesno = (v) => v == null ? '—' : v ? 'yes' : 'no';
+    el.innerHTML = `<dt>Name</dt><dd>${esc(st.name ?? '—')}</dd>
+      <dt>World</dt><dd>${esc(st.world ?? '—')}</dd>
+      <dt>Seed</dt><dd>${esc(st.seed ?? '—')}</dd>
+      <dt>Port</dt><dd>${esc(st.port ?? '—')}</dd>
+      <dt>Room for</dt><dd>${st.max_players != null ? st.max_players + ' Vikings' : '—'}</dd>
+      <dt>Password</dt><dd>${st.password_protected === false ? 'none, anyone can walk in' : 'password protected'}</dd>
+      <dt>Listed publicly</dt><dd>${yesno(st.public)}</dd>
+      <dt>Crossplay</dt><dd>${yesno(st.crossplay)}</dd>
+      <dt>Saves every</dt><dd>${st.save_interval_s ? fmtDur(st.save_interval_s) : '—'}</dd>
+      <dt>Snapshots</dt><dd>${st.backups != null ? `${st.backups} kept` : '—'}${st.backup_short_s ? `, one every ${fmtDur(st.backup_short_s)}` : ''}${st.backup_long_s ? ` and a longer one every ${fmtDur(st.backup_long_s)}` : ''}</dd>
+      <dt>Modifiers</dt><dd>${mods}</dd>`;
+  }
+
+  function renderAside() {
+    const d = status.discord, dc = $('discord'), dh = $('discordh3');
+    if (!d || !d.invite) {
+      // No DISCORD_INVITE configured on the server -- hide the section rather than show a broken link.
+      dc.hidden = true; dc.innerHTML = '';
+      if (dh) dh.hidden = true;
+    } else {
+      dc.hidden = false;
+      if (dh) dh.hidden = false;
+      if (d.members == null) dc.innerHTML = `<div class="k">Member counts are not recorded yet.</div><p><a href="${esc(d.invite)}" rel="noopener">Join on Discord</a></p>`;
+      else dc.innerHTML = `<div class="big">${esc(d.name || 'The mead hall')}</div><div class="k">${d.online ?? 0} online of ${d.members} members${d.fetched ? ', counted ' + ago(d.fetched) : ''}</div><p><a href="${esc(d.invite)}" rel="noopener">Join on Discord</a></p>`;
+    }
+    const news = $('news'), items = Array.isArray(status.news) ? status.news.slice(0, 5) : null;
+    if (!items) news.innerHTML = '<li class="empty">Not fetched yet.</li>';
+    else if (!items.length) news.innerHTML = '<li class="empty">Nothing from Iron Gate lately.</li>';
+    else news.innerHTML = items.map((n) => `<li><a href="${esc(n.url || '#')}" target="_blank" rel="noopener">${esc(n.title || 'Untitled')}</a>${n.t ? `<time>${dateShort(n.t)}</time>` : ''}</li>`).join('');
+  }
+
+  function renderOffsite() {
+    const o = status.backup && status.backup.offsite, el = $('offsite');
+    if (!o) { el.innerHTML = '<div class="k">Off-site backups are not set up yet.</div>'; return; }
+    const okLine = o.last_success ? `Last copy safely off-site ${ago(o.last_success)}` : 'No successful copy yet';
+    const stale = o.last_success && (Date.now() / 1000 - o.last_success) > 36 * 3600;
+    el.innerHTML = `<div class="big${stale ? ' warn' : ''}">${okLine}</div>
+      <div class="k">${o.blobs != null ? o.blobs + ' archive' + (o.blobs === 1 ? '' : 's') : '—'}${o.bytes != null ? ', ' + bytes(o.bytes) : ''}${o.account ? ' in ' + esc(o.account) : ''}</div>
+      ${o.last_error ? `<p class="k bad">Last attempt: ${esc(o.last_error)}</p>` : ''}`;
+  }
+
+  function renderChart() {
+    if (!history) return;
+    const c = $('chart'), dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = 190;
+    if (!W) return;   // #/trends is hidden: nothing to measure, and the router redraws on arrival
+    c.width = W * dpr; c.height = H * dpr;
+    const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+    const series = history[range] || [];
+    const span = range === 'day' ? 86400 : 7 * 86400;
+    const t1 = Date.now() / 1000, t0 = t1 - span;
+    const maxP = Math.max(4, ...series.map((s) => s.p));
+    const padL = 28, padR = 8, padT = 12, padB = 26;
+    const x = (t) => padL + (W - padL - padR) * (t - t0) / span;
+    const y = (p) => padT + (H - padT - padB) * (1 - p / maxP);
+    ctx.strokeStyle = 'rgba(165,146,122,.18)'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#a5927a'; ctx.font = '14px Alegreya, Georgia, serif'; ctx.textAlign = 'right';
+    for (let p = 0; p <= maxP; p++) {
+      if (maxP > 6 && p % 2) continue;
+      ctx.beginPath(); ctx.moveTo(padL, y(p) + .5); ctx.lineTo(W - padR, y(p) + .5); ctx.stroke();
+      ctx.fillText(p, padL - 8, y(p) + 5);
+    }
+    ctx.textAlign = 'center';
+    const step = range === 'day' ? 4 * 3600 : 86400;
+    const first = Math.ceil(t0 / step) * step;
+    for (let t = first; t <= t1; t += step) {
+      const d = new Date(t * 1000);
+      const lbl = range === 'day' ? d.toLocaleTimeString([], { hour: 'numeric' }) : d.toLocaleDateString([], { weekday: 'short' });
+      ctx.fillText(lbl, x(t), H - 8);
+    }
+    if (!series.length) { ctx.fillText('No samples yet', W / 2, H / 2); return; }
+    ctx.beginPath();
+    let started = false;
+    const gap = range === 'day' ? 180 : 1500;
+    let prev = null;
+    for (const s of series) {
+      if (s.t < t0) { prev = s; continue; }
+      if (!started) { ctx.moveTo(x(Math.max(t0, s.t)), y(0)); ctx.lineTo(x(Math.max(t0, s.t)), y(prev ? prev.p : s.p)); started = true; }
+      else if (prev && s.t - prev.t > gap) { ctx.lineTo(x(prev.t), y(0)); ctx.lineTo(x(s.t), y(0)); }
+      ctx.lineTo(x(s.t), y(s.p));
+      prev = s;
+    }
+    if (prev) { ctx.lineTo(x(t1), y(prev.p)); ctx.lineTo(x(t1), y(0)); }
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, padT, 0, H - padB);
+    g.addColorStop(0, 'rgba(227,165,74,.55)'); g.addColorStop(1, 'rgba(227,165,74,.04)');
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = '#e3a54a'; ctx.lineWidth = 1.5; ctx.stroke();
+    const busy = series.filter((s) => s.t >= t0 && s.p > 0).length;
+    const mins = range === 'day' ? busy : busy * 10;
+    $('tidenote').textContent = busy ? `Someone was in the world for about ${fmtDur(mins * 60)} of the last ${range === 'day' ? '24 hours' : '7 days'}.` : `No one has been in the world in the last ${range === 'day' ? '24 hours' : '7 days'}.`;
+    $('tidetitle').textContent = `Vikings in the world, last ${range === 'day' ? '24 hours' : '7 days'}`;
+  }
+
+  // One line per Viking, colours fixed by order of first appearance so they stay put between polls.
+  const PING_COLORS = ['#e3a54a', '#93b06e', '#ead9bb', '#c9513c', '#8fa9c9', '#b98bc9', '#d98c5f', '#a5927a'];
+  function renderPingChart() {
+    const wrap = $('pingwrap');
+    if (!history) return;
+    const series = (history.day || []).filter((s) => s && s.pg && typeof s.pg === 'object' && Object.keys(s.pg).length);
+    if (!series.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    const names = [...new Set(series.flatMap((s) => Object.keys(s.pg)))];
+    const c = $('pingchart'), dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = 150;
+    if (!W) return;
+    c.width = W * dpr; c.height = H * dpr;
+    const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+    const t1 = Date.now() / 1000, t0 = t1 - 86400;
+    const vals = series.flatMap((s) => Object.values(s.pg)).filter((v) => typeof v === 'number');
+    const maxMs = Math.max(100, Math.ceil(Math.max(...vals) / 50) * 50);
+    const padL = 60, padR = 8, padT = 10, padB = 26;
+    const x = (t) => padL + (W - padL - padR) * (t - t0) / 86400;
+    const y = (v) => padT + (H - padT - padB) * (1 - v / maxMs);
+    ctx.strokeStyle = 'rgba(165,146,122,.18)'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#a5927a'; ctx.font = '14px Alegreya, Georgia, serif'; ctx.textAlign = 'right';
+    const stepMs = maxMs > 300 ? 100 : 50;
+    for (let v = 0; v <= maxMs; v += stepMs) {
+      ctx.beginPath(); ctx.moveTo(padL, y(v) + .5); ctx.lineTo(W - padR, y(v) + .5); ctx.stroke();
+      ctx.fillText(v ? v + ' ms' : '0', padL - 8, y(v) + 5);
+    }
+    ctx.textAlign = 'center';
+    const first = Math.ceil(t0 / 14400) * 14400;
+    for (let t = first; t <= t1; t += 14400) ctx.fillText(new Date(t * 1000).toLocaleTimeString([], { hour: 'numeric' }), x(t), H - 8);
+    names.forEach((n, i) => {
+      ctx.strokeStyle = PING_COLORS[i % PING_COLORS.length]; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let prev = null;
+      for (const s of series) {
+        const v = s.pg[n];
+        if (s.t < t0 || typeof v !== 'number') { prev = null; continue; }
+        if (prev && s.t - prev > 180) prev = null;
+        if (prev) ctx.lineTo(x(s.t), y(Math.min(v, maxMs))); else ctx.moveTo(x(s.t), y(Math.min(v, maxMs)));
+        prev = s.t;
+      }
+      ctx.stroke();
+    });
+    $('pinglegend').innerHTML = names.map((n, i) => `<li><i style="background:${PING_COLORS[i % PING_COLORS.length]}"></i>${esc(n)}</li>`).join('');
+  }
+
+  // Opt-in browser notifications when the count of Vikings rises between polls.
+  const NKEY = 'valheim.notifyJoins';
+  let notifyOn = false, prevCount = null, prevNames = [];
+  try { notifyOn = localStorage.getItem(NKEY) === '1'; } catch {}
+  const canNotify = () => typeof Notification !== 'undefined';
+  function renderNotify(msg) {
+    const b = $('notify'), n = $('notifynote');
+    if (!canNotify()) { b.disabled = true; b.textContent = 'Notify me when someone joins'; n.textContent = 'This browser cannot show notifications.'; return; }
+    if (notifyOn && Notification.permission !== 'granted') notifyOn = false;
+    b.textContent = notifyOn ? 'Stop notifying' : 'Notify me when someone joins';
+    b.setAttribute('aria-pressed', notifyOn);
+    n.textContent = msg || (notifyOn ? 'On. You will hear when the count of Vikings rises, for as long as this page stays open.'
+      : 'Your browser will show a note when the count of Vikings rises, for as long as this page stays open.');
+  }
+  function setNotify(on) { notifyOn = on; try { on ? localStorage.setItem(NKEY, '1') : localStorage.removeItem(NKEY); } catch {} }
+  $('notify').addEventListener('click', async () => {
+    if (!canNotify()) return;
+    if (notifyOn) { setNotify(false); renderNotify('Off. Nothing more will be shown.'); return; }
+    let perm = Notification.permission;
+    if (perm !== 'granted') { try { perm = await Notification.requestPermission(); } catch { perm = 'denied'; } }
+    if (perm === 'granted') { setNotify(true); renderNotify(); }
+    else renderNotify(perm === 'denied' ? 'Your browser has blocked notifications for this page. Allow them in the site settings and try again.' : 'No permission was given, so nothing will be shown.');
+  });
+  function checkArrivals(s) {
+    const count = s.players.count, names = (s.players.online || []).map((p) => p.name);
+    if (prevCount != null && count > prevCount && notifyOn && canNotify() && Notification.permission === 'granted') {
+      const fresh = names.filter((n) => !prevNames.includes(n));
+      const body = (fresh.length ? list(fresh) + ' arrived. ' : 'Someone arrived. ') + (count === 1 ? 'One Viking is in the world.' : `${count} Vikings are in the world.`);
+      try { new Notification('The hall has company', { body, tag: 'valheim-join', icon: document.querySelector('link[rel=icon]').href }); } catch {}
+    }
+    prevCount = count; prevNames = names;
+  }
+
+  // ================================ #/hall: medals and records ================================
+  // Everything here is rendered from medals.json's own `catalog` and the engine's own `display`
+  // strings. No medal name, emoji, category or rule is written down twice: adding a medal in
+  // valheim-medals.py lights it up here with no change to this page.
+  const CAT_TITLES = {
+    time: 'Hours in the hall', death: 'Dying, and not dying', social: 'Side by side',
+    world: 'Out in the world', fun: 'For the fun of it',
+  };
+  const CAT_ORDER = ['time', 'death', 'social', 'world', 'fun'];
+  const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  // The medals engine says "since 10 September" and never "all time"; match it exactly rather than
+  // letting toLocaleDateString reorder it per locale.
+  const dayMonth = (t) => { const d = new Date(t * 1000); return `${d.getDate()} ${MONTHS[d.getMonth()]}`; };
+  const HKEY = 'valheim.hallTab';
+  let hallTab = 'medals';
+  try { const v = localStorage.getItem(HKEY); if (v === 'fame' || v === 'medals') hallTab = v; } catch {}
+
+  const UNWON = {
+    day: 'No one claimed this that day.',
+    week: 'No one has claimed this yet this week.',
+    all: 'No one holds this one yet.',
+  };
+
+  function medalCard(m, res, w) {
+    const head = `<div class="t"><span class="em" aria-hidden="true">${esc(m.emoji || '')}</span><b>${esc(m.name || m.key)}</b></div>`;
+    const how = `<p class="how">How this is decided: ${esc(m.howto || 'not written down.')}</p>`;
+    const names = res && Array.isArray(res.names) ? res.names.filter(Boolean) : [];
+    if (!names.length) {
+      return `<li class="medal unwon">${head}<p class="win">${UNWON[w]} A medal needs at least two Vikings in the running before it is handed out at all.</p>${how}</li>`;
+    }
+    let verb = m.verb || '';
+    if (names.length > 1 && verb.startsWith('has ')) verb = 'have ' + verb.slice(4);
+    const val = res.display ? `<span class="val">${esc(res.display)}</span>` : '';
+    const who = `<b>${list(names.map(esc))}</b>`;
+    const win = verb ? `${who} ${esc(verb)}${val ? ' — ' + val : ''}` : `${who}${val ? ' — ' + val : ''}`;
+    const ru = Array.isArray(res.runners_up) ? res.runners_up.filter((r) => r && r.name) : [];
+    const run = ru.length
+      ? `<p class="run">Behind them: ${ru.map((r) => `${esc(r.name)}${r.display ? ' (' + esc(r.display) + ')' : ''}`).join(', ')}.</p>`
+      : '';
+    return `<li class="medal">${head}<p class="win">${win}</p>${run}${how}</li>`;
+  }
+
+  // One window (day / week / all) grouped into the five categories, in the catalogue's own order.
+  function medalPanel(w) {
+    const won = (medals.windows || {})[w] || {};
+    const mine = medals.catalog.filter((m) => m && Array.isArray(m.windows) && m.windows.includes(w));
+    if (!mine.length) return '<p class="note">No medals are handed out over this stretch of time.</p>';
+    let html = '';
+    for (const cat of [...CAT_ORDER, ...new Set(mine.map((m) => m.category).filter((c) => !CAT_ORDER.includes(c)))]) {
+      const group = mine.filter((m) => m.category === cat);
+      if (!group.length) continue;
+      html += `<h4>${esc(CAT_TITLES[cat] || cat)}</h4><ul class="medals">${group.map((m) => medalCard(m, won[m.key], w)).join('')}</ul>`;
+    }
+    const n = Object.keys(won).length;
+    const lead = n ? '' : `<p class="note">Nothing was handed out over this stretch — not enough Vikings were in the running.</p>`;
+    return lead + html;
+  }
+
+  function renderHall() {
+    const mp = $('medalspanel'), fp = $('famepanel'), note = $('hallnote');
+    for (const b of $('halltabs').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.tab === hallTab));
+    mp.hidden = hallTab !== 'medals';
+    fp.hidden = hallTab !== 'fame';
+    if (!medals || !Array.isArray(medals.catalog) || !medals.catalog.length) {
+      mp.innerHTML = ''; fp.innerHTML = '';
+      note.textContent = medalsSeen
+        ? 'The tally of medals came back empty. Nothing to show yet.'
+        : 'No tally of medals has reached the page yet. It is written on the server every few minutes, once that has been set up.';
+      return;
+    }
+    const age = medals.generated ? Date.now() / 1000 - medals.generated : null;
+    const stale = age != null && age > 6 * 3600 ? ` Counted ${ago(medals.generated)}, so it may be behind.` : '';
+    if (hallTab === 'medals') {
+      note.textContent = `${medals.catalog.length} medals. Handed out once a day; a medal needs at least two Vikings in the running, so a quiet day hands out little.${stale}`;
+      mp.innerHTML = `<h3>Yesterday${medals.day_label ? ' — ' + esc(medals.day_label) : ''}</h3>${medalPanel('day')}<h3>This week</h3>${medalPanel('week')}`;
+    } else {
+      note.textContent = `The marks that still stand, since ${medals.tracking_since ? dayMonth(medals.tracking_since) : 'the world moved to this server'} — records, not awards. Beat one and it is yours.${stale}`;
+      fp.innerHTML = medalPanel('all');
+    }
+  }
+
+  // ============================== #/server: the restart request ==============================
+  // The page files a request and watches it. It cannot restart anything: only the approved
+  // executor on the server may touch valheim.service, and only after a human says yes in Discord.
+  const RS_REASONS = {
+    not_responding: 'the server was not answering',
+    cannot_join: 'no one could get in',
+    lag: 'it was lagging badly',
+    stuck_after_update: 'it looked stuck after an update',
+    other: 'something else',
+  };
+  const RS_STATES = {
+    pending_validation: 'The request is being looked over.',
+    awaiting_approval: 'Waiting for someone in the hall to approve it in Discord. Nothing happens until they do.',
+    approved: 'Approved. Getting ready.',
+    counting_down: 'Counting down. Anyone in the world will not see this.',
+    waiting_for_lock: 'Waiting for the backup or the updater to let go of the world.',
+    backing_up: 'Copying the world first.',
+    stopping: 'Shutting the server down.',
+    stopped_verified: 'Down, and the world is saved.',
+    starting: 'Starting it up again.',
+    verifying: 'Up. Checking that it answers.',
+    succeeded: 'Done. The hall is back.',
+    denied: 'Someone in the hall turned it down.',
+    rejected_invalid: 'The request did not make sense and was thrown out.',
+    failed_precheck: 'Stopped before anything was touched — a check failed.',
+    expired_unapproved: 'No one approved it in time, so it lapsed.',
+    expired_approval: 'The approval went stale before the restart began.',
+    aborted: 'Called off.',
+    aborted_lock_timeout: 'Called off — the world stayed locked too long.',
+    failed_needs_admin: 'It went wrong and needs the owner. Nothing more will be tried on its own.',
+  };
+  const RS_DONE = new Set(['succeeded', 'denied', 'rejected_invalid', 'failed_precheck', 'expired_unapproved',
+    'expired_approval', 'aborted', 'aborted_lock_timeout', 'failed_needs_admin']);
+  const rsLive = (r) => r && r.current && !RS_DONE.has(r.current.state) ? r.current : null;
+  const mmss = (s) => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+  let rsBusy = false, rsAckSig = null;
+
+  // restart_at is an absolute deadline, so the countdown is read off the clock, not slept through.
+  function paintCountdown() {
+    for (const el of document.querySelectorAll('.cd')) {
+      const at = Number(el.dataset.at);
+      if (!at) continue;
+      const left = at - Date.now() / 1000;
+      el.textContent = left > 0.5 ? mmss(left) : 'any moment now';
+    }
+  }
+
+  function rsProgHtml(cur) {
+    const done = RS_DONE.has(cur.state);
+    const why = RS_REASONS[cur.reason] || cur.reason || 'no reason given';
+    const who = cur.nickname ? `${esc(cur.nickname)} asked` : 'Someone asked';
+    const appr = cur.approver && cur.approver.display ? ` Approved by ${esc(cur.approver.display)}.` : '';
+    const cd = cur.state === 'counting_down' && cur.restart_at
+      ? `<div class="cd" data-at="${Number(cur.restart_at)}">${mmss(cur.restart_at - Date.now() / 1000)}</div>`
+      : '';
+    const pl = cur.players_at_request && cur.players_at_request.count
+      ? `<div class="k">${cur.players_at_request.count} Viking${cur.players_at_request.count === 1 ? '' : 's'} ${Array.isArray(cur.players_at_request.names) && cur.players_at_request.names.length ? '(' + list(cur.players_at_request.names.map(esc)) + ') ' : ''}${done ? 'were' : 'are'} in the world.</div>`
+      : '';
+    const link = cur.message_url ? ` <a href="${esc(cur.message_url)}" rel="noopener">See it in Discord</a>` : '';
+    return `<div class="rsprog${done ? ' done' : ''}">
+      <div class="big">${esc(RS_STATES[cur.state] || cur.state || 'In hand.')}</div>
+      ${cd}
+      <div class="k">${who} because ${esc(why)}, ${ago(cur.created_at)}.${appr}${link}</div>
+      ${pl}</div>`;
+  }
+
+  function rsNeedAck() { return !!(status && status.players && status.players.count > 0); }
+
+  // Rebuilt only when the names change, so a 30 s poll never clears the box the user just ticked.
+  function rsPlayersBlock() {
+    const el = $('rsplayers');
+    const online = (status && status.players && status.players.online) || [];
+    const names = online.map((p) => p.name);
+    const sig = JSON.stringify(names) + '|' + ((status && status.players && status.players.count) || 0);
+    if (sig === rsAckSig) return;
+    rsAckSig = sig;
+    if (!rsNeedAck()) {
+      el.innerHTML = '<p class="note">No one is in the world right now, so a restart would interrupt nobody.</p>';
+      return;
+    }
+    const n = (status.players.count) || names.length;
+    const whoText = names.length ? list(names.map(esc)) : `${n} Viking${n === 1 ? '' : 's'}`;
+    el.innerHTML = `<div class="rsack">
+      <input type="checkbox" id="rsack">
+      <label for="rsack">${whoText} ${names.length === 1 ? 'is' : 'are'} in the world right now and will be thrown out mid-swing with no warning in the game. I still want to ask for a restart.</label>
+    </div>`;
+    $('rsack').addEventListener('change', () => safe(rsGate));
+  }
+
+  function rsGate() {
+    const btn = $('rssend'), gate = $('rsgate');
+    let reason = '';
+    if (rsBusy) reason = '';
+    else if (!restart) reason = restartSeen ? 'The restart desk is not answering right now.' : 'Asking for a restart is not switched on for this server yet.';
+    else if (rsLive(restart)) reason = 'A request is already in hand. Only one at a time.';
+    else if (!restart.accepting) reason = restart.why_not || 'Requests are not being taken right now.';
+    else if (restart.cooldown_until && restart.cooldown_until > Date.now() / 1000) reason = `Too soon after the last one — you can ask again ${until(restart.cooldown_until)}.`;
+    else if (rsNeedAck() && !($('rsack') && $('rsack').checked)) reason = 'Tick the box to say you know people are in the world.';
+    btn.disabled = rsBusy || !!reason;
+    btn.textContent = rsBusy ? 'Sending…' : 'File the request';
+    gate.textContent = reason;
+  }
+
+  function renderRestart() {
+    const cur = restart && restart.current;
+    $('rsprog').innerHTML = cur ? rsProgHtml(cur) : (restart ? '' : `<p class="note">${restartSeen ? 'The restart desk stopped answering. Try again in a moment.' : 'Nothing on this page can restart the server yet. Until that is switched on, ask in Discord.'}</p>`);
+    safe(rsPlayersBlock);
+    safe(rsGate);
+    const ul = $('rsrecent'), recent = (restart && Array.isArray(restart.recent) ? restart.recent : []).slice(0, 10);
+    if (!restart) ul.innerHTML = '<li class="empty">Not recorded yet.</li>';
+    else if (!recent.length) ul.innerHTML = '<li class="empty">No one has asked for a restart yet.</li>';
+    else ul.innerHTML = recent.map((r) => {
+      const st = esc(RS_STATES[r.state] || r.state || 'unknown');
+      const by = r.approver && r.approver.display ? ` <span class="dim">Approved by ${esc(r.approver.display)}.</span>` : '';
+      const dt = r.downtime_s != null ? ` <span class="dim">Down for ${fmtDur(r.downtime_s)}.</span>` : '';
+      return `<li><time>${r.at ? when(r.at) : '—'}</time><div><b>${esc(RS_REASONS[r.reason] || r.reason || 'no reason given')}</b> — ${st}${by}${dt}</div></li>`;
+    }).join('');
+    paintCountdown();
+  }
+
+  // On #/ Now: only ever shown when the server is not answering.
+  function renderDownCall() {
+    const sec = $('downcall'), body = $('downcallbody');
+    const s = status.server || {};
+    if (s.online) { sec.hidden = true; body.innerHTML = ''; return; }
+    sec.hidden = false;
+    const cur = rsLive(restart);
+    if (cur) {
+      body.innerHTML = `<div class="big">Someone has already asked for a restart.</div>
+        <div class="k">${esc(RS_STATES[cur.state] || cur.state)}</div>
+        <p><a class="btn" href="#/server">See where it stands</a></p>`;
+    } else if (restart) {
+      body.innerHTML = `<div class="big">The server is not answering.</div>
+        <div class="k">You can ask the hall to restart it. Someone in Discord has to approve it before anything happens.</div>
+        <p><a class="btn primary" href="#/server">Ask the hall to restart it</a></p>`;
+    } else {
+      body.innerHTML = `<div class="big">The server is not answering.</div>
+        <div class="k">Nothing on this page can restart it yet. Say something in Discord and someone will look.</div>`;
+    }
+  }
+
+  function rsSay(text, cls) { const el = $('rsmsg'); el.textContent = text; el.className = 'rsmsg' + (cls ? ' ' + cls : ''); }
+
+  // The one write path in the whole system. Four things are required by the server: the JSON
+  // content type, the X-Valheim-Restart header, a same-origin Sec-Fetch-Site (the browser sets
+  // that itself) and a current csrf value copied out of restart-state.json.
+  async function rsSubmit() {
+    if (rsBusy) return;
+    if (!restart || !restart.csrf) { rsSay('The page has no valid token to send. Give it a moment and try again.', 'bad'); return; }
+    const ack = !!($('rsack') && $('rsack').checked);
+    if (rsNeedAck() && !ack) { rsSay('Tick the box first — people are in the world.', 'bad'); return; }
+    const nickname = ($('rsnick').value || '').replace(/[^A-Za-z0-9 _.\-]/g, '').slice(0, 24).trim();
+    rsBusy = true; rsGate(); rsSay('Sending…');
+    let res = null, body = null;
+    try {
+      res = await fetch(base + 'api/restart/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Valheim-Restart': '1' },
+        cache: 'no-store',
+        body: JSON.stringify({ csrf: restart.csrf, reason: $('rsreason').value, nickname, ack_players: ack }),
+      });
+      try { body = await res.json(); } catch { body = null; }
+    } catch (e) {
+      rsBusy = false; rsGate();
+      rsSay('The request never left the building — the network or the server refused it. Nothing was filed.', 'bad');
+      return;
+    }
+    rsBusy = false;
+    const why = (body && (body.why || body.error)) ? String(body.why || body.error) : '';
+    if (res.status === 202) {
+      rsSay('Filed. Someone in the hall has to approve it in Discord before anything happens — this page will follow along.', 'ok');
+      const box = $('rsack'); if (box) box.checked = false;
+      rsAckSig = null;
+      await refreshRestart();          // don't make the user wait 30 s to see their own request
+    } else if (res.status === 409) {
+      rsSay(why ? `Not taken: ${why}` : 'Not taken — either a request is already in hand or the server was restarted too recently.', 'bad');
+      await refreshRestart();
+    } else if (res.status === 429) {
+      rsSay('Too many requests in too short a time. Wait a few minutes and ask again.', 'bad');
+    } else if (res.status === 403) {
+      rsSay('The page\'s token was refused, usually because it went stale. Reload the page and ask again.', 'bad');
+      await refreshRestart();
+    } else if (res.status === 400) {
+      rsSay(why ? `The server could not read the request: ${why}` : 'The server could not read the request. Nothing was filed.', 'bad');
+    } else {
+      rsSay(`The server answered ${res.status} and nothing was filed.${why ? ' ' + why : ''}`, 'bad');
+    }
+    rsGate();
+  }
+
+  async function refreshRestart() {
+    const r = await soft('restart-state.json');
+    restartSeen = restartSeen || !!r;
+    if (r && typeof r === 'object') restart = r;
+    if (view === 'server') safe(renderRestart);
+    if (view === 'now') safe(renderDownCall);
+  }
+
+  // ==================================== routes ====================================
+  // Six hash routes over the one set of sections. Only the visible view's renderers run on a poll;
+  // the map and the two chart canvases are the expensive part of every tick and are usually hidden.
+  const ROUTES = [
+    ['/', 'now', 'Now'],
+    ['/world', 'world', 'The world'],
+    ['/vikings', 'vikings', 'Vikings'],
+    ['/trends', 'trends', 'Trends'],
+    ['/hall', 'hall', 'Hall of fame'],
+    ['/server', 'server', 'The machine'],
+  ];
+  const VIEW_OF = Object.fromEntries(ROUTES.map(([r, v]) => [r, v]));
+  const ROUTE_OF = Object.fromEntries(ROUTES.map(([r, v]) => [v, r]));
+  const NAME_OF = Object.fromEntries(ROUTES.map(([, v, n]) => [v, n]));
+  let view = 'now';
+
+  const VIEW_RENDER = {
+    now: [renderHero, renderFacts, renderNowFeed, renderDownCall],
+    world: [renderProgress, renderWorldMap, renderRaids, renderWorldFacts],
+    vikings: [renderStats, renderRecords, renderTogether, renderCalendars, renderTimeline, renderHeat],
+    trends: [renderChart, renderPingChart],
+    hall: [renderHall],
+    server: [renderMachine, renderFeed, renderRestarts, renderSettings, renderAside, renderOffsite, renderRestart],
+  };
+
+  // An unknown or empty hash simply shows Now. It is never rewritten, so there is no way to loop.
+  function routeFromHash() {
+    let h = location.hash.replace(/^#/, '').trim();
+    if (!h) return 'now';
+    if (h[0] !== '/') h = '/' + h;
+    if (h.length > 1) h = h.replace(/\/+$/, '') || '/';
+    return VIEW_OF[h] || 'now';
+  }
+
+  function renderCurrentView() {
+    if (!status) return;
+    for (const fn of VIEW_RENDER[view] || []) safe(fn);
+  }
+
+  // Un-hides first and renders second: a canvas measured inside a hidden section has no size, so
+  // every view that owns one re-measures and redraws on the way in.
+  function applyView(next, announce) {
+    const changed = next !== view;
+    view = next;
+    for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.dataset.view !== view;
+    for (const a of document.querySelectorAll('#navlist a')) {
+      if (a.dataset.route === ROUTE_OF[view]) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    }
+    renderCurrentView();
+    if (changed && announce) $('viewsay').textContent = NAME_OF[view] + '.';
+  }
+
+  // Resolves to null rather than rejecting, so one missing file can never take the page with it.
+  const soft = (name) => fetch(base + name + '?t=' + Date.now(), { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null)).then((j) => j, () => null);
+
+  async function load() {
+    const [s, h, m, r] = await Promise.all([
+      soft('status.json'), soft('history.json'), soft('medals.json'), soft('restart-state.json'),
+    ]);
+    if (!s || !s.server || !s.players) {
+      $('gen').textContent = 'Could not reach the server for a report. Retrying.';
+      $('gen').className = 'stale';
+      return;
+    }
+    status = s;
+    safe(renderMast);
+    if (h) history = h;                                  // keep the last good history on a blip
+    medalsSeen = medalsSeen || !!m;
+    if (m && Array.isArray(m.catalog)) medals = m;
+    restartSeen = restartSeen || !!r;
+    if (r && typeof r === 'object') restart = r;
+    renderCurrentView();
+    safe(() => checkArrivals(s));
+    // Global on every view: the staleness footer and the document title.
+    const age = Date.now() / 1000 - s.generated;
+    const g = $('gen');
+    g.textContent = `Last report ${ago(s.generated)}.`;
+    g.className = age > 300 ? 'stale' : '';
+    if (age > 300) g.textContent += ' The reporter on the server has gone quiet; the numbers above may be old.';
+    document.title = (s.server.online ? (s.players.count ? `${s.players.count} online` : 'Open') : 'Down') + ' · ' + (s.server.name || 'Valheim');
+  }
+
+  async function ping() {
+    const el = $('ping');
+    try {
+      await fetch(base + 'ping.txt?w=' + Math.random(), { cache: 'no-store' });
+      const t = [];
+      for (let i = 0; i < 5; i++) {
+        const a = performance.now();
+        await fetch(base + 'ping.txt?i=' + i + Math.random(), { cache: 'no-store' });
+        t.push(performance.now() - a);
+      }
+      t.sort((a, b) => a - b);
+      el.innerHTML = `Your ping to the server <b>${Math.round(t[2])} ms</b>`;
+      el.title = 'Round trip from this browser to the server over HTTPS. In-game ping is usually close to this.';
+    } catch { el.textContent = ''; }
+  }
+
+  document.querySelectorAll('.tide .range button').forEach((b) => b.addEventListener('click', () => {
+    range = b.dataset.range;
+    document.querySelectorAll('.tide .range button').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    safe(renderChart);
+  }));
+  $('halltabs').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-tab]');
+    if (!b) return;
+    hallTab = b.dataset.tab;
+    try { localStorage.setItem(HKEY, hallTab); } catch {}
+    safe(renderHall);
+  });
+  $('rssend').addEventListener('click', () => { rsSubmit(); });
+  $('copy').addEventListener('click', async (e) => {
+    const addr = status && status.server && status.server.address;
+    if (!addr) return;
+    try { await navigator.clipboard.writeText(addr); e.target.textContent = 'Copied'; setTimeout(() => e.target.textContent = 'Copy address', 1500); } catch {}
+  });
+  $('snaplink').href = base + 'snapshots/';
+  window.addEventListener('resize', () => { if (view === 'trends') { safe(renderChart); safe(renderPingChart); } });
+  window.addEventListener('hashchange', () => { applyView(routeFromHash(), true); window.scrollTo(0, 0); });
+  renderNotify();
+  applyView(routeFromHash(), false);
+  load(); ping();
+  setInterval(load, 30000);
+  setInterval(ping, 120000);
+  setInterval(() => safe(paintCountdown), 1000);
+})();
+</script>
+</body>
+</html>

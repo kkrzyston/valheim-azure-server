@@ -1,0 +1,9 @@
+[Unit]
+Description=Valheim off-site backup to Azure Blob Storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/valheim-offsite-backup.sh

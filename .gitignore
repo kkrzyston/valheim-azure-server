@@ -1,0 +1,41 @@
+# World archives and vendor docs -- large binaries, not source. Also: Iron Gate's own
+# dedicated-server manual is a PDF we deliberately don't redistribute (see README credits).
+*.zip
+*.pdf
+
+# Python bytecode (the scripts are run on the VM, never imported as a package here).
+__pycache__/
+*.pyc
+
+# Session scratch from the Remember plugin.
+.remember/
+
+# Local-only Claude Code permissions.
+.claude/settings.local.json
+
+# Secrets never belong here. Real env files live on the VM only (/etc/valheim-alert.env,
+# /etc/valheim-server.env), mode 0600, root-only -- see .env.example and docs/OPERATIONS.md.
+# Blanket-ignore anything with ".env" in its name so a filled-in copy can't slip into a
+# commit by accident, then explicitly un-ignore the checked-in reference templates, which
+# are tracked on purpose and must keep every credential value empty:
+#   - any *.env.example file (this repo's root .env.example, and any companion under azure/)
+#   - azure/dashboard/valheim-alert.env, the tracked template installed to /etc/valheim-alert.env
+*.env*
+!*.env.example
+!azure/dashboard/valheim-alert.env
+
+# Valheim world-save binary files. These hold live world state (and, via player-tied ZDOs,
+# player data) -- never something to check into source control, and this repo ships no
+# world saves or player data by design (see README).
+*.db2
+*.fwl2
+*.chunk
+
+# World backup / snapshot archives (local .tgz snapshots and off-site backup bundles) --
+# same reason as above: full world saves, which may include player-identifying data.
+*.tgz
+
+# Checksum manifests generated for one specific world migration (see migrate-world.sh /
+# replace-world.sh). Meaningless without the world files they were generated against, which
+# aren't shipped either -- regenerate your own rather than committing one.
+*.sha256

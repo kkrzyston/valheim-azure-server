@@ -1,0 +1,7 @@
+[Unit]
+Description=Valheim: update to Steam's current build if one is pending and nobody is playing
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/valheim-autoupdate.sh

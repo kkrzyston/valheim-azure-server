@@ -1,0 +1,10 @@
+[Unit]
+Description=Valheim daily Discord medals
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-medals.py --daily --board
+EnvironmentFile=-/etc/valheim-alert.env
+EnvironmentFile=-/etc/valheim-server.env
+Nice=10

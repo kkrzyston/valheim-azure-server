@@ -1,0 +1,88 @@
+# Valheim status dashboard. HTTPS certificate is obtained automatically from Let's Encrypt.
+# Two logins: `viking` opens the dashboard; `owner` (and only `owner`) opens /snapshots/.
+# install-dashboard.sh fills in the two bcrypt password hashes and the dashboard hostname at
+# install time (__HASH__, __OWNER_HASH__, __DASHBOARD_HOST__). Its sed replaces every match on
+# each line, and the `viking` hash now appears on two separate lines (the API route and the
+# catch-all), so both are substituted correctly.
+# Do not write the placeholder tokens in a comment: sed would rewrite the comment too, which
+# is how the live config ended up with hashes pasted into this paragraph.
+__DASHBOARD_HOST__ {
+	encode gzip
+
+	header {
+		Cache-Control "no-store"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		# The restart button is the first thing here worth clickjacking.
+		X-Frame-Options DENY
+		# index.html is one document with an inline <style> and an inline <script>, so
+		# 'unsafe-inline' for both is unavoidable without hashing every block. The rest is
+		# still worth having: connect-src 'self' keeps page JS from talking to anyone else,
+		# form-action 'none' means an injected <form> cannot submit anywhere (the page uses
+		# fetch), and frame-ancestors 'none' backs up X-Frame-Options.
+		# This does NOT protect the API from cross-site POSTs -- CSP is per-document and says
+		# nothing about requests an attacker's page makes. valheim-restartd.py does that job,
+		# by requiring a JSON content type, a custom header, Sec-Fetch-Site and a CSRF token.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+	}
+
+	# /snapshots -> /snapshots/ so the listing below matches
+	redir /snapshots /snapshots/ 308
+
+	# World snapshots (the .tgz files in /home/valheim/backups), owner login only.
+	handle_path /snapshots/* {
+		basic_auth {
+			owner __OWNER_HASH__
+		}
+		root * /home/valheim/backups
+		file_server browse
+	}
+
+	# Restart requests -- the only write path into this system, ever.
+	#
+	# POST one path and nothing else; every other method and path gets 405. The upstream is a
+	# unix socket, not a localhost port, because a port on 127.0.0.1 is reachable by every
+	# local account including `valheim` (the process exposed to the internet), whereas the
+	# socket is 0660 valheim-restartd:caddy and reachable only by us.
+	#
+	# Everything the page READS about restarts is restart-state.json, a static file served by
+	# the catch-all below. There is deliberately no GET route here.
+	#
+	# `route` is used so these run in written order rather than Caddy's default directive
+	# order: authenticate, cap the body, then proxy.
+	handle /api/* {
+		@restart_post {
+			method POST
+			path /api/restart/request
+		}
+		route {
+			basic_auth {
+				viking __HASH__
+			}
+			request_body {
+				max_size 2KB
+			}
+			reverse_proxy @restart_post unix//run/valheim-restartd/http.sock {
+				# restartd has no business holding the dashboard password, and Caddy has
+				# already verified it.
+				header_up -Authorization
+				header_up -Cookie
+				# Caddy APPENDS to an existing X-Forwarded-For, so a client-supplied value
+				# would land first and the audit log would be whatever the caller claimed.
+				# Delete it, then set the peer address ourselves. restartd trusts X-Real-IP.
+				header_up -X-Forwarded-For
+				header_up X-Real-IP {remote_host}
+			}
+			respond 405
+		}
+	}
+
+	# Everything else: the dashboard, viewer login.
+	handle {
+		basic_auth {
+			viking __HASH__
+		}
+		root * /var/www/valheim
+		file_server
+	}
+}

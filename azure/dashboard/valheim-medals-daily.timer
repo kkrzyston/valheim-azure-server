@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Valheim Discord medals, 09:00 local
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
