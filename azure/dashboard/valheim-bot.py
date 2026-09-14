@@ -469,15 +469,32 @@ def get_azure_token():
 
 def call_ai_sync(question, context):
     """Blocking HTTP; callers on the gateway must run this via asyncio.to_thread so the
-    heartbeat is never blocked. Returns (ok, text_or_error_message)."""
+    heartbeat is never blocked. Returns (ok, text_or_error_message, english_mode) -- english_mode
+    is True only when ENGLISH_RE matched `question` and the one-turn override below was appended
+    to the system message for this call. Callers use it to know whether to post the answer
+    through norse_reply() (Old Norse default) or as plain text (explicit English request)."""
     try:
         token = get_azure_token()
     except Exception as exc:
-        return False, f"could not get a managed-identity token: {exc!r}"
+        return False, f"could not get a managed-identity token: {exc!r}", False
+    english_mode = bool(ENGLISH_RE.search(question))
+    system_content = SYSTEM_PROMPT.format(context=context)
+    if english_mode:
+        # A Python-side, deterministic override -- not left to the model to decide on its own.
+        # SYSTEM_PROMPT hard-instructs "never answer in English"; a model that consistent will
+        # otherwise refuse or hedge on its own stated exception, so the exception is granted here
+        # in code, for this one call only, never by editing SYSTEM_PROMPT itself.
+        system_content += (
+            "\n\nLANGUAGE OVERRIDE (this reply only): the user just explicitly asked for English "
+            "(matched via ENGLISH_RE, e.g. \"in English\", \"translate that\", \"a ensku\"). "
+            "Answer this one reply in plain English instead of Old Norse. The backtick-wrapping "
+            "instruction above is not needed for this reply."
+        )
+    log(f"answering in {'english (explicit request)' if english_mode else 'old norse (default)'} mode")
     body = {
         "model": AI_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": question},
         ],
         "max_tokens": MAX_TOKENS,
@@ -492,19 +509,41 @@ def call_ai_sync(question, context):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return True, data["choices"][0]["message"]["content"]
+        return True, data["choices"][0]["message"]["content"], english_mode
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
             detail = exc.read().decode("utf-8", "replace")[:300]
         except Exception:
             pass
-        return False, f"AI endpoint returned {exc.code}: {detail}"
+        return False, f"AI endpoint returned {exc.code}: {detail}", english_mode
     except Exception as exc:
-        return False, f"AI call failed: {exc!r}"
+        return False, f"AI call failed: {exc!r}", english_mode
 
 
 EVERYONE_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
+
+
+# Old Norse is the default (SYSTEM_PROMPT's LANGUAGE block); this is the deterministic escape
+# hatch back to English for one reply. Deterministic on purpose, same reasoning as JOIN_RE below:
+# a model hard-instructed to never use English will otherwise second-guess or refuse its own
+# stated exception, so the decision is made here in Python and handed to the model as a one-turn
+# override (see call_ai_sync()), never left for the model to decide on its own from the prompt
+# text alone. Matches only an explicit ask -- "in english", "speak english", "say that/it in
+# english", "english please", "translate that/it/this", "what does that/it/this mean in english",
+# and the Old Norse phrase "á ensku" ("in English") -- never a question that merely contains the
+# word "English" on its own (e.g. "did the Vikings speak Old English?" does not match, since
+# "speak" and "english" are not adjacent there).
+ENGLISH_PATTERNS = [
+    r"\bin english\b",
+    r"\bspeak english\b",
+    r"\bsay (?:that|it) in english\b",
+    r"\benglish please\b",
+    r"\btranslate (?:that|it|this)\b",
+    r"\bwhat does (?:that|it|this) mean in english\b",
+    r"\bá ensku\b",
+]
+ENGLISH_RE = re.compile("|".join(ENGLISH_PATTERNS), re.IGNORECASE)
 
 
 VALHEIM_UNIT = os.environ.get("HERMODR_VALHEIM_UNIT", "/etc/systemd/system/valheim.service")
@@ -1290,7 +1329,7 @@ def run_bot():
         if verdict == "warn":
             try:
                 await message.reply(
-                    "Slow down -- one question per 10 s, a cap per hour. Try again shortly.",
+                    RATE_LIMIT_REPLY,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except Exception as exc:
@@ -1301,7 +1340,7 @@ def run_bot():
         if not question:
             try:
                 await message.reply(
-                    "Ask me something -- the server, a Viking, or a medal.",
+                    EMPTY_QUESTION_REPLY,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except Exception as exc:
@@ -1323,21 +1362,23 @@ def run_bot():
             log(f"build_context failed: {exc!r}", "error")
             context = "Context is unavailable right now; answer briefly that live data could not be read."
 
-        ok, answer = await asyncio.to_thread(call_ai_sync, question, context)
+        ok, answer, english_mode = await asyncio.to_thread(call_ai_sync, question, context)
         if not ok:
             log(f"AI call failed: {answer}", "error")
             try:
                 await message.reply(
-                    "The well ran dry -- could not reach the oracle just now. Try again shortly.",
+                    AI_FAILURE_REPLY,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except Exception as exc:
                 log(f"failed to send AI-failure notice: {exc!r}", "warning")
             return
 
-        answer = truncate_discord(sanitize_output(answer))
+        answer = sanitize_output(answer)
+        reply_text = answer if english_mode else norse_reply(answer)
+        reply_text = truncate_discord(reply_text)
         try:
-            await message.reply(answer, allowed_mentions=discord.AllowedMentions.none())
+            await message.reply(reply_text, allowed_mentions=discord.AllowedMentions.none())
         except Exception as exc:
             log(f"failed to send reply: {exc!r}", "error")
 
@@ -1360,7 +1401,7 @@ def cmd_selftest():
 
 def cmd_ask(question):
     context = build_context()
-    ok, answer = call_ai_sync(question, context)
+    ok, answer, english_mode = call_ai_sync(question, context)
     if not ok:
         print(f"AI call did not succeed: {answer}", file=sys.stderr)
         low = (answer or "").lower()
@@ -1371,7 +1412,8 @@ def cmd_ask(question):
         elif "content_filter" in low or "jailbreak" in low:
             print("(Azure content safety refused this prompt -- not a bug)", file=sys.stderr)
         sys.exit(1)
-    print(sanitize_output(answer))
+    answer = sanitize_output(answer)
+    print(answer if english_mode else norse_reply(answer))
 
 
 def main():
