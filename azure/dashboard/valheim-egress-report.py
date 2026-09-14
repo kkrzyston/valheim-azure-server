@@ -40,6 +40,17 @@ Inputs (all read-only, none modified):
                                                     genuinely budget-limited, one demand-limited
                                                     -- and check the verdict comes out right.
 
+READ THIS BEFORE TRUSTING A "CONFIRMED". The prior is already shaky, and in an interesting way.
+The 30-day maximum from the per-minute collector data is 276,425 B/s. 4.5 x 61440 = 276,480, and
+276,480 B/s is exactly 270 KiB/s. The observed hard maximum is within 55 bytes -- 0.02% -- of a
+round 270 KiB/s. That is not what n x 61440 looks like for the three players who were online; it
+is what a single GLOBAL cap looks like. If the real limit is one server-wide 270 KiB/s budget
+rather than a per-peer one, the per-peer hypothesis is wrong even though every plateau graph will
+look identical. R2 is the test that separates them: a global cap produces a plateau that does NOT
+scale with player count, and R2 fires. Run with several distinct player counts before concluding
+anything, and treat --budget as the parameter it is rather than as a known constant -- 61440 is a
+figure from an older build, and this server runs l-1.0.12.
+
 A NOTE ON WHAT THE BYTES ARE. nftables counters at the filter hooks count what the kernel sees at
 layer 3: IP header + UDP header + payload, 28 bytes of header per packet. They do NOT include the
 14-byte Ethernet header. So --hdr defaults to 28, not the 42 you would use against a NIC counter.
