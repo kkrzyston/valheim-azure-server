@@ -321,6 +321,14 @@ def count_new_save_windows(unit, cursor):
     except Exception as e:
         return 0, cursor, f"exec:{e!r}"
     if p.returncode != 0:
+        # journalctl --show-cursor exits 1 (not 0), with BOTH stdout and stderr empty, when the
+        # filter matched nothing at all -- observed with `--since "5 minutes ago"` on a quiet
+        # journal. That is "zero new save windows", not a failure: a real failure (bad unit name,
+        # a corrupt journal) always produces stderr text. Treating the silent case as an error
+        # would spam a warning every JOURNAL_POLL_SEC on a quiet server, which is exactly the
+        # kind of noise that trains an operator to stop reading the log.
+        if p.returncode == 1 and not p.stdout and not p.stderr:
+            return 0, cursor, None
         return 0, cursor, f"exit{p.returncode}: {(p.stderr or '').strip()[:200]}"
     lines = p.stdout.splitlines()
     new_cursor = cursor
@@ -637,8 +645,8 @@ def selftest(keep=False):
         print("journal cursor parsing")
 
         class FakeCompleted:
-            def __init__(self, out, rc=0):
-                self.stdout, self.returncode, self.stderr = out, rc, ""
+            def __init__(self, out, rc=0, err=""):
+                self.stdout, self.returncode, self.stderr = out, rc, err
 
         import unittest.mock as mock
         with mock.patch("subprocess.run", return_value=FakeCompleted(
@@ -650,11 +658,20 @@ def selftest(keep=False):
             check("counts exactly one PrepareSave line", n == 1, n)
             check("captures the trailing cursor", cur == "s=abc;i=42", cur)
             check("no error on a clean run", err is None)
-        with mock.patch("subprocess.run", return_value=FakeCompleted("", rc=1)):
+        with mock.patch("subprocess.run", return_value=FakeCompleted("", rc=1, err="No journal files were found.")):
             n, cur, err = count_new_save_windows("valheim.service", "s=old")
             check("a journalctl failure is reported, not swallowed as zero-with-no-error",
                   n == 0 and err is not None, (n, err))
             check("cursor is unchanged on failure", cur == "s=old")
+        with mock.patch("subprocess.run", return_value=FakeCompleted("", rc=1, err="")):
+            # Observed on the VM: journalctl --show-cursor exits 1 with BOTH stdout and stderr
+            # empty when the filter (e.g. `--since "5 minutes ago"`) matched nothing at all. That
+            # is "zero new save windows", not a failure -- see count_new_save_windows's own
+            # comment. Getting this wrong means a warning every 30s on a quiet journal.
+            n, cur, err = count_new_save_windows("valheim.service", "s=old")
+            check("rc=1 with empty stdout AND stderr is 'nothing matched', not an error",
+                  n == 0 and err is None, (n, err))
+            check("cursor is preserved (nothing to advance it to)", cur == "s=old")
         with mock.patch("subprocess.run", return_value=FakeCompleted(
                 "PrepareSave: ZDOExtraData.PrepareSave done [151ms]\n"
                 "PrepareSave: ZDOExtraData.PrepareSave done [149ms]\n"
