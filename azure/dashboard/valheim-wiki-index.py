@@ -584,6 +584,162 @@ def _rank_by_title_priority(rows, original_terms):
     return sorted(rows, key=lambda row: 0 if has_title_hit(row) else 1)
 
 
+# ---------------------------------------------------------------- relevance floor (W6 follow-up)
+# Third live-index incident: a question with NOTHING to do with game knowledge ("who is online
+# right now" -- a live server-status question the bot answers from Discord/API data, never from
+# the wiki) still ran wiki retrieval and injected irrelevant pages, because two of its words
+# ("right", "now") happen to collide with real wiki vocabulary (Mistlands dungeon-piece titles
+# like "Dvergr Spiral Right Stair"). search() had no notion of "nothing here is actually
+# relevant" -- it returned the top k by raw bm25 no matter how weak the best candidate was. Per
+# this module's own standing design principle (an honest [] beats a confidently-served pile of
+# noise -- see _sections_materially_differ()'s docstring and the SYNONYM_GROUPS "spawn" removal
+# above for two earlier instances of the same principle), the fix is a relevance floor: if even
+# the BEST candidate in the pool is too weak to plausibly be about the question, skip curated
+# boost and title-priority entirely and return [] -- the same well-handled "no game knowledge"
+# outcome _build_match_expression's own None return already produces for an unusable query.
+#
+# Why a RELATIVE measure, not a raw bm25 cutoff: bm25 magnitude scales with how many of a query's
+# OR'd terms actually appear in a document and how rare each one is -- neither is comparable
+# across queries of different lengths. A 7-term query ("how do I craft a Bronze Sword", expanded
+# by ALIASES/_SYNONYM_GROUPS to 7 terms) that matches strongly on most of them produces a raw
+# score several times larger in magnitude than a 1-term query ("Blueberries") matching a single
+# rare title -- even though both are equally good answers. A flat cutoff tuned to admit the first
+# would trivially admit almost anything; one tuned to require the second's magnitude would reject
+# the first. The fix used here: normalize the best row's raw bm25 by MATCHED_TERM_COUNT -- not
+# the total number of OR'd terms fed to MATCH, but only the terms from that count that actually
+# appear (case-insensitively, via the same _TOKEN_RE used everywhere else in this module) in the
+# winning row's title/heading/text. This -- not dividing by the raw OR-term count -- was chosen
+# after measuring both against a real (temporary) FTS5 index: dividing by the total OR-term count
+# badly under-scores a real match whose query also contains OR'd terms that can never match
+# anything (worst case: "hvat er heilsa Boar" -- 3 of its 4 OR'd terms are Old Norse words that
+# exist nowhere in an English-language wiki, so they can never contribute, and diluting by them
+# anyway made this genuinely-good, already-shipped query's normalized score look weaker than an
+# actual noise query). Dividing by MATCHED terms instead means a query's own untranslatable/
+# irrelevant filler terms never drag down a real hit's score, while a noise query's few
+# coincidentally-matching common words are still judged on their own (weak) merits.
+#
+# Measurement (the ~66-record fixture in cmd_selftest()'s own "relevance floor" block: the
+# module's own real curated Boar/Bonemass/Blueberries/Bronze-Sword text, live Fenring/Troll fandom
+# text, ~56 unrelated "background" Valheim mechanic/building/biome pages so common English words
+# like "right"/"up"/"now"/"players"/"time" get realistic, spread-out corpus frequency instead of
+# the 1-2-document concentration a tiny fixture would otherwise give them, PLUS the literal
+# reported decoys -- "Dvergr Spiral Right Stair"/"Staircase Right"/"Left Stair"/"Staircase Left"):
+#   - Every one of the 9 required-to-keep-working queries normalized to -4.17 or stronger
+#     (weakest: "Bonemass weakness" at -4.17; strongest: "Blueberries" at -7.46, a single rare,
+#     unambiguous title term).
+#   - The literal reported failure, "who is online right now", normalized to -2.17 (its best
+#     coincidental hit: "now" alone, in an unrelated "Elder" boss-overview page) -- clearly on the
+#     weak side of every real query above.
+#   - "how many players are on" (-1.65), "is the server up" (-1.79), "what time is it" (-2.75),
+#     and "when did the server restart" (-3.57) all likewise land below every real query's floor
+#     in this fixture -- closer to it than the primary reported failure, but still separated.
+#   - _RELEVANCE_FLOOR_PER_TERM is set at -3.8: clear of the weakest REAL query (-4.17, a 0.37
+#     margin) and clear of the strongest NOISE query (-3.57, a 0.23 margin) -- deliberately NOT
+#     centered between them, per this task's own instruction to err toward keeping results: a
+#     false negative (dropping a good match) silently removes the corpus from an answer it should
+#     have informed and is much harder to notice than a false positive, so the larger half of the
+#     gap is spent protecting the real queries, not chasing extra margin on the noise side.
+#
+# This measurement went through two fixture iterations before landing here, and that history is
+# itself part of the evidence for the confidence caveat below: an earlier ~75-record fixture with
+# very slightly different background wording (a "Portal" page happening to contain both "right"
+# and a stray "online"-adjacent word, rather than "now" alone in "Elder") measured "who is online
+# right now" at a WEAKER -1.13 and "when did the server restart" at a STRONGER -3.71 -- close
+# enough to the required-query floor in that version that -2.0 was the conservative choice there,
+# and this fixture's own numbers (-2.17 / -3.57) would have been misjudged by that older constant
+# (confirmed directly: -2.0 fails to reject "who is online right now" against the CURRENT fixture,
+# per cmd_selftest()'s own regression test for the literal failure). Nothing about which specific
+# decoy wins is meant to be load-bearing; the point is that a wording change this small moved the
+# measured numbers enough to flip which threshold is safe, which is exactly the small-fixture IDF
+# hypersensitivity this task's brief warned about, demonstrated here on a ~66-70 record fixture,
+# not just the smaller ones this module was burned by twice before (_SYNONYM_GROUPS' "spawn"
+# removal and _rank_by_title_priority above).
+#
+# Confidence this generalizes to the real ~5,911-section index: LOW-TO-MODERATE, explicitly not
+# high, precisely because of the fixture-to-fixture drift just described. A ~66-record fixture's
+# IDF ratios should be closer to real-index behavior than this module's much smaller prior
+# fixtures (a handful of records each), but 66 sections is ~1.1% of the real index's size, the
+# specific per-query numbers already moved noticeably between two fixtures of similar scale, and
+# there is no way to rule out the real index moving them again. -3.8 is chosen with a margin on
+# BOTH sides specifically so it survives being somewhat wrong in either direction, but "somewhat"
+# is doing real work in that sentence: the margin on the strongest-noise side (0.23) is thin. What
+# would confirm or correct it: after deploy, run the 9 required queries AND the 5 server-status
+# queries above against the real index directly (bypassing Discord) and log each one's best-row
+# raw bm25 alongside whether search() returned [] -- if any real required query's normalized
+# score comes in under roughly -4.2 (eroding the good-side margin) or any noise query comes in
+# over roughly -3.6 (eroding the bad-side margin), -3.8 should be revisited rather than left in
+# place on the strength of this fixture alone.
+_RELEVANCE_FLOOR_PER_TERM = -3.8
+
+# BM25's idf term is driven by a WORD'S SHARE of the corpus (document frequency / total document
+# count), not by the absolute document count -- but the "+0.5" smoothing terms in the standard idf
+# formula only become negligible once the corpus has enough documents that they do; on a handful
+# of documents they dominate, so nearly every word looks unnaturally "common" or "rare" depending
+# on which side of one or two documents it happens to fall on. Concretely: this module's OWN
+# smaller selftest fixtures below (4, 7, and 11 real records respectively, built to cheaply
+# exercise ONE specific mechanism each -- curated-boost, the health/hp vocabulary gap,
+# title-priority -- not to be realistic retrieval corpora) produce bm25 magnitudes on totally
+# different, incomparable scales from the ~66-record measurement fixture _RELEVANCE_FLOOR_PER_TERM
+# was tuned against, and applying that threshold to them directly flipped which record won
+# multiple already-shipped, live-verified assertions -- not because the floor was catching real
+# noise, but because adding even ~30 unrelated background records to make those tiny fixtures
+# "big enough" measurably shifted every term's idf and, with it, which decoy beat which real
+# record (confirmed directly while building this fix: see the git history of this comment).
+# Rather than percolate a filler-record dependency through every existing (and future) small
+# fixture in this file, the floor itself refuses to engage below a minimum corpus size -- this
+# also protects a genuinely small/partial PRODUCTION index (e.g. mid-crawl, or a fresh deployment
+# before the first full refresh has run) from rejecting real matches purely as a side effect of
+# not having enough documents yet, which would be wrong regardless of any test. The real index
+# (~5,911 sections) is always far above this; only synthetic/partial corpora ever see the floor
+# skipped. See cmd_selftest()'s own relevance-floor block for the dedicated, realistically-sized
+# fixture (deliberately built above this minimum) that exercises the floor itself.
+_RELEVANCE_FLOOR_MIN_CORPUS_ROWS = 50
+
+
+def _match_terms(original_terms):
+    """Return the same lowercased term list _build_match_expression() feeds to FTS5 as OR'd
+    literals (after alias/synonym expansion, stopword-stripping, and the _MAX_TERMS/
+    _MAX_TERM_CHARS caps) -- WITHOUT the FTS5 quoting step, since callers here only need the
+    plain words to check token membership, not a MATCH-safe string. Kept as a separate,
+    independently-callable function rather than threaded through _build_match_expression()'s own
+    return value, for the same reason _search_impl() already recomputes `original_terms` instead
+    of relying on a shared side channel: _build_match_expression()'s public contract (a MATCH
+    expression string or None) stays exactly what every existing caller/test expects, and this
+    cheap, pure re-derivation cannot drift from it since it calls the exact same helpers in the
+    exact same order. Never raises; returns [] for [] input, mirroring _strip_stopwords()/
+    _expand_synonyms()'s own plain-list-in/out contract."""
+    if not original_terms:
+        return []
+    terms = _strip_stopwords(_expand_synonyms(original_terms))
+    return [t[:_MAX_TERM_CHARS] for t in terms[:_MAX_TERMS] if t]
+
+
+def _relevance_floor_ok(top_row, terms, total_rows):
+    """Return True if `top_row` -- the single best (most negative) raw-bm25 row in the candidate
+    pool, taken BEFORE curated-boost/title-priority reordering (see the module comment above
+    _RELEVANCE_FLOOR_PER_TERM for why it must be the pool's best, not whichever row eventually
+    wins re-ranking) -- clears the relevance floor, OR `total_rows` (the corpus's total section
+    count) is below _RELEVANCE_FLOOR_MIN_CORPUS_ROWS, in which case the floor does not apply at
+    all (see that constant's own comment) and this always returns True. `terms` is the plain word
+    list from _match_terms(); normalization divides the row's raw bm25 by how many of those terms
+    actually appear (case-insensitively) in the row's own title/heading/text, never by the total
+    number of OR'd terms the query produced (see the module comment for the measured reason).
+
+    Deliberately has no internal try/except: this is pure, in-memory arithmetic over data
+    _search_impl already validated by fetching it from the database, so a failure here can only
+    mean a genuine bug in this function -- which should surface (and, via search()'s own
+    try/except, still degrade to the module's standard no-raise [] contract, logged per H1) rather
+    than being silently swallowed a second time and masked as an ordinary low-relevance result."""
+    if total_rows < _RELEVANCE_FLOOR_MIN_CORPUS_ROWS:
+        return True
+    raw_score = top_row[-1]
+    blob = " ".join([top_row[0] or "", top_row[1] or "", top_row[2] or ""]).lower()
+    blob_tokens = set(_TOKEN_RE.findall(blob))
+    matched = sum(1 for t in terms if t.lower() in blob_tokens)
+    denom = matched if matched > 0 else 1
+    return (raw_score / denom) <= _RELEVANCE_FLOOR_PER_TERM
+
+
 def _search_impl(query, k, max_chars):
     if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
         k = 3
@@ -618,6 +774,20 @@ def _search_impl(query, k, max_chars):
         rows = conn.execute(
             sql, (weight_title, weight_heading, weight_text, match_expr, candidate_limit)
         ).fetchall()
+
+        # Relevance floor (see the module comment above _RELEVANCE_FLOOR_PER_TERM): evaluated
+        # against rows[0] -- the single best RAW bm25 row in the whole pool, since SQL already
+        # sorted ascending by rank -- BEFORE curated-boost/title-priority get a chance to reorder
+        # anything. If even the best raw candidate is too weak to plausibly be about this
+        # question, neither re-ranker is run at all; this is the same honest [] outcome
+        # _build_match_expression's own None already produces for an unusable query, not a
+        # degraded/partial result. Skipped entirely (via _relevance_floor_ok's own
+        # total_rows < _RELEVANCE_FLOOR_MIN_CORPUS_ROWS check) on a small/partial corpus, where
+        # bm25 magnitudes are not meaningful enough to gate on -- see that constant's comment.
+        if rows:
+            total_rows = conn.execute("SELECT count(*) FROM sections").fetchone()[0]
+            if not _relevance_floor_ok(rows[0], _match_terms(original_terms), total_rows):
+                return []
 
     rows = _rank_with_curated_boost(rows)
     rows = _rank_by_title_priority(rows, original_terms)[:k]
@@ -981,6 +1151,104 @@ def build_index(records_path=None, db_path=None):
         "skipped_unparseable": skipped,
         "sections_kept": len(kept),
     }
+
+
+def _relevance_floor_filler_records(base_revid):
+    """Purely-background, test-only wiki-shaped records used to give the smaller e2e selftest
+    fixtures below a corpus SIZE the relevance floor (_RELEVANCE_FLOOR_PER_TERM) can produce
+    meaningful bm25 magnitudes against. This is a completely separate concern from whatever a
+    given e2e block is actually testing (curated-boost, title-priority, vocabulary/synonym
+    gaps, ...): those mechanisms were already correct before the floor existed, but bm25 on a
+    handful-of-documents fixture (N=4, N=7, ...) makes essentially every word look "common" --
+    the *ratio* of documents containing a term to total documents is what drives idf, and in a
+    4-document corpus even a genuinely rare entity term is trivially 25%+ of the corpus -- so the
+    floor, tuned against a realistically-sized measurement fixture (see the module comment above
+    _RELEVANCE_FLOOR_PER_TERM), would otherwise reject perfectly good matches in these tiny
+    fixtures purely as an artifact of their size, not because anything about the underlying
+    mechanism being tested is wrong. Splicing ~30 unrelated background records into each fixture
+    fixes the artifact without changing what any existing assertion checks for.
+
+    Deliberately avoids every term any selftest query below tokenizes to (boar, bonemass, weak/
+    weakness, stamina, blueberries, health/hp/hitpoints, star, level, fenring, resistant/
+    resistance, troll, drops/drop/loot, greydwarf(s), spawn, found, location, players, online,
+    today, serpent) so it can never change which record wins any existing assertion -- it only
+    adds unrelated competition for corpus-scale purposes. `base_revid` keeps its revids from
+    colliding with a fixture's own real records."""
+    topics = [
+        ("Workbench", "Overview", "A Workbench is required before crafting most early tools, "
+         "and any nearby piece within its radius benefits from the crafting area it provides."),
+        ("Forge", "Overview", "A Forge lets a smith work metal into tools and weapons, and "
+         "several upgrades can be built alongside it to raise its overall crafting level."),
+        ("Smelter", "Overview", "A Smelter converts raw ore into metal bars over time, and needs "
+         "fuel loaded regularly to keep running without interruption."),
+        ("Charcoal Kiln", "Overview", "A Charcoal Kiln converts wood into fuel for other "
+         "stations, and produces a byproduct that can be collected once cooled."),
+        ("Longship", "Overview", "A Longship is a large ocean-capable vessel with room for "
+         "cargo, built at a shipwright's bench once the right materials are gathered."),
+        ("Karve", "Overview", "A Karve is a mid-tier boat, quicker than a simple raft and "
+         "sturdier in open water, though smaller than the largest vessels."),
+        ("Raft", "Overview", "A Raft is the simplest vessel available, assembled from basic "
+         "materials and best suited to calm, sheltered water."),
+        ("Portal", "Overview", "A Portal links two fixed points together once both are given a "
+         "matching tag, letting a traveler move between them instantly."),
+        ("Portal Room", "Building", "A Portal Room is a small enclosure built around a portal to "
+         "keep it dry and give visiting travelers a place to arrive."),
+        ("Longhouse", "Building", "A Longhouse is a larger communal hall, often the centerpiece "
+         "of a settlement once enough materials have been gathered."),
+        ("Stone Foundation", "Building Piece", "A Stone Foundation piece provides a solid base "
+         "for a structure on uneven terrain, keeping upper floors level."),
+        ("Roof Shingles", "Building Piece", "Roof Shingles cap an angled roof section, and come "
+         "in several material variants to match a structure's style."),
+        ("Iron Gate", "Building Piece", "An Iron Gate can be opened or closed at an entrance, "
+         "often paired with a nearby lever for quick access."),
+        ("Lever", "Mechanism", "A Lever toggles a linked mechanism, such as a gate or a swinging "
+         "door, when pulled by a nearby traveler."),
+        ("Hoe", "Tool", "A Hoe reshapes terrain by raising or lowering the ground, letting a "
+         "builder flatten an area before construction begins."),
+        ("Cultivator", "Tool", "A Cultivator plants seeds on cleared ground and can also clear "
+         "small patches of brush before planting."),
+        ("Pickaxe", "Tool", "A Pickaxe breaks rock and mines ore from deposits, with sturdier "
+         "variants breaking harder material more quickly."),
+        ("Stonecutter", "Tool", "A Stonecutter enables stone-based construction once placed "
+         "alongside an existing crafting station."),
+        ("Cart", "Tool", "A Cart can be towed behind a traveler to haul heavy cargo overland, "
+         "though steep terrain can tip it over."),
+        ("Tankard", "Item", "A Tankard is a decorative furnishing that can be hung on a wall or "
+         "set on a table inside a finished hall."),
+        ("Fishing Rod", "Tool", "A Fishing Rod is cast from a dock or shoreline to catch fish, "
+         "reeling the line in once something bites."),
+        ("Beehive", "Structure", "A Beehive produces a sweet byproduct over time once placed "
+         "outdoors, as long as it remains covered from rain."),
+        ("Cauldron", "Structure", "A Cauldron enables more complex recipes at a base, and pairs "
+         "well with other nearby cooking stations."),
+        ("Ward", "Structure", "A Ward protects a settlement within its placement radius once "
+         "activated, keeping the area safe from unwanted visitors."),
+        ("Chest", "Storage", "A Chest stores a traveler's belongings at a fixed spot, with "
+         "larger variants built from higher material tiers."),
+        ("Rune Stone", "Lore", "A Rune Stone displays a short message when read, drawn from a "
+         "pool of lore text tied to the surrounding region."),
+        ("Vegvisir", "Lore", "A Vegvisir shard reveals a marked location on the map once read, "
+         "guiding a traveler toward a significant landmark."),
+        ("Crypt", "Dungeon", "A Crypt is a sealed underground chamber, opened with a key carried "
+         "from elsewhere and explored through narrow tunnels."),
+        ("Frost Cave", "Dungeon", "A Frost Cave is an icy underground chamber, home to "
+         "creatures suited to the cold and often connected by narrow passages."),
+        ("World Generation", "Mechanic", "World generation lays out the map's terrain and "
+         "regions from a starting seed, persisting any changes a traveler makes."),
+        ("Sailing", "Mechanic", "Sailing speed changes with wind direction, and turning a sail "
+         "relative to the wind can speed up or slow down a vessel."),
+        ("Parry", "Mechanic", "A well-timed parry staggers most attackers, opening a brief "
+         "window for a follow-up strike."),
+        ("Blocking", "Mechanic", "Blocking an incoming attack reduces the damage taken, though a "
+         "heavy strike can still stagger the defender."),
+    ]
+    return [
+        {"title": title, "heading": heading, "text": text, "source": "fandom",
+         "revid": base_revid + i,
+         "url": f"https://example.invalid/fandom/{title.lower().replace(' ', '-')}",
+         "timestamp": ""}
+        for i, (title, heading, text) in enumerate(topics)
+    ]
 
 
 # ---------------------------------------------------------------- selftest (stdlib-only, no network)
@@ -1841,6 +2109,282 @@ def cmd_selftest():
                   f"empty result must stay silent: result={honest_empty!r} "
                   f"logged={buf3.getvalue()!r}")
             all_ok = all_ok and honest_empty_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
+
+    print("\n--- relevance floor: THE LIVE FAILURE -- 'who is online right now' server-status "
+          "noise, honest [] ---")
+    # Third live-index incident (see the module comment above _RELEVANCE_FLOOR_PER_TERM): a
+    # question about the SERVER -- nothing to do with game knowledge -- still ran wiki retrieval
+    # and injected irrelevant pages, because two of its words ("right", "now") happen to collide
+    # with real wiki vocabulary. Reproduced here with decoys deliberately close to the real
+    # reported match ("Dvergr Spiral Right Stair, Dvergr Spiral Staircase Right, Dvergr spiral
+    # right stair").
+    #
+    # This fixture is deliberately much larger (~68 records, a genuine unrelated-background
+    # majority) than this module's other e2e fixtures above -- specifically so the relevance
+    # floor, which needs a corpus large enough for bm25/idf to be meaningful
+    # (_RELEVANCE_FLOOR_MIN_CORPUS_ROWS), actually engages here, unlike in those smaller,
+    # single-mechanism fixtures. It is the same fixture (same records, same measured numbers)
+    # this fix's own threshold was derived from -- see the module comment above
+    # _RELEVANCE_FLOOR_PER_TERM for the full measurement writeup and its confidence caveat.
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-relevance-floor-") as tmp_dir:
+        records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+        floor_db = os.path.join(tmp_dir, "wiki.db")
+        floor_records = [
+            # Real curated text, verbatim from valheim-curated-numbers.jsonl.
+            {"title": "Bonemass", "heading": "Curated: Boss Stats",
+             "text": "Bonemass (3rd boss, altar in the Swamp, summoned with 10x Withered bone): "
+                     "5000 HP. Area-of-effect poison vomit: 130 Poison damage in a 9m radius, "
+                     "15s duration, 30s cooldown, usable within 15m. Punch attack: 80 Blunt + 50 "
+                     "Poison + 1000 Chop + 1000 Pickaxe damage, ~7s cooldown. Throw attack: ~50s "
+                     "cooldown. Weak to Blunt and Frost; resistant to Slash; very resistant to "
+                     "Fire and Pierce; immune to Poison and Stagger.",
+             "source": "curated", "revid": 51492,
+             "url": "https://valheim.fandom.com/wiki/Bonemass", "timestamp": ""},
+            {"title": "Boar", "heading": "Curated: Creature Stats",
+             "text": "Boar (Meadows, tameable): HP by star level -- 0-star: 10, 1-star: 20, "
+                     "2-star: 30. Attack damage by star level -- 0-star: 10 Blunt, 1-star: 15 "
+                     "Blunt, 2-star: 20 Blunt (attack usable every 5s). Stagger threshold: 50%. "
+                     "Immune to Spirit damage.",
+             "source": "curated", "revid": 51440,
+             "url": "https://valheim.fandom.com/wiki/Boar", "timestamp": ""},
+            {"title": "Blueberries", "heading": "Curated: Food Stats",
+             "text": "Blueberries (raw food item, found on Blueberry bushes in the Black "
+                     "Forest): 8 health, 25 stamina, 600s duration, 1 hp/tick healing.",
+             "source": "curated", "revid": 45067,
+             "url": "https://valheim.fandom.com/wiki/Blueberries", "timestamp": ""},
+            {"title": "Bronze Sword", "heading": "Curated: Crafting & Upgrade Stats",
+             "text": "Bronze Sword (one-handed sword, crafted and upgraded at a Forge starting "
+                     "at Forge level 1): Slash damage by quality level -- Q1: 35, Q2: 41, Q3: "
+                     "47, Q4: 53. Durability by quality level -- Q1: 200, Q2: 250, Q3: 300, Q4: "
+                     "350.",
+             "source": "curated", "revid": 47747,
+             "url": "https://valheim.fandom.com/wiki/Bronze_Sword", "timestamp": ""},
+            {"title": "Fenring", "heading": "Weaknesses",
+             "text": "Fenring is weak to fire and pierce damage. It is resistant to blunt "
+                     "attacks.",
+             "source": "fandom", "revid": 2001,
+             "url": "https://example.invalid/fandom/fenring", "timestamp": ""},
+            {"title": "Troll", "heading": "Drops",
+             "text": "Troll drops Troll Hide and Coins. A 2-star Troll has a higher drop "
+                     "chance.",
+             "source": "fandom", "revid": 3001,
+             "url": "https://example.invalid/fandom/troll", "timestamp": ""},
+            # THE LITERAL LIVE FAILURE: near-duplicate Mistlands dungeon-piece titles, all
+            # sharing "right" with the query "who is online right now".
+            {"title": "Dvergr Spiral Right Stair", "heading": "Building Piece",
+             "text": "The Dvergr Spiral Right Stair is a dungeon building piece found in "
+                     "Mistlands Dvergr structures. It connects a lower floor to the one above "
+                     "via a right-turning spiral.",
+             "source": "fandom", "revid": 9001,
+             "url": "https://example.invalid/fandom/dvergr-spiral-right-stair", "timestamp": ""},
+            {"title": "Dvergr Spiral Staircase Right", "heading": "Building Piece",
+             "text": "The Dvergr Spiral Staircase Right piece is used to generate Dvergr ruins "
+                     "in the Mistlands, spiraling upward to the right.",
+             "source": "fandom", "revid": 9002,
+             "url": "https://example.invalid/fandom/dvergr-spiral-staircase-right",
+             "timestamp": ""},
+            {"title": "Dvergr Spiral Left Stair", "heading": "Building Piece",
+             "text": "The Dvergr Spiral Left Stair mirrors the right-hand variant, spiraling "
+                     "upward to the left instead.",
+             "source": "fandom", "revid": 9003,
+             "url": "https://example.invalid/fandom/dvergr-spiral-left-stair", "timestamp": ""},
+            {"title": "Dvergr Spiral Staircase Left", "heading": "Building Piece",
+             "text": "The Dvergr Spiral Staircase Left piece spirals upward to the left, "
+                     "mirroring the right variant used elsewhere in the same ruin.",
+             "source": "fandom", "revid": 9004,
+             "url": "https://example.invalid/fandom/dvergr-spiral-staircase-left",
+             "timestamp": ""},
+        ]
+        # ~60 unrelated background pages so ordinary English words ("right"/"up"/"now"/
+        # "players"/"time") get realistic, spread-out corpus frequency instead of the
+        # 1-2-document concentration a tiny fixture would otherwise give them -- the same
+        # measurement fixture referenced in the module comment above _RELEVANCE_FLOOR_PER_TERM.
+        background_topics = [
+            ("Greydwarf", "Overview", "The Greydwarf is a creature found in the Black Forest "
+             "biome, near Greydwarf nests. It attacks in groups and can now be seen fleeing at "
+             "low health."),
+            ("Greyling", "Overview", "The Greyling is a relative of the Greydwarf, found right "
+             "at the edge of the Meadows and Black Forest border."),
+            ("Eikthyr", "Overview", "Eikthyr is the first boss, found by praying at his altar. "
+             "Right before summoning, players should gear up with a good bow."),
+            ("Elder", "Overview", "The Elder is the second boss. It is now considered easier "
+             "once players bring fire arrows."),
+            ("Moder", "Overview", "Moder is the fourth boss, found high up in the Mountains "
+             "biome. She will now flee to the air when her health drops low."),
+            ("Yagluth", "Overview", "Yagluth is the fifth boss, summoned in the Plains. Right "
+             "up until the final phase he stays mostly stationary."),
+            ("Seeker Queen", "Overview", "The Seeker Queen is the sixth boss, found deep in the "
+             "Mistlands. She digs up from underground right beneath the player."),
+            ("Portal", "Overview", "A Portal lets players travel instantly between two linked "
+             "portals. Right now, portals cannot transport ore or metal."),
+            ("Workbench", "Overview", "A Workbench is required to craft most early items. "
+             "Building up walls around it keeps the crafting radius active."),
+            ("Forge", "Overview", "A Forge is used to craft and upgrade metal tools and "
+             "weapons. Right next to it, a Smelter is often placed."),
+            ("Smelter", "Overview", "A Smelter turns ore into metal bars. It must be built "
+             "right next to a Charcoal Kiln for fuel access, and refuels over time."),
+            ("Charcoal Kiln", "Overview", "A Charcoal Kiln converts wood into coal over time. "
+             "Keep it topped up so it does not run out mid-smelt."),
+            ("Longship", "Overview", "The Longship is the best boat available. Right now it "
+             "can carry a full inventory and cross open ocean safely."),
+            ("Karve", "Overview", "The Karve is an early boat, faster to build than the "
+             "Longship, and can now tow a small raft."),
+            ("Raft", "Overview", "The Raft is the first boat available. It is slow and can tip "
+             "over if loaded up too much on one side."),
+            ("Portal Room", "Building", "A Portal Room is a small structure built up around a "
+             "Portal to protect it and keep it dry and safe from raids."),
+            ("Longhouse", "Building", "A Longhouse is a larger hall players build up over time "
+             "as their base grows, right in the center of a settlement."),
+            ("Stone Foundation", "Building Piece", "Stone Foundation pieces let players build "
+             "up from uneven ground, right where wood beams would otherwise sag."),
+            ("Roof Shingles", "Building Piece", "Roof Shingles finish a roof's angled top. "
+             "Right now they come in several wood and stone variants."),
+            ("Iron Gate", "Building Piece", "An Iron Gate can now be raised and lowered right "
+             "at a base's entrance using a nearby lever."),
+            ("Lever", "Mechanism", "A Lever, right when pulled, toggles a linked mechanism such "
+             "as a gate, up or down."),
+            ("Swamp", "Overview", "The Swamp is a biome right after the Black Forest in "
+             "progression. Water levels rise up during rain."),
+            ("Mountains", "Overview", "The Mountains biome is right after the Swamp in "
+             "progression. Frost Caves are found here, high up above the snowline."),
+            ("Plains", "Overview", "The Plains biome opens up right after the Mountains, "
+             "especially dangerous right at night."),
+            ("Mistlands", "Overview", "The Mistlands biome is shrouded right up to a player's "
+             "own feet in thick fog, and opens up after the Plains."),
+            ("Ashlands", "Overview", "The Ashlands biome is a later addition right at the edge "
+             "of the map, with lava flows that light up the horizon."),
+            ("Deep North", "Overview", "The Deep North biome sits right past the Ashlands, "
+             "snowed in and largely unfinished as content is built up over future updates."),
+            ("Hoe", "Tool", "A Hoe is used to raise or lower terrain right where a player is "
+             "standing, flattening ground up for building."),
+            ("Cultivator", "Tool", "A Cultivator lets players plant crops right on cleared, "
+             "tilled ground, and can also clear brush up close."),
+            ("Pickaxe", "Tool", "A Pickaxe is used to mine ore and break rock. Right-clicking, "
+             "if bound, can sometimes bring up an alternate swing."),
+            ("Stonecutter", "Tool", "A Stonecutter lets players build up stone structures, "
+             "right alongside a Forge for a full crafting station."),
+            ("Cart", "Tool", "A Cart can be pulled behind a player to haul ore right out of the "
+             "Mountains, though steep slopes can tip it up and over."),
+            ("Tankard", "Item", "A Tankard is a decorative item players can hang right up on a "
+             "wall or set on a table."),
+            ("Fishing Rod", "Tool", "A Fishing Rod lets players catch fish right off a dock or "
+             "shoreline, reeling the line up once a fish bites."),
+            ("Beehive", "Structure", "A Beehive produces honey over time right where it is "
+             "placed, as long as it stays covered and roofed up."),
+            ("Cauldron", "Structure", "A Cauldron is used to cook more complex recipes right at "
+             "a base, and can be leveled up with nearby cooking stations."),
+            ("Ward", "Structure", "A Ward protects a base right around its placement radius, "
+             "keeping it safe from raids once set up and activated."),
+            ("Chest", "Storage", "A Chest stores items right where it is placed, and its "
+             "capacity can be leveled up with better wood and metal tiers."),
+            ("Rune Stone", "Lore", "A Rune Stone can be read right where it stands, and its "
+             "message text is randomly picked up from a lore pool each visit."),
+            ("Sacrificial Stones", "Lore", "The Sacrificial Stones let a player trade a trophy "
+             "right at an altar to reveal the matching boss location, shown up on the map."),
+            ("Vegvisir", "Lore", "A Vegvisir shard reveals a boss location right on the map "
+             "once read, and can be picked up from certain dungeons."),
+            ("Crypt", "Dungeon", "A Crypt is a Black Forest dungeon sealed right behind a "
+             "rune-locked door, opened up with a Swamp Key."),
+            ("Sunken Crypt", "Dungeon", "A Sunken Crypt is a Swamp dungeon, often flooded right "
+             "up to the ceiling in the lower rooms."),
+            ("Burial Chambers", "Dungeon", "Burial Chambers are Meadows/Black Forest dungeons "
+             "right beneath small hills, with narrow tunnels that open up into rooms."),
+            ("Frost Cave", "Dungeon", "A Frost Cave is a Mountains dungeon right inside the "
+             "ice, home to creatures that can show up in groups."),
+            ("Dvergr Camp", "Structure", "A Dvergr Camp is a small Mistlands structure right at "
+             "the surface, distinct from the underground ruins that spiral up nearby."),
+            ("Infested Mine", "Dungeon", "An Infested Mine is a Mistlands dungeon right beneath "
+             "the surface, with Seekers that can dig up through walls."),
+            ("Giant Sealed Tower", "Dungeon", "A Giant Sealed Tower stands right at the "
+             "surface in the Mistlands, with content sealed up for a future update."),
+            ("World Generation", "Mechanic", "Restarting the game reloads the world right from "
+             "its saved seed, and any structures players have built up persist between "
+             "sessions."),
+            ("Multiplayer", "Mechanic", "Valheim supports up to ten players right out of the "
+             "box on a dedicated server, or fewer on a peer-hosted game hosted by one player."),
+            ("Difficulty Settings", "Mechanic", "World modifiers can be set right when a world "
+             "is created, raising or lowering up enemy health and resource drop rates."),
+            ("Sailing", "Mechanic", "Sailing right into the wind is slower; turning the sail up "
+             "or down relative to wind direction changes speed."),
+            ("Building Stability", "Mechanic", "A piece placed right at the edge of another's "
+             "support range may show a stability warning, going from green up through yellow "
+             "to red."),
+            ("Food System", "Mechanic", "Players can have up to three foods active right away "
+             "after eating, each contributing to max health and stamina."),
+            ("Parry", "Mechanic", "A parry right as an attack lands staggers most enemies, "
+             "opening them up for a follow-up hit."),
+            ("Blocking", "Mechanic", "Blocking right before a hit lands reduces incoming "
+             "damage, though heavy attacks can still stagger a player and knock them up into "
+             "the air."),
+        ]
+        floor_records.extend(
+            {"title": title, "heading": heading, "text": text, "source": "fandom",
+             "revid": 10000 + i,
+             "url": f"https://example.invalid/fandom/{title.lower().replace(' ', '-')}",
+             "timestamp": ""}
+            for i, (title, heading, text) in enumerate(background_topics)
+        )
+        with open(records_path, "w", encoding="utf-8") as fh:
+            for rec in floor_records:
+                fh.write(json.dumps(rec) + "\n")
+        build_index(records_path=records_path, db_path=floor_db)
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = floor_db
+            _reset_cache_for_tests()
+
+            def top_source_title3(query):
+                r = search(query, k=1)
+                return (r[0]["source"], r[0]["title"]) if r else None
+
+            good_queries = [
+                ("how much health does a Boar have", ("curated", "Boar")),
+                ("Boar health", ("curated", "Boar")),
+                ("Boar hitpoints", ("curated", "Boar")),
+                ("what is Fenring weak to", ("fandom", "Fenring")),
+                ("Bonemass weakness", ("curated", "Bonemass")),
+                ("what drops from a Troll", ("fandom", "Troll")),
+                ("hvat er heilsa Boar", ("curated", "Boar")),
+                ("Blueberries", ("curated", "Blueberries")),
+                ("how do I craft a Bronze Sword", ("curated", "Bronze Sword")),
+            ]
+            for query, expected in good_queries:
+                got = top_source_title3(query)
+                ok = got == expected
+                print(f"{'PASS' if ok else 'FAIL'} relevance floor does not reject a real match: "
+                      f"{query!r} -> {got!r} (want {expected!r})")
+                all_ok = all_ok and ok
+
+            literal_failure_result = search("who is online right now")
+            literal_failure_ok = literal_failure_result == []
+            print(f"{'PASS' if literal_failure_ok else 'FAIL'} THE LIVE FAILURE: 'who is online "
+                  f"right now' against real Dvergr-stair decoys now returns an honest [] instead "
+                  f"of injecting irrelevant pages: {literal_failure_result!r}")
+            all_ok = all_ok and literal_failure_ok
+
+            # The other 4 server-status queries from the task brief's measurement list. All 4
+            # separate cleanly from every required-good query in THIS fixture (see the module
+            # comment above _RELEVANCE_FLOOR_PER_TERM for the exact per-query numbers and,
+            # importantly, for why that separation is not assumed to be this comfortable on the
+            # real index -- an earlier, slightly different fixture measured these numbers close
+            # enough to the good-query floor that a looser threshold was chosen there instead).
+            clean_reject_queries = [
+                "how many players are on",
+                "is the server up",
+                "what time is it",
+                "when did the server restart",
+            ]
+            for query in clean_reject_queries:
+                got = search(query)
+                ok = got == []
+                print(f"{'PASS' if ok else 'FAIL'} relevance floor rejects a server-status "
+                      f"question with only weak, coincidental corpus matches: {query!r} -> "
+                      f"{got!r}")
+                all_ok = all_ok and ok
         finally:
             DB_PATH_DEFAULT = original_db_path
             _reset_cache_for_tests()
