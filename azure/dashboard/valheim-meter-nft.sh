@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# valheim-meter-nft.sh -- install the `inet valheim_meter` nftables table: two byte/packet
-# counters for game traffic, and a short-lived set of the addresses currently sending to the
-# game port.
+# valheim-meter-nft.sh -- install the `inet valheim_meter` nftables table: byte/packet counters
+# for game traffic (split by port and by address family -- see the ruleset below for why that
+# split is load-bearing rather than fussy), and a short-lived, size-capped set of the addresses
+# currently sending to the game port.
 #
 # This table is the measurement primitive for the egress probe. It exists so that
 # valheim-egress-probe.py can read an exact byte and packet count for game traffic once a
@@ -26,6 +27,8 @@
 # timeout would leave departed players in the set for that whole window, making the check noisy.
 # The collector only needs an address to be present while the player is actively sending, and an
 # active Valheim client sends tens of packets a second, so 2m is generous for that purpose.
+# VALHEIM_PEER_MAX (default 256) caps the set: the game port faces the internet, and an
+# uncapped set is an unbounded kernel allocation driven by anyone who can spoof a source address.
 #
 # SAFETY -- why this cannot change what the server does with a packet:
 #   * Separate table. nftables tables are independent rule sets; `table inet valheim_meter`
@@ -62,6 +65,7 @@ port() {
 GAME_PORT=$(port VALHEIM_GAME_PORT "${VALHEIM_GAME_PORT:-2456}")
 QUERY_PORT=$(port VALHEIM_QUERY_PORT "${VALHEIM_QUERY_PORT:-2457}")
 PEER_TIMEOUT="${VALHEIM_PEER_TIMEOUT:-2m}"
+PEER_MAX=$(port VALHEIM_PEER_MAX "${VALHEIM_PEER_MAX:-256}")
 if ! [[ "$PEER_TIMEOUT" =~ ^[0-9]{1,4}[smh]$ ]]; then
   echo "valheim-meter-nft: VALHEIM_PEER_TIMEOUT=$PEER_TIMEOUT is not an nft timeout (e.g. 30s, 2m, 1h)" >&2
   exit 2
@@ -84,7 +88,7 @@ case "$ACTION" in
     # "present" is not enough -- check that all three objects are actually there before deciding
     # to leave it alone.
     if have=$(nft list table $TABLE 2>/dev/null); then
-      if printf '%s' "$have" | grep -q 'counter game_tx'          && printf '%s' "$have" | grep -q 'counter game_rx'          && printf '%s' "$have" | grep -q 'set peers'; then
+      if printf '%s' "$have" | grep -q 'counter game_tx'          && printf '%s' "$have" | grep -q 'counter game_rx'          && printf '%s' "$have" | grep -q 'counter query_tx'          && printf '%s' "$have" | grep -q 'counter game_tx6'          && printf '%s' "$have" | grep -q 'set peers'; then
         echo "valheim-meter-nft: table $TABLE already present and complete -- left alone (counters not reset)"
         exit 0
       fi
@@ -116,29 +120,53 @@ table $TABLE
 delete table $TABLE
 
 table $TABLE {
+  # SEPARATE COUNTERS PER PORT AND PER ADDRESS FAMILY, because the analysis models exactly one
+  # of them. predicted_ceiling() describes per-peer ZDO traffic on the GAME port only. Folding
+  # the Steam query port into the same counter would let a master-server scrape inflate the
+  # measured side of a comparison whose whole point is whether a measured value sits above a
+  # computed one -- the same reason the header size is 28 and not 42.
   counter game_tx { }
   counter game_rx { }
+  counter query_tx { }
+  counter query_rx { }
+  # And the v4/v6 split is not pedantry. `udp sport` matches both families, but the peer set
+  # below is ipv4_addr and `ip saddr` only ever matches v4 -- so an IPv6 player used to have
+  # their bytes counted while the peer set denied they existed. That desynchronises bytes from
+  # player count in precisely the per-player scaling R2 turns on, and silently drops their ping
+  # from the dashboard. The model now counts v4 only; v6 is counted separately so that it is
+  # VISIBLE rather than silently mixed in, and the probe warns if it is ever non-zero.
+  counter game_tx6 { }
+  counter game_rx6 { }
 
   # Addresses seen sending to the game port within VALHEIM_PEER_TIMEOUT. This replaces the
-  # per-minute tcpdump the collector used to run purely to learn who to ping. Entries expire
-  # on their own, so nothing has to prune them, and the set never grows past the player cap.
-  # The probe also compares the size of this set against its player count, which is how a join
-  # is noticed before status.json catches up -- see the header.
+  # per-minute tcpdump the collector used to run purely to learn who to ping. Entries expire on
+  # their own, so nothing has to prune them.
+  #
+  # `size` is mandatory, not tidiness: this is an INTERNET-FACING port. Without a cap, every
+  # scanner that poked UDP $GAME_PORT once would sit here until it expired, and a spoofed-source
+  # flood would grow the set unbounded in kernel memory. With a cap, the kernel refuses new
+  # elements instead -- the players already in the set keep working, and the collector bounds the
+  # ping fan-out on its own side too.
   set peers {
     type ipv4_addr
     flags timeout
     timeout $PEER_TIMEOUT
+    size $PEER_MAX
   }
 
   chain out {
     type filter hook output priority 300; policy accept;
-    oifname != "lo" udp sport { $GAME_PORT, $QUERY_PORT } counter name game_tx
+    oifname != "lo" meta nfproto ipv4 udp sport $GAME_PORT counter name game_tx
+    oifname != "lo" meta nfproto ipv6 udp sport $GAME_PORT counter name game_tx6
+    oifname != "lo" udp sport $QUERY_PORT counter name query_tx
   }
 
   chain in {
     type filter hook input priority 300; policy accept;
-    iifname != "lo" udp dport { $GAME_PORT, $QUERY_PORT } counter name game_rx
-    iifname != "lo" udp dport $GAME_PORT update @peers { ip saddr }
+    iifname != "lo" meta nfproto ipv4 udp dport $GAME_PORT counter name game_rx
+    iifname != "lo" meta nfproto ipv6 udp dport $GAME_PORT counter name game_rx6
+    iifname != "lo" udp dport $QUERY_PORT counter name query_rx
+    iifname != "lo" meta nfproto ipv4 udp dport $GAME_PORT update @peers { ip saddr }
   }
 }
 NFT
