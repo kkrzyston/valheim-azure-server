@@ -490,9 +490,18 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
         # the answer: it picks non-raid seconds that already have the same egress as the raid, so
         # the two sides are equal by construction whether or not anything is supply-limited.
         # Inbound is client-to-server traffic, which no server-side send budget constrains, so it
-        # is an independent proxy for how much is going on. (The selftest includes a world where
-        # demand and egress genuinely decouple, specifically so that the circular version of this
-        # selection produces the wrong verdict and gets caught.)
+        # is an independent proxy for how much is going on.
+        #
+        # THAT CLAIM IS NOW ACTUALLY TESTED, WHICH IT WAS NOT WHEN IT WAS FIRST MADE. The original
+        # commit asserted that the synthetic fixture had caught the circular version. It had not:
+        # it only caught a half-swapped variant that died on a units mismatch (inbound is ~2 KB/s,
+        # egress ~200 KB/s), which is a scale artifact and not the property at issue. The fully
+        # self-consistent circular version -- target AND filter both on egress -- survived, because
+        # in that fixture inbound and would-be egress were both exact linear functions of the same
+        # per-second demand, so the two selection rules were indistinguishable by construction.
+        # The `circular_trap` world in synth() exists to fix exactly that: demand and egress
+        # genuinely decouple there, matching on inbound gives INCONCLUSIVE (the right answer) and
+        # matching on egress gives CONFIRMED (the wrong one).
         for n in sorted(pl):
             rs = [r for r in pl[n]["all"] if "rxb" in r]
             raid_rows = [r for r in rs if in_raid(r["t"])]
