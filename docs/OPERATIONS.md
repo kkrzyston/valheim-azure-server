@@ -159,6 +159,7 @@ meaningful extra cloud charge.
 | Run collector by hand | `sudo systemctl start valheim-status.service` |
 | Egress probe health | `systemctl status valheim-egress`; `sudo valheim-meter-nft.sh show` — the counters climb while players are online and stand still when nobody is. The probe logs a heartbeat hourly, so if the journal is silent it is not running |
 | Rebuild the meter table | `sudo valheim-meter-nft.sh ensure` (creates it only if missing or incomplete; `install` forces a rebuild and resets the counters) |
+| Check the meter script before deploying it | `bash valheim-meter-nft.sh selftest` — runs the cold and warm paths against a stubbed `nft`, needs no root, and fails if anything writes to stderr or if a backtick or command substitution has crept into a heredoc body |
 | One live egress sample | `sudo valheim-egress-probe.py --once` |
 | Read the egress data | `sudo valheim-egress-report.py` (or `--days 7`) |
 | Web server health | `systemctl status caddy`; `sudo journalctl -u caddy -n 50` |
