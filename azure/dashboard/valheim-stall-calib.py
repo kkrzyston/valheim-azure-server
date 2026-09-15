@@ -58,9 +58,11 @@ every heartbeat log line (never silently discarded, never fabricated/interpolate
 
 Retention: bounded on BOTH age (STALLCALIB_RETAIN_DAYS, default 14) and total on-disk size
 (STALLCALIB_MAX_MB, default 60) -- whole day-files are unlinked, oldest first, whenever either
-bound is exceeded. Enforced on every flush and on startup, so it holds across kill/restart. No
-personal data of any kind is recorded: queue depths, timings and player *counts* only, never
-addresses or player names.
+bound is exceeded. Enforced hourly (not on every flush -- prune() is only called from the
+main-loop hourly timer), and effectively also at startup because that timer's initial state
+guarantees its first firing is immediate. The file actively being appended to this cycle is never
+evicted, even if it alone exceeds the size cap. No personal data of any kind is recorded: queue
+depths, timings and player *counts* only, never addresses or player names.
 
 CPU cost, measured (see PR write-up for the full note): the predecessor one-off ran continuously
 at 10 Hz rq/sq with a 5 Hz-backing-off A2S for ~83 minutes with 0 players online and used ~12s of
@@ -109,6 +111,17 @@ def _env_num(name, default, cast=float):
         return default
 
 
+def _positive(value, name, default):
+    """Domain guard for values that must be > 0 (e.g. a rate used as 1/x). _env_num only catches
+    cast failures, not a syntactically-valid-but-domain-invalid value like 0 or a negative number
+    -- STALLCALIB_SAMPLE_HZ=0 would otherwise divide-by-zero at import time and crash the service
+    before it ever logs anything useful."""
+    if value <= 0:
+        log(f"WARNING: {name}={value:g} must be positive -- falling back to {default:g}.")
+        return default
+    return value
+
+
 STATUS = _env("STALLCALIB_STATUS", "/var/www/valheim/status.json")
 LIB = _env("STALLCALIB_DIR", "/var/lib/valheim-status")
 STATE_PATH_DEFAULT = os.path.join(LIB, "stallcalib-state.json")
@@ -116,8 +129,8 @@ GAME_PORT = _env_num("VALHEIM_GAME_PORT", 2456, int)
 QUERY_PORT = _env_num("VALHEIM_QUERY_PORT", 2457, int)
 VALHEIM_UNIT = _env("STALLCALIB_GAME_UNIT", "valheim.service")
 
-SAMPLE_HZ = _env_num("STALLCALIB_SAMPLE_HZ", 10.0)          # rq/sq rate -- see module docstring
-SAMPLE_PERIOD = 1.0 / SAMPLE_HZ
+SAMPLE_HZ = _positive(_env_num("STALLCALIB_SAMPLE_HZ", 10.0), "STALLCALIB_SAMPLE_HZ", 10.0)
+SAMPLE_PERIOD = 1.0 / SAMPLE_HZ          # rq/sq rate -- see module docstring
 A2S_HZ_START = _env_num("STALLCALIB_A2S_HZ_START", 1.0)     # throttled hard -- rq is the signal
 A2S_HZ_MIN = _env_num("STALLCALIB_A2S_HZ_MIN", 0.2)
 A2S_TIMEOUT = _env_num("STALLCALIB_A2S_TIMEOUT", 0.4)
@@ -267,6 +280,29 @@ def read_status(path, now, max_age=None):
     return n, "", gen
 
 
+def status_transition_message(why, last_why):
+    """The log message for a *change* in read_status()'s 'why', or None if unchanged since the
+    last tick. Isolates the transition-only logging policy (log on change, never spam every tick)
+    so it is unit-testable without capturing stderr. Without this, a genuinely empty server and a
+    broken/stale/corrupt status.json are indistinguishable in the logs -- 'why' was previously
+    unpacked and discarded (silent skip on a broken collector)."""
+    if why == last_why:
+        return None
+    if why:
+        return f"status gate: {why}"
+    if last_why:
+        return "status gate: status.json OK again"
+    return None
+
+
+def dt_is_sane(dt):
+    """True if a computed dt (seconds since the previous KEPT sample) falls within
+    [DT_MIN, DT_MAX]. A sample outside this range is dropped rather than kept with an implausible
+    delta (clock jump, long stall, restart). Extracted from run()'s inline check so it can be
+    exercised directly instead of only via a constants-only assertion."""
+    return DT_MIN <= dt <= DT_MAX
+
+
 # ---------------------------------------------------------------- state (persists the
 # calibration's progress and "done" flag across restarts/reboots)
 def load_state(path):
@@ -315,7 +351,14 @@ def count_new_save_windows(unit, cursor):
     if cursor:
         cmd += ["--after-cursor", cursor]
     else:
-        cmd += ["--since", "5 minutes ago"]     # first run: do not replay the whole journal
+        # No cursor yet -- this should be rare: maybe_seed_journal_cursor() seeds one at
+        # gate-open (the first players>0 transition) precisely so this branch is not the normal
+        # path. If it IS hit (e.g. the seed call itself failed), keep the blind spot as narrow as
+        # possible: a save in the preceding JOURNAL_POLL_SEC is indistinguishable from one during
+        # play, but a save from minutes before player connect is not -- so this must never be a
+        # multi-minute window. (Previously hardcoded to "5 minutes ago", which could credit a
+        # pre-connection save toward save_windows_captured; see item 1 of the PR#8 review.)
+        cmd += ["--since", f"{max(1, int(JOURNAL_POLL_SEC))} seconds ago"]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except Exception as e:
@@ -340,6 +383,55 @@ def count_new_save_windows(unit, cursor):
         if JOURNAL_MARKER in line:
             count += 1
     return count, new_cursor, None
+
+
+def seed_journal_cursor(unit):
+    """(cursor_or_None, error_or_None). Returns the journal cursor at "now" -- i.e. the position
+    after 0 matched lines (`-n 0`) -- WITHOUT counting or skipping anything. Used to seed
+    state['journal_cursor'] at gate-open time (see maybe_seed_journal_cursor) so a later
+    --after-cursor poll can only ever see journal entries written after this call, never anything
+    from before. Shares count_new_save_windows's "rc=1 with empty stdout+stderr means nothing
+    matched" convention (an empty journal for this unit)."""
+    cmd = ["journalctl", "-u", unit, "--no-pager", "-o", "cat", "--show-cursor", "-n", "0"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        return None, f"exec:{e!r}"
+    if p.returncode != 0:
+        if p.returncode == 1 and not p.stdout and not p.stderr:
+            return None, None
+        return None, f"exit{p.returncode}: {(p.stderr or '').strip()[:200]}"
+    for line in p.stdout.splitlines():
+        if line.startswith("-- cursor: "):
+            return line[len("-- cursor: "):].strip(), None
+    return None, None
+
+
+def maybe_seed_journal_cursor(state, unit):
+    """Called once, exactly at the moment sampling starts (players 0 -> >0), and only when no
+    journal_cursor has EVER been recorded (state['journal_cursor'] is None). Mutates state in
+    place and returns True if it seeded a cursor (caller should persist state).
+
+    This is the fix for item 1 of the PR#8 review: on the very first invocation ever,
+    journal_cursor is None, so count_new_save_windows() used to fall back to a multi-minute
+    lookback window. A PrepareSave in that window -- while the server was still empty -- was
+    indistinguishable from one during play and got credited toward save_windows_captured, which
+    defeats the entire purpose of the save-window target (ruling out a coincidental artifact:
+    that window would have had NO rq samples at all). Seeding the cursor at gate-open time means
+    only saves that occur after a player has actually connected can ever be counted."""
+    if state.get("journal_cursor") is not None:
+        return False
+    cursor, err = seed_journal_cursor(unit)
+    if err:
+        log(f"WARNING: could not seed journal cursor at gate-open ({err}) -- falling back to "
+            f"the narrow {JOURNAL_POLL_SEC:g}s lookback on the next poll instead")
+        return False
+    if cursor:
+        state["journal_cursor"] = cursor
+        log("seeded journal cursor at gate-open -- only save windows after this moment can be "
+            "credited toward the target")
+        return True
+    return False
 
 
 # ---------------------------------------------------------------- output file + retention
@@ -375,13 +467,18 @@ def flush_records(lib, records):
     return unwritten
 
 
-def prune(lib, now, retain_days=None, max_mb=None):
+def prune(lib, now, retain_days=None, max_mb=None, active_name=None):
     """Unlink whole day-files, oldest first, until BOTH the age bound and the size bound are
     satisfied. Age comes from the filename (a file being appended to has today's mtime regardless
     of which day it holds); size is the sum of stallcalib-*.jsonl bytes on disk. This is the fix
     for the unbounded-growth class this session already found in a sibling script (relay-check) --
-    retention here is enforced on every flush, not just at prune time, and holds across
-    kill/restart because it is recomputed from the files themselves, not from in-memory state."""
+    retention here is enforced hourly by run()'s main loop, and holds across kill/restart because
+    it is recomputed from the files themselves, not from in-memory state.
+
+    `active_name` (basename only) is the file being actively appended to THIS cycle, e.g. today's
+    stallcalib-YYYY-MM-DD.jsonl. It is never chosen as an eviction victim by the size bound, even
+    if it alone exceeds max_mb -- oldest-first eviction with only one file on disk (today's, still
+    being written) would otherwise delete live, in-progress data instead of shrinking anything."""
     retain_days = RETAIN_DAYS if retain_days is None else retain_days
     max_mb = MAX_MB if max_mb is None else max_mb
     cutoff = (datetime.fromtimestamp(now, timezone.utc) - timedelta(days=retain_days)).date()
@@ -424,7 +521,14 @@ def prune(lib, now, retain_days=None, max_mb=None):
 
     keep.sort()
     while keep and total_mb(keep) > max_mb:
-        victim = keep.pop(0)
+        evictable = [n for n in keep if n != active_name]
+        if not evictable:
+            log(f"WARNING: {total_mb(keep):.1f}MB exceeds the {max_mb:g}MB cap but the only "
+                f"file(s) left are the one actively being appended to this cycle "
+                f"({active_name!r}) -- leaving it in place rather than deleting live data")
+            break
+        victim = evictable[0]
+        keep.remove(victim)
         try:
             os.unlink(os.path.join(lib, victim))
             dropped.append(victim)
@@ -455,6 +559,7 @@ def run(state_path=None):
     next_tick = time.monotonic()
     last_prune_wall = 0.0
     was_sampling = False
+    last_why = None
 
     log(f"started: target {TARGET_SAVE_WINDOWS} save window(s) with players connected, "
         f"{state['save_windows_captured']} already captured, done={state['done']}, "
@@ -468,7 +573,8 @@ def run(state_path=None):
         log(f"heartbeat: {msg}; {stats['written']:,} samples written, {len(buf)} buffered, "
             f"{state['save_windows_captured']}/{TARGET_SAVE_WINDOWS} save windows captured"
             + (f"; dropped dt={stats['dt']}" if stats["dt"] else "; no samples dropped")
-            + (f"; overflow={stats['overflow']}" if stats["overflow"] else ""))
+            + (f"; overflow={stats['overflow']}" if stats["overflow"] else "")
+            + (f"; status gate: {last_why}" if last_why else ""))
 
     while True:
         mono, wall = time.monotonic(), time.time()
@@ -479,7 +585,8 @@ def run(state_path=None):
 
         if wall - last_prune_wall >= 3600.0:
             last_prune_wall = wall
-            prune(LIB, wall)
+            active = os.path.basename(out_path(LIB, datetime.fromtimestamp(wall, timezone.utc)))
+            prune(LIB, wall, active_name=active)
 
         if state["done"]:
             if buf:
@@ -488,12 +595,18 @@ def run(state_path=None):
             continue
 
         players, why, generated = read_status(STATUS, wall)
+        msg = status_transition_message(why, last_why)
+        if msg:
+            log(msg)
+        last_why = why
         if players is None:
             players = 0
         sampling = players > 0
 
         if sampling and not was_sampling:
             log(f"{players} player(s) online -- sampling at {SAMPLE_HZ:g} Hz")
+            if maybe_seed_journal_cursor(state, VALHEIM_UNIT):
+                save_state(state_path, state)
         elif was_sampling and not sampling:
             log("server empty -- sampling stopped")
             if buf:
@@ -542,7 +655,7 @@ def run(state_path=None):
 
         now_wall_dt = datetime.now(timezone.utc)
         dt = None if last_mono is None else round(mono - last_mono, 4)
-        if last_mono is not None and not (DT_MIN <= dt <= DT_MAX):
+        if last_mono is not None and not dt_is_sane(dt):
             stats["dt"] += 1
             last_mono = mono
         else:
@@ -719,8 +832,108 @@ def selftest(keep=False):
         check("stallcalib-2026-01-01.jsonl (oldest) was the first evicted",
               "stallcalib-2026-01-01.jsonl" in dropped2, dropped2)
 
-        print("dt sanity")
-        check("DT bounds are sane for a 10 Hz sampler", DT_MIN == 0.0 and DT_MAX >= 1.0)
+        print("dt sanity (real lock on dt_is_sane, not just a constants-only assertion)")
+        check("a plausible dt at 10 Hz is sane", dt_is_sane(0.1))
+        check("dt exactly at DT_MIN is accepted (inclusive lower bound)", dt_is_sane(DT_MIN))
+        check("dt exactly at DT_MAX is accepted (inclusive upper bound)", dt_is_sane(DT_MAX))
+        check("a negative dt (clock went backwards) is rejected", not dt_is_sane(-0.05))
+        check("a dt beyond DT_MAX (implausible gap/stall) is rejected", not dt_is_sane(DT_MAX + 1.0))
+
+        print("SAMPLE_HZ domain guard (STALLCALIB_SAMPLE_HZ=0 must not crash the process)")
+        check("zero is rejected, falls back to the given default", _positive(0.0, "X", 10.0) == 10.0)
+        check("a negative value is rejected", _positive(-5.0, "X", 10.0) == 10.0)
+        check("a valid positive value passes through unchanged", _positive(2.5, "X", 10.0) == 2.5)
+        env = dict(os.environ)
+        env["STALLCALIB_SAMPLE_HZ"] = "0"
+        # Load the module fresh (as a non-__main__ script via runpy, NOT --selftest again --
+        # that would recurse forever since the child inherits STALLCALIB_SAMPLE_HZ=0 too) and
+        # confirm the module-level SAMPLE_HZ/SAMPLE_PERIOD computation survived without a
+        # ZeroDivisionError crash.
+        probe = ("import runpy, sys; "
+                 "ns = runpy.run_path(sys.argv[1]); "
+                 "print(ns['SAMPLE_HZ'], ns['SAMPLE_PERIOD'])")
+        r = subprocess.run([sys.executable, "-c", probe, os.path.abspath(__file__)],
+                            env=env, capture_output=True, text=True, timeout=30)
+        check("module import does not crash with STALLCALIB_SAMPLE_HZ=0 (falls back instead)",
+              r.returncode == 0, (r.returncode, r.stderr[-300:]))
+        check("the fallback SAMPLE_HZ is the positive default, not 0",
+              r.stdout.split()[:1] == ["10.0"], r.stdout)
+
+        print("status 'why' is logged on transition, not silently discarded (item 2)")
+        check("no message when why is unchanged (both healthy)",
+              status_transition_message("", "") is None)
+        check("no message when why is unchanged (still broken, same reason)",
+              status_transition_message("status.json is missing", "status.json is missing") is None)
+        check("logs when status becomes broken",
+              status_transition_message("status.json is missing", "") ==
+              "status gate: status.json is missing")
+        check("logs recovery back to healthy",
+              status_transition_message("", "status.json is missing") ==
+              "status gate: status.json OK again")
+
+        print("journal cursor seeding at gate-open -- pre-connection saves must never be "
+              "credited (item 1)")
+        with mock.patch("subprocess.run", return_value=FakeCompleted("-- cursor: s=seed;i=5\n")) as m:
+            cur, err = seed_journal_cursor("valheim.service")
+            check("seed_journal_cursor returns the cursor from a 0-line query",
+                  cur == "s=seed;i=5" and err is None, (cur, err))
+            check("seed_journal_cursor asks for 0 lines (must not count anything)",
+                  "-n" in m.call_args[0][0] and
+                  m.call_args[0][0][m.call_args[0][0].index("-n") + 1] == "0", m.call_args)
+
+        st_seed = {"save_windows_captured": 0, "journal_cursor": None, "done": False}
+        with mock.patch("subprocess.run", return_value=FakeCompleted("-- cursor: s=seed;i=5\n")):
+            changed = maybe_seed_journal_cursor(st_seed, "valheim.service")
+        check("first-ever gate-open seeds the cursor",
+              changed and st_seed["journal_cursor"] == "s=seed;i=5", st_seed)
+
+        st_already = {"save_windows_captured": 1, "journal_cursor": "s=existing;i=1", "done": False}
+        with mock.patch("subprocess.run") as m2:
+            changed2 = maybe_seed_journal_cursor(st_already, "valheim.service")
+            check("a cursor that already exists is never re-seeded (only the first-ever gate-open)",
+                  not changed2 and not m2.called, (changed2, m2.called))
+
+        # THE lock this item exists for: a PrepareSave that happened while the server was still
+        # empty (i.e. before the seeded cursor) must never be credited once the cursor is seeded.
+        with mock.patch("subprocess.run", return_value=FakeCompleted(
+                "PrepareSave: ZDOExtraData.PrepareSave done [151ms]\n-- cursor: s=post;i=6\n")) as m3:
+            n, cur2, err2 = count_new_save_windows("valheim.service", st_seed["journal_cursor"])
+            check("post-seed poll queries --after-cursor from the seeded point, not a wide window",
+                  "--after-cursor" in m3.call_args[0][0], m3.call_args)
+            check("a save after the seeded cursor IS counted (the instrument still works)",
+                  n == 1 and err2 is None, (n, err2))
+
+        # Defense in depth: even if seeding itself failed (cursor still None when polling), the
+        # blind-spot window must be bounded to JOURNAL_POLL_SEC, never the old 5-minute fallback.
+        with mock.patch("subprocess.run", return_value=FakeCompleted("")) as m4:
+            count_new_save_windows("valheim.service", None)
+            args = m4.call_args[0][0]
+            since_val = args[args.index("--since") + 1]
+            check("no-cursor fallback window is bounded to JOURNAL_POLL_SEC, not a 5-minute "
+                  "pre-connection blind spot",
+                  "5 minutes" not in since_val and str(int(JOURNAL_POLL_SEC)) in since_val,
+                  since_val)
+
+        print("retention: never evict the actively-written file, even if it alone exceeds the "
+              "cap (item 5)")
+        d3 = tempfile.mkdtemp(prefix="stallcalib-selftest-active-", dir=d)
+        active_name = "stallcalib-2026-02-01.jsonl"
+        with open(os.path.join(d3, active_name), "wb") as f:
+            f.write(b"x" * (3 * 1024 * 1024))    # 3 MiB alone, over a 2MB cap
+        dropped3 = prune(d3, time.time(), retain_days=3650, max_mb=2.0, active_name=active_name)
+        check("the actively-written file survives even though it alone exceeds the size cap",
+              os.path.exists(os.path.join(d3, active_name)) and active_name not in dropped3,
+              dropped3)
+        # and confirm the guard is specific to the active file, not a general "give up" -- an
+        # older, non-active file over the cap is still evicted normally.
+        d4 = tempfile.mkdtemp(prefix="stallcalib-selftest-active2-", dir=d)
+        with open(os.path.join(d4, "stallcalib-2026-01-01.jsonl"), "wb") as f:
+            f.write(b"x" * (1024 * 1024))
+        with open(os.path.join(d4, active_name), "wb") as f:
+            f.write(b"x" * (1024 * 1024))
+        dropped4 = prune(d4, time.time(), retain_days=3650, max_mb=1.0, active_name=active_name)
+        check("a non-active file over the cap is still evicted normally",
+              "stallcalib-2026-01-01.jsonl" in dropped4 and active_name not in dropped4, dropped4)
     finally:
         if keep:
             print("\nfixtures kept in " + d)

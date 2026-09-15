@@ -36,10 +36,13 @@ timer and isn't running the next time players log on misses the opportunity enti
   reboots, since the flag is read from disk on every start, not held only in memory.
 - **Bounded retention**: day-partitioned JSONL (`stallcalib-YYYY-MM-DD.jsonl`), pruned on both age
   (`STALLCALIB_RETAIN_DAYS`, default 14) and total on-disk size (`STALLCALIB_MAX_MB`, default 60),
-  oldest file first, enforced on every flush and hourly regardless of gate state -- the class of
-  defect this guards against is the one this session found and fixed in a sibling script
-  (`valheim-relay-check.py`, unbounded persisted retention). No personal data is recorded: queue
-  depths, timings and player *counts* only, never addresses or names.
+  oldest file first, enforced hourly regardless of gate state (prune() is only called from the
+  main loop's hourly timer, not from every flush -- corrected here per PR#8 review item 3; the
+  timer's initial state also guarantees an effectively-immediate first prune at startup) -- the
+  class of defect this guards against is the one this session found and fixed in a sibling script
+  (`valheim-relay-check.py`, unbounded persisted retention). The file actively being appended to
+  this cycle is never evicted even if it alone exceeds the size cap. No personal data is recorded:
+  queue depths, timings and player *counts* only, never addresses or names.
 - **Drop accounting**: every dropped sample (`dt` outside sane bounds) and buffer overflow
   increments an in-memory counter, surfaced on every heartbeat log line -- never silently
   discarded, never fabricated.
