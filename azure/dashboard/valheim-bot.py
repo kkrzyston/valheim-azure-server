@@ -1076,6 +1076,69 @@ def to_futhark(text):
         log(f"to_futhark(): unbalanced {unbalanced_kind} in input -- protecting to end of string "
             "rather than rune-mangling it (fail closed)", "warning")
     return "".join(out)
+# ---------------------------------------------------------------- !lag (player lag reports)
+# The egress probe can show that game traffic sat pinned at a ceiling. It cannot show that anyone
+# minded. Without a human timestamp the experiment proves a number exists; with one it can say
+# whether the number is what players are feeling. That is the entire job of this command.
+#
+# `!lag`, optionally with a few words after it. Matched on the raw message, not on a question
+# addressed to the bot: a player who is lagging should not have to compose a sentence.
+LAG_RE = re.compile(r"^\s*!lag\b", re.IGNORECASE)
+
+# WHY A SPOOL AND NOT A DIRECT APPEND TO events.jsonl:
+# events.jsonl is written by valheim-status-collect.py running as root, and written by *rewrite* --
+# append_and_trim() reads the whole file, re-sorts it and os.replace()s it once a minute. So the
+# file the bot sees is replaced out from under it every 60 s, its ownership and mode are reset to
+# root:root 0644 by that rename (the bot cannot write it at all), and any line appended in the
+# window between the collector's read and its rename would be silently discarded by the rename.
+# events.jsonl seeds the all-time totals and the hall of fame and is never trimmed; losing a line
+# to a race there is not acceptable.
+#
+# So the bot drops one small file per report into a spool the collector drains into events.jsonl
+# on its next run -- the same one-writer-per-file pattern as the restart spool in
+# /var/lib/valheim-restart/requests, and for the same reason. The collector stays the only writer
+# of events.jsonl, and a report cannot be lost to a rename.
+LAG_SPOOL = os.environ.get("HERMODR_LAG_SPOOL", "").strip() or "/var/lib/valheim-status/lagreports"
+
+
+def record_lag_report(name, when=None):
+    """Drop one lagreport into the spool. Returns True if it landed. Written to a .tmp name and
+    renamed into place so the collector, which globs *.json, can never read a half-written file."""
+    t = time.time() if when is None else when
+    stem = "%d-%s" % (int(t), os.urandom(4).hex())
+    tmp = os.path.join(LAG_SPOOL, stem + ".tmp")
+    final = os.path.join(LAG_SPOOL, stem + ".json")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            # Explicit, not left to the umask: a later UMask= hardening of valheim-bot.service
+            # would otherwise make these unreadable by the root collector's own sanity checks and
+            # by anyone auditing the spool, and the failure would be silent.
+            os.fchmod(fd, 0o644)
+            os.write(fd, (json.dumps({"t": round(t, 1), "kind": "lagreport", "name": name},
+                                     separators=(",", ":")) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(tmp, final)
+        return True
+    except Exception as exc:
+        log("could not record a lag report in %s: %r" % (LAG_SPOOL, exc), "error")
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def lag_reply(ok):
+    """Fixed text. Never goes near the model -- this path must not cost an AI call, since the one
+    moment it is used is the moment the server is already struggling."""
+    if ok:
+        return ("Noted, with the hour. If the wire was pinned at the time, the scribes will see "
+                "it next to your name.")
+    return "I could not write that down. Tell whoever keeps the server -- the log is not taking marks."
+
+
 
 
 def truncate_discord(text, limit=DISCORD_LIMIT):
@@ -1237,7 +1300,12 @@ class RateLimiter:
     """1 question / 10 s, 20 / hour, per Discord user id. Over limit: warn once, then silence
     until they are back under both limits -- never spam a repeat offender."""
 
-    def __init__(self):
+    def __init__(self, cooldown=None, cap=None):
+        # Defaults are the Q&A limits; !lag passes its own, because a lag report costs no AI call
+        # but does cost a permanent line in events.jsonl, so it wants a longer cooldown and a
+        # tighter hourly cap rather than sharing a budget with questions.
+        self._cooldown = SHORT_COOLDOWN_S if cooldown is None else cooldown
+        self._cap = HOURLY_CAP if cap is None else cap
         self._last = {}
         self._hourly = defaultdict(deque)
         self._warned = set()
@@ -1247,7 +1315,7 @@ class RateLimiter:
         dq = self._hourly[user_id]
         while dq and now - dq[0] > HOUR_S:
             dq.popleft()
-        if now - self._last.get(user_id, 0) < SHORT_COOLDOWN_S or len(dq) >= HOURLY_CAP:
+        if now - self._last.get(user_id, 0) < self._cooldown or len(dq) >= self._cap:
             if user_id in self._warned:
                 return "silent"
             self._warned.add(user_id)
@@ -1753,6 +1821,9 @@ def run_bot():
     client = discord.Client(intents=intents)
     limiter = RateLimiter()
     approval_limiter = RateLimiter()  # separate instance, same class -- see handle_approval_interaction
+    # !lag gets its own budget: one report a minute, ten an hour. Separate from the Q&A limiter
+    # so a player who has been asking questions can still report lag, and vice versa.
+    lag_limiter = RateLimiter(cooldown=60, cap=10)
     allowed_channel_id = int(CHANNEL_ID_ENV) if CHANNEL_ID_ENV.isdigit() else None
 
     async def setup_hook():
@@ -1814,6 +1885,30 @@ def run_bot():
         if allowed_channel_id is None or message.channel.id != allowed_channel_id:
             return
         if message.author.bot:
+            return
+
+        # 2. `!lag` -- deliberately checked before the mention gate below. Someone whose game is
+        # stuttering should be able to type four characters, not compose a sentence addressed to
+        # a bot. It costs no AI call and no context build: one small file into the spool, one
+        # fixed reply. Its own rate limit, so it neither spends nor is spent by the Q&A budget.
+        if LAG_RE.match(message.content or ""):
+            verdict = lag_limiter.check(message.author.id)
+            if verdict == "silent":
+                return
+            if verdict == "warn":
+                try:
+                    await message.reply("Already marked, and recently. One report a minute is plenty.",
+                                        allowed_mentions=discord.AllowedMentions.none())
+                except Exception as exc:
+                    log(f"failed to send lag-report rate-limit notice: {exc!r}", "warning")
+                return
+            who = getattr(message.author, "display_name", None) or message.author.name
+            ok = await asyncio.to_thread(record_lag_report, who)
+            log("recorded a lag report from user %s (ok=%s)" % (message.author.id, ok))
+            try:
+                await message.reply(lag_reply(ok), allowed_mentions=discord.AllowedMentions.none())
+            except Exception as exc:
+                log(f"failed to acknowledge a lag report: {exc!r}", "warning")
             return
 
         triggered = client.user in message.mentions

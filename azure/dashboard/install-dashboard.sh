@@ -33,7 +33,10 @@ test -f /etc/valheim-alert.env || install -m 0600 valheim-alert.env /etc/valheim
 # Hermodr reads its own env now that it runs as valheim-bot, so the bot process never holds the
 # Discord WEBHOOK credential that alert/medals/digest still use. Never overwritten once present.
 test -f /etc/valheim-bot.env || install -o root -g valheim-bot -m 0640 valheim-bot.env /etc/valheim-bot.env
-command -v tcpdump >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y tcpdump
+# nftables, not tcpdump: the collector learns peer addresses from the `peers` set in the
+# `inet valheim_meter` table (installed by valheim-egress.service's ExecStartPre=), which
+# replaced a once-a-minute AF_PACKET tap on the game's own receive path.
+command -v nft >/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y nftables
 install -m 0644 valheim-status.service valheim-status.timer /etc/systemd/system/
 # Let the caddy user reach /home/valheim/backups (the snapshots listing) without opening
 # /home/valheim to everyone: an ACL granting traversal of the home dir and read of backups only.
@@ -58,6 +61,13 @@ install -d -m 0700 -o root -g root             /var/lib/valheim-restart/archive
 install -d -m 0700 -o root -g root             /var/lib/valheim-restart/quarantine
 # gate.json and secret.csrf are created by the executor on its first tick, with the right modes.
 
+# Hermodr's `!lag` spool, same shape and same reason as requests/ above: 1730 lets valheim-bot
+# create a report by name but never list or read the directory back, and root (the collector)
+# drains it into events.jsonl once a minute. The bot cannot write events.jsonl itself -- the
+# collector rewrites and renames that file every run, which would reset its owner and mode and
+# could swallow an appended line outright.
+install -d -m 1730 -o root -g valheim-bot /var/lib/valheim-status/lagreports
+
 HASH=$(caddy hash-password --plaintext "$PW")
 OWNER_HASH=$(caddy hash-password --plaintext "$OWNER_PW")
 sed -e "s#__HASH__#$HASH#" -e "s#__OWNER_HASH__#$OWNER_HASH#" -e "s#__DASHBOARD_HOST__#$DASHBOARD_HOST#" Caddyfile > /etc/caddy/Caddyfile
@@ -73,8 +83,19 @@ install -m 0644 valheim-medals-web.service valheim-medals-web.timer /etc/systemd
 # The restart feature. valheim-restart-exec.path is installed but deliberately NOT enabled --
 # see the warning in its header; the 15 s timer is the guarantee, the path unit is convenience.
 install -m 0755 valheim-restartd.py valheim-restart-exec.py /usr/local/sbin/
-install -m 0644 valheim-restartd.service valheim-restart-exec.service \n                valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
+install -m 0644 valheim-restartd.service valheim-restart-exec.service \
+                valheim-restart-exec.timer valheim-restart-exec.path /etc/systemd/system/
 install -m 0644 manifest.webmanifest icon.svg icon-192.png icon-512.png /var/www/valheim/
+# --- egress probe (lag investigation) ---------------------------------------------------------
+# valheim-egress.service's ExecStartPre= runs the nft helper, so the `inet valheim_meter` table
+# (counters + the `peers` set the collector now reads instead of running tcpdump) is rebuilt on
+# every start and after a reboot. Keep this unit enabled: stopping it leaves the table in place,
+# but a reboot with it disabled would take the dashboard's per-player ping column with it.
+# The report script is offline and operator-run; it is installed only so it is on PATH.
+install -m 0755 valheim-meter-nft.sh /usr/local/sbin/valheim-meter-nft.sh
+install -m 0755 valheim-egress-probe.py /usr/local/sbin/valheim-egress-probe.py
+install -m 0755 valheim-egress-report.py /usr/local/sbin/valheim-egress-report.py
+install -m 0644 valheim-egress.service /etc/systemd/system/
 # Hermodr (Discord Q&A bot) -- its own venv so discord.py never touches the system Python used by
 # the collector/alert/medals scripts above. Installed but NOT started: it needs DISCORD_BOT_TOKEN
 # (and HERMODR_CHANNEL_ID or HERMODR_CHANNEL_NAME) in /etc/valheim-alert.env first, and there is no
@@ -122,6 +143,9 @@ systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals
 systemctl enable --now valheim-restart-exec.timer
 systemctl enable --now valheim-restartd.service
 systemctl enable --now valheim-status.timer
+# Started before the collector's first run, so the meter table (and its `peers` set) exists by the
+# time valheim-status-collect.py first looks for it.
+systemctl enable --now valheim-egress.service
 systemctl start valheim-status.service
 systemctl enable --now caddy
 systemctl reload caddy

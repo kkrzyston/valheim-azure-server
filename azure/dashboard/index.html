@@ -708,6 +708,7 @@
       else if (e.kind === 'raid') body.innerHTML = `Raid: <b>${esc(e.label || e.name)}</b>`;
       else if (e.kind === 'outdated') body.innerHTML = `Someone tried to join with game version ${esc(e.their ?? '?')} vs ours ${esc(e.mine ?? '?')}`;
       else if (e.kind === 'newcomer') body.innerHTML = `A new Steam account (…${esc(e.steamid_suffix || '')}) connected`;
+      else if (e.kind === 'lagreport') body.innerHTML = `<b>${esc(e.name)}</b> reported lag`;
       else body.innerHTML = `<b>${esc(e.text ?? e.name ?? '')}</b>`;
       li.append(tm, body);
       ul.appendChild(li);

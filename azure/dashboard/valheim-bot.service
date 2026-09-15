@@ -42,10 +42,26 @@ ProtectHome=true
 # restart feature) purely for documentation and defense-in-depth, matching this unit's existing
 # style of spelling out what it reads even where that duplicates ProtectSystem's own default.
 ReadOnlyPaths=/var/www/valheim /var/lib/valheim-status /var/lib/valheim-restart/inbox
-# The only path this process can write to besides its own log: verdicts/ is mode 1730
-# (root:valheim-bot, create-only -- see PLAN-v5's spool table), so even with this grant the bot
-# can create a new file by name but can never list or read the directory back.
-ReadWritePaths=/var/lib/valheim-restart/verdicts
+# The only paths this process can write to besides its own log. Both are mode 1730
+# (root:valheim-bot, create-only -- see PLAN-v5's spool table), so even with these grants the bot
+# can create a new file by name but can never list or read either directory back.
+#
+# lagreports/ sits INSIDE /var/lib/valheim-status, which the line above marks read-only. systemd
+# applies the most specific path, so the parent stays read-only and only this one subdirectory is
+# writable -- but the grant is mandatory, not decorative: without it `!lag` gets EROFS on every
+# single attempt, replies "I could not write that down" every time, and R3 in the egress analysis
+# never receives one data point. The feature is dead on arrival if this line is missing.
+ReadWritePaths=/var/lib/valheim-restart/verdicts /var/lib/valheim-status/lagreports
+
+# SYSCALL NOTE for record_lag_report(): it calls open(O_CREAT|O_EXCL), write, fchmod, rename.
+# fchmod is the one worth checking, because this repo has already shipped a unit that a syscall
+# filter silently broke (see the "re-allow the chown syscalls" fix to valheim-restartd.service).
+# Reasoning, not assumption: systemd's @privileged set is syscalls that need CAP_SYS_ADMIN or
+# equivalent -- chown/fchown/lchown are in it (changing an owner crosses a privilege boundary),
+# but chmod/fchmod are NOT: changing the mode of a file you already own needs no capability.
+# fchmod lands in @file-system, which @system-service includes. So this passes -- and the mode is
+# set explicitly rather than left to the umask precisely so a future UMask= here cannot silently
+# make the reports unreadable to the root collector that drains them.
 
 # Additional hardening for the restart-approval feature: this process talks to Discord's gateway
 # and the Azure AI endpoint over plain outbound HTTPS/WSS and does not need anything resembling a
