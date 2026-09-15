@@ -84,8 +84,9 @@ USAGE:
                        "fandom"/"weirdgloop" and is never re-derived or collapsed against the wiki
                        records that happen to share its (title, heading). Default: the file's
                        installed location, $VALHEIM_WIKI_ROOT/valheim-curated-numbers.jsonl (see
-                       WIKI_ROOT below -- install-dashboard.sh still needs a line copying the
-                       checked-in file there; not done as part of this task, see its report). A
+                       WIKI_ROOT below -- install-dashboard.sh installs the checked-in file there
+                       alongside the scripts, ownership matching /var/lib/valheim-wiki's own
+                       valheim-bot:valheim-bot pattern; see this task's report). A
                        MISSING file at this path is not an error (the curated layer is optional
                        and may not be installed yet) -- 0 curated facts are merged, logged at
                        INFO. A file that EXISTS but is malformed (invalid JSON, a non-object line,
@@ -154,11 +155,57 @@ DEFAULT_CONTACT = "https://github.com/kkrzyston/valheim-azure-server"
 BASE_USER_AGENT = "westernskies-hermodr-wiki-ingest/1.0 (Valheim Discord bot knowledge base; {contact})"
 
 MAXLAG = 5  # seconds; passed on every write-cheap read request per PLAN-v6.md's etiquette rule
-GAP_LIMIT = 500  # "Anonymous gaplimit 500/request" per PLAN-v6.md's source table, for both wikis
+
+# ---------------------------------------------------------------- content-fetch gaplimit (bugfix)
+# PLAN-v6.md's source table quotes "Anonymous gaplimit 500/request" -- true for a METADATA-ONLY
+# generator=allpages walk, but walk_allpages() below ALWAYS also requests
+# prop=revisions&rvprop=content in the same call, and that combination does not behave like a
+# plain listing. Confirmed empirically against BOTH live wikis while fixing this (see this task's
+# report): regardless of what `gaplimit` is requested, MediaWiki's revisions submodule caps actual
+# CONTENT delivery at 50 pages per HTTP response for a non-highlimits (anonymous) caller. Below
+# that cap, `gaplimit` behaves exactly as expected -- every listed page comes back with content in
+# one round, and `continue` advances the generator itself (`gapcontinue`) to a fresh set of titles.
+#
+# ABOVE 50, MediaWiki does NOT drop the extra pages or shrink the batch -- it keeps the SAME
+# `gaplimit`-sized set of titles fixed and instead pages THROUGH THEIR REVISIONS via `rvcontinue`,
+# revealing content for a different 50-title slice of that same fixed batch each round, while every
+# OTHER title in that round's response is missing its `revisions` key entirely (confirmed: not
+# `missing`/`invalid`, not an empty `revisions` list with no content -- simply no `revisions` key
+# on an otherwise perfectly normal page, indistinguishable in that one response from a page that
+# will never get content). walk_allpages() does not (and, short of buffering an entire gaplimit
+# batch until every title in it has been seen at least once, cannot cheaply) tell "this title just
+# hasn't had its turn yet in this batch's rvcontinue cycle" apart from "this title has no usable
+# revision" -- so at gaplimit=500 (needing up to 10 such rounds to fully drain one batch) a
+# perfectly healthy page gets logged and counted as a skip on every round before its turn comes,
+# roughly 9 spurious skips for every 1 real success. That is precisely the ~85-86% "skip" rate a
+# previous run observed at --limit 60/400 -- not mwparserfromhell failing to parse anything (the
+# SUMMARY line's "failed to parse" framing sent that investigation to the wrong place; the actual
+# recorded reasons were walk_allpages()'s own "no revisions returned"/"no readable content", just
+# spuriously repeated), and it reliably blows past FAILURE_THRESHOLD long before a real problem
+# exists, which is why no --limit above ~50 could ever write a corpus at all.
+#
+# The fix: request no more than the wiki's own per-response content cap in the first place, so
+# every batch is satisfied in a single round and `continue` is always a plain `gapcontinue` advance
+# to titles never seen before -- no rvcontinue cycling, no repeated titles, no spurious skips.
+# Chosen at 30 (standard MediaWiki practice for a content-bearing query is 20-50; PLAN-v6.md's
+# "500" was correct only for the metadata-only case) to sit with real margin under the empirically
+# confirmed exact cliff at 50, since that cap is the *wiki's* to change without notice and this
+# project has committed to polite pacing over raw throughput here (see MIN_REQUEST_INTERVAL_S
+# below -- both wikis' robots.txt disallow api.php entirely; smaller, gentler batches are the right
+# tradeoff, not the largest batch that happens to still work today). See WikiClient.get's own
+# below-cap-cliff canary in walk_allpages() for what happens if a wiki's cap ever drops under this.
+CONTENT_GAP_LIMIT = 30
 REQUEST_TIMEOUT_S = 30
 MAX_RETRIES = 5
 BACKOFF_BASE_S = 2.0  # doubles each retry: 2, 4, 8, 16, 32s, capped by MAX_RETRIES
-MIN_REQUEST_INTERVAL_S = 1.0  # serialized: never more than one request/second to either wiki
+# Serialized: never more than one request per this many seconds, to either wiki. Bumped from the
+# previous 1.0s (still true "one/second", the ordinary MediaWiki API etiquette baseline) to 1.5s
+# specifically because CONTENT_GAP_LIMIT above turns one ~2,200-page run into roughly 15x more HTTP
+# requests than the old (broken) gaplimit=500 design ever issued -- see this task's report for the
+# request-count math. Weird Gloop's robots.txt disallows api.php outright and the owner has decided
+# to fetch anyway; a request-count increase this large is exactly the moment to pace a little more
+# gently, not the moment to hold pacing flat while volume grows.
+MIN_REQUEST_INTERVAL_S = 1.5
 
 FAILURE_THRESHOLD = 0.05  # >5% of attempted pages failing to parse => hard failure, write nothing
 
@@ -1111,11 +1158,13 @@ def walk_allpages(
     client: "WikiClient", source: str, stats: "RunStats", limit: Optional[int] = None
 ) -> Iterator[RawPage]:
     """Batched, continuation-following walk over a wiki's live ns0 pages: `action=query&
-    generator=allpages&gapnamespace=0&prop=revisions&rvprop=content|ids|timestamp`, GAP_LIMIT
-    (500) pages per request. PLAN-v6.md specifies exactly this mechanism for BOTH the Fandom delta
-    walk (step 2) and the full Weird Gloop walk (step 3), so this one function serves both call
-    sites -- see ingest_fandom_delta() and the main Weird Gloop path in run_ingest() below for how
-    each uses what comes out.
+    generator=allpages&gapnamespace=0&prop=revisions&rvprop=content|ids|timestamp`,
+    CONTENT_GAP_LIMIT pages per request. PLAN-v6.md specifies this mechanism for BOTH the Fandom
+    delta walk (step 2) and the full Weird Gloop walk (step 3), so this one function serves both
+    call sites -- see ingest_fandom_delta() and the main Weird Gloop path in run_ingest() below for
+    how each uses what comes out. See CONTENT_GAP_LIMIT's own comment for why this must stay small
+    (empirically confirmed cause of the "full corpus can never be ingested" bug this function's
+    fix addresses) and why continuation must always be a `gapcontinue` advance, never `rvcontinue`.
 
     Stops as soon as `limit` pages have been yielded (no further request is issued), regardless of
     how many more `continue` batches the wiki still has -- this is what makes `--limit 20` cheap
@@ -1130,12 +1179,21 @@ def walk_allpages(
     -- the SAME accounting a parse failure gets in raw_pages_to_records() -- so it is counted in
     `attempted`, counted in `skipped`, feeds skip_ratio() exactly like a parse failure would, and
     is logged at WARNING with its title (record_skip() already does this logging; see its own
-    docstring)."""
+    docstring). NOTE, added while fixing the gaplimit bug: at a `gaplimit` above the wiki's actual
+    per-response content cap, these three reasons are exactly what a page LOSES ITS TURN in an
+    `rvcontinue` cycle logs as -- see CONTENT_GAP_LIMIT's comment. They are the right thing to log
+    for a genuinely missing/invalid/content-less page; CONTENT_GAP_LIMIT is what keeps them from
+    also firing, spuriously and repeatedly, for perfectly healthy ones.
+
+    Periodic INFO progress logging (this task's fix): one line per completed batch, so an operator
+    watching `journalctl -u valheim-wiki-refresh` mid-run can tell a slow run (a new line every few
+    seconds) from a hung one (no new line at all), across what is now many more, smaller requests
+    than before."""
     params = {
         "action": "query",
         "generator": "allpages",
         "gapnamespace": 0,
-        "gaplimit": GAP_LIMIT,
+        "gaplimit": CONTENT_GAP_LIMIT,
         "prop": "revisions",
         "rvprop": "content|ids|timestamp",
         "format": "json",
@@ -1173,9 +1231,29 @@ def walk_allpages(
             count += 1
             if limit is not None and count >= limit:
                 return
+        _LOG.info("%s: %d page(s) fetched with usable content so far", source, count)
         if "continue" not in data:
             return
         continue_params = data["continue"]
+        if "gapcontinue" not in continue_params and "rvcontinue" in continue_params:
+            # Below-cap-cliff canary (see CONTENT_GAP_LIMIT's comment for the full mechanism): a
+            # `continue` with `rvcontinue` but no `gapcontinue` means the API is still paging
+            # through THIS SAME batch's revisions rather than advancing to new titles -- i.e.
+            # CONTENT_GAP_LIMIT is no longer under this wiki's real per-response content cap (the
+            # cap dropped, or CONTENT_GAP_LIMIT was raised without re-checking it empirically).
+            # Every "no revisions"/"no readable content" skip logged for the REST of this batch's
+            # titles until the cycle finishes may just be pages that have not had their turn yet,
+            # not pages that are actually broken -- this is exactly the ~85-86% spurious-skip
+            # failure this task's fix addresses, so a recurrence must be loud, not another silent
+            # `continue`.
+            _LOG.warning(
+                "%s: API is paging revisions WITHIN the current page batch (rvcontinue, no "
+                "gapcontinue) instead of advancing to new pages -- this wiki's per-response "
+                "content cap has dropped below CONTENT_GAP_LIMIT (%d). Skips logged for this "
+                "wiki until the batch finishes cycling may be pages that simply have not had "
+                "their turn yet, not genuinely missing/invalid pages -- lower CONTENT_GAP_LIMIT.",
+                source, CONTENT_GAP_LIMIT,
+            )
 
 
 def ingest_fandom_delta(
@@ -1918,6 +1996,114 @@ def selftest() -> int:
             "a re-run with a curated file present stays byte-identical",
             rc_18a == 0 and rc_18b == 0 and bytes_18a is not None and bytes_18a == bytes_18b,
         )
+
+    # 19-20. The gaplimit bugfix itself (this task): confirmed empirically against BOTH live wikis
+    # while building this fix (see CONTENT_GAP_LIMIT's own comment for the full mechanism and this
+    # task's report for the raw probe output) that a combined generator=allpages +
+    # prop=revisions&rvprop=content query does not hand back content for anywhere near `gaplimit`
+    # pages in one response -- MediaWiki caps actual content delivery at 50 pages per response for
+    # a non-highlimits caller and, ABOVE that, pages through the SAME fixed batch's revisions via
+    # `rvcontinue` instead of advancing the generator, so a title that has not yet had its turn in
+    # that cycle is indistinguishable, in any ONE response, from a genuinely contentless page.
+    # walk_allpages() logs and counts that as a skip regardless -- correct for a real
+    # missing/invalid/content-less page, but spurious and repeated for a healthy one just waiting
+    # its turn, which is what turned into the ~85-86% "skip" rate this task's fix addresses.
+    #
+    # This fake client reproduces that exact shape offline -- keyed off whatever `gaplimit` the
+    # caller actually requests (not a fixed slice of some master list), so the SAME fake proves
+    # both halves of the fix with no network at all: request no more than the wiki's real
+    # per-response content cap (TRUNCATION_CAP here) and every page comes back with content, no
+    # skips, on the first pass through -- exactly CONTENT_GAP_LIMIT's job; request MORE than that
+    # cap (the OLD, broken gaplimit=500) and most of that batch comes back skipped on every round
+    # until its turn comes, exactly reproducing the regression this task fixes. Check 20 is the
+    # sabotage half of check 19 -- it is what proves 19 is not vacuous: with the fix reverted (via
+    # a temporary CONTENT_GAP_LIMIT monkeypatch back to the old 500, exactly like check 12-14's
+    # `page_to_sections` monkeypatch above does for a different constant), the very same walk over
+    # the very same fake pages fails loudly instead of quietly passing.
+    class _FakeTruncatingClient:
+        """Simulates the real, empirically-confirmed MediaWiki behavior: within ANY one batch of
+        up to `gaplimit` titles, only the first TRUNCATION_CAP of THAT REQUEST'S OWN gaplimit
+        actually come back with revision content -- the rest of that same batch are still listed
+        (present in `pages`, matching the generator's page count) but carry no `revisions` key at
+        all, exactly like a real page MediaWiki has fully indexed but has not yet cycled content
+        for. Continuation for a batch that still has more to reveal uses `rvcontinue` (no
+        `gapcontinue`) and re-lists the SAME batch's remaining titles, revealing content for the
+        NEXT TRUNCATION_CAP-sized slice each round -- once the whole batch has cycled, `gapcontinue`
+        finally advances to fresh titles never seen before. This is not a simplification of the
+        real behavior; it is the same shape confirmed against both live wikis' actual JSON."""
+
+        TRUNCATION_CAP = 50  # matches the exact per-response cap confirmed on both live wikis
+
+        def __init__(self, total_pages):
+            self.titles = [f"Page {i:04d}" for i in range(total_pages)]
+
+        def get(self, params):
+            gaplimit = params["gaplimit"]
+            batch_start = 0
+            cycle_offset = 0
+            if "gapcontinue" in params:
+                batch_start = self.titles.index(params["gapcontinue"])
+            elif "rvcontinue" in params:
+                # rvcontinue's own value encodes (batch_start, cycle_offset) so this fake can
+                # resume mid-cycle without needing any state beyond what a real client would
+                # thread through via the params dict, exactly like the real API's opaque token.
+                batch_start, cycle_offset = (int(x) for x in params["rvcontinue"].split("|"))
+            batch = self.titles[batch_start: batch_start + gaplimit]
+            cycle_titles = batch[cycle_offset: cycle_offset + self.TRUNCATION_CAP]
+            pages = []
+            for title in batch:
+                if title in cycle_titles:
+                    pages.append({
+                        "title": title,
+                        "revisions": [{
+                            "revid": 1, "timestamp": "2026-01-01T00:00:00Z",
+                            "content": f"Prose for {title}.",
+                        }],
+                    })
+                else:
+                    pages.append({"title": title})  # no "revisions" key -- real truncation shape
+            result = {"query": {"pages": pages}}
+            next_cycle_offset = cycle_offset + self.TRUNCATION_CAP
+            if next_cycle_offset < len(batch):
+                result["continue"] = {"rvcontinue": f"{batch_start}|{next_cycle_offset}"}
+            else:
+                next_batch_start = batch_start + len(batch)
+                if next_batch_start < len(self.titles):
+                    result["continue"] = {"gapcontinue": self.titles[next_batch_start]}
+            return result
+
+    fake_total = 120  # several CONTENT_GAP_LIMIT-sized batches' worth, so continuation is exercised
+    fixed_client = _FakeTruncatingClient(fake_total)
+    fixed_stats = RunStats()
+    fixed_results = list(walk_allpages(fixed_client, "fandom", fixed_stats))
+    check(
+        "CONTENT_GAP_LIMIT (<= the wiki's real per-response content cap): every page is fetched "
+        "with content on its first pass through, zero skips",
+        len(fixed_results) == fake_total
+        and {p.title for p in fixed_results} == set(fixed_client.titles)
+        and fixed_stats.skipped == 0,
+    )
+
+    _original_content_gap_limit = CONTENT_GAP_LIMIT
+    globals()["CONTENT_GAP_LIMIT"] = 500  # the OLD, broken value this task's fix replaces
+    try:
+        broken_client = _FakeTruncatingClient(fake_total)
+        broken_stats = RunStats()
+        broken_results = list(walk_allpages(broken_client, "fandom", broken_stats))
+    finally:
+        globals()["CONTENT_GAP_LIMIT"] = _original_content_gap_limit
+    broken_success_titles = {p.title for p in broken_results}
+    spuriously_skipped_then_succeeded = broken_success_titles & set(broken_stats.skipped_titles)
+    check(
+        "sabotage: reverting to the OLD gaplimit (500) against the identical fake truncation "
+        "logs pages that eventually succeed as skips first (the exact spurious-skip regression "
+        "this task fixes -- not merely 'some pages are bad', but the SAME titles counted both "
+        "ways), proving check 19 is not vacuous",
+        len(broken_results) == fake_total  # the full drain still eventually succeeds...
+        and broken_stats.skip_ratio() > 0.5  # ...but only after this much spurious skip noise...
+        # ...and every single one of those skips was, in the end, a perfectly good page:
+        and spuriously_skipped_then_succeeded == broken_success_titles,
+    )
 
     ok = True
     for name, passed in checks:
