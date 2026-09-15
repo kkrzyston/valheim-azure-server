@@ -332,6 +332,32 @@ def _fresh_state():
     return {"save_windows_captured": 0, "journal_cursor": None, "done": False, "windows": []}
 
 
+def credited_windows_count(windows, threshold=None):
+    """The number of entries in a state['windows'] audit list that meet the
+    STALLCALIB_MIN_PLAYERS_FOR_WINDOW threshold -- i.e. the ONLY authoritative source for
+    save_windows_captured. windows[] records EVERY observed save window (both counted and
+    below-threshold, for audit), each {"at": iso, "players": N}; a malformed entry (not a dict,
+    missing/non-int/bool 'players') is never counted, same defensive discipline as the rest of
+    this module's status/state parsing.
+
+    save_windows_captured must never be maintained as an independently-incrementable integer that
+    can drift from this array -- that drift is exactly how the 2026-09-15 incident's repair nearly
+    shipped a state where the cached counter (3, carried over from the OLD any-player criterion)
+    disagreed with what the array actually supports under the NEW >=2-player rule (0). Deriving
+    the counter FROM the array, every time, makes that class of drift structurally impossible."""
+    threshold = MIN_PLAYERS_FOR_WINDOW if threshold is None else threshold
+    count = 0
+    for w in windows or []:
+        if not isinstance(w, dict):
+            continue
+        players = w.get("players")
+        if isinstance(players, bool) or not isinstance(players, int):
+            continue
+        if players >= threshold:
+            count += 1
+    return count
+
+
 def load_state(path):
     try:
         with open(path) as f:
@@ -347,6 +373,16 @@ def load_state(path):
     st.setdefault("journal_cursor", None)
     st.setdefault("done", False)
     st.setdefault("windows", [])
+
+    # Invariant: save_windows_captured must always equal credited_windows_count(windows). A
+    # mismatch means the file was hand-edited, written by an older version of this script, or
+    # corrupted -- never trust the cached integer over the array it is supposed to summarize.
+    expected = credited_windows_count(st["windows"])
+    if st["save_windows_captured"] != expected:
+        log(f"WARNING: state file save_windows_captured ({st['save_windows_captured']!r}) "
+            f"disagrees with the count recomputed from windows[] ({expected}) under the current "
+            f"{MIN_PLAYERS_FOR_WINDOW}-player threshold -- correcting to {expected}")
+        st["save_windows_captured"] = expected
     return st
 
 
@@ -691,23 +727,29 @@ def run(state_path=None):
             else:
                 state["journal_cursor"] = new_cursor
                 if n_new:
-                    credited = credited_count(n_new, min_players_since_poll)
+                    # Record EVERY newly-observed save window in the audit array, counted or
+                    # not -- these are real observations and the raw samples are useful context
+                    # even when they don't meet the threshold (see module docstring). The
+                    # credited counter is then DERIVED from the array (never incremented
+                    # independently) so it cannot drift from what the array actually supports.
+                    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    for _ in range(n_new):
+                        state["windows"].append({"at": now_iso, "players": min_players_since_poll})
+                    before = state["save_windows_captured"]
+                    state["save_windows_captured"] = credited_windows_count(state["windows"])
+                    credited = state["save_windows_captured"] - before
+                    skipped = n_new - credited
                     if credited:
-                        state["save_windows_captured"] += credited
-                        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                        for _ in range(credited):
-                            state["windows"].append({"at": now_iso, "players": min_players_since_poll})
                         log(f"captured {credited} save window(s) with >= {MIN_PLAYERS_FOR_WINDOW} "
                             f"player(s) connected ({state['save_windows_captured']}/"
                             f"{TARGET_SAVE_WINDOWS} total; min players in this interval: "
                             f"{min_players_since_poll})")
-                    skipped = n_new - credited
                     if skipped:
                         log(f"saw {skipped} save window(s) but did NOT count them -- only "
                             f"{min_players_since_poll} player(s) online during this interval, "
-                            f"below the {MIN_PLAYERS_FOR_WINDOW}-player threshold for counting")
-                    if credited:
-                        save_state(state_path, state)
+                            f"below the {MIN_PLAYERS_FOR_WINDOW}-player threshold for counting "
+                            f"(recorded in state['windows'] for audit)")
+                    save_state(state_path, state)
                 # Reset the per-interval player-count floor for the NEXT poll interval,
                 # regardless of whether this poll found any new save lines.
                 min_players_since_poll = players
@@ -823,6 +865,7 @@ def selftest(keep=False):
               "journal_cursor": None, "done": False, "windows": []})
         st0["save_windows_captured"] = 3
         st0["journal_cursor"] = "s=abc;i=1"
+        st0["windows"] = [{"at": "2026-01-01T00:00:00+00:00", "players": 2} for _ in range(3)]
         save_state(stp, st0)
         st1 = load_state(stp)
         check("state round-trips through save/load", st1["save_windows_captured"] == 3 and
@@ -832,6 +875,48 @@ def selftest(keep=False):
         check("corrupt state file does not crash -- restarts at 0, not done",
               load_state(stp) == {"save_windows_captured": 0, "journal_cursor": None,
                                    "done": False, "windows": []})
+
+        print("save_windows_captured is DERIVED from windows[], never an independently-drifting "
+              "counter (the exact defect the 2026-09-15 repair almost re-shipped: a cached "
+              "counter of 3 surviving under the NEW >=2-player rule when all 3 recorded windows "
+              "were 1-player)")
+        check("credited_windows_count of an empty list is 0", credited_windows_count([]) == 0)
+        all_below = [{"at": "t1", "players": 1}, {"at": "t2", "players": 1},
+                     {"at": "t3", "players": 1}]
+        check("THE lock: all-below-threshold windows[] must report 0 credited, never the raw "
+              "list length", credited_windows_count(all_below) == 0, credited_windows_count(all_below))
+        mixed = all_below + [{"at": "t4", "players": 2}, {"at": "t5", "players": 3}]
+        check("only entries meeting the threshold are credited, in a mixed list",
+              credited_windows_count(mixed) == 2, credited_windows_count(mixed))
+        malformed = [{"at": "t1", "players": "two"}, {"at": "t2"}, "not a dict",
+                     {"at": "t3", "players": True}, {"at": "t4", "players": 2}]
+        check("malformed entries (non-int/bool/missing players, non-dict) are never counted, "
+              "never crash", credited_windows_count(malformed) == 1, credited_windows_count(malformed))
+        check("threshold is configurable on credited_windows_count too",
+              credited_windows_count(all_below, threshold=1) == 3)
+
+        print("load_state enforces the save_windows_captured <-> windows[] invariant -- THE lock "
+              "for item 2 (a stale/hand-edited/legacy counter must never be trusted over the "
+              "array it is supposed to summarize)")
+        stp2 = os.path.join(d, "state-invariant.json")
+        with open(stp2, "w") as f:
+            json.dump({"save_windows_captured": 3, "journal_cursor": "s=x;i=1", "done": False,
+                       "windows": all_below}, f)   # exactly the bad repair shape: cached 3,
+                                                    # array only supports 0 under the new rule
+        st_loaded = load_state(stp2)
+        check("THE lock: a loaded counter that disagrees with windows[] is corrected on load, "
+              "not trusted verbatim", st_loaded["save_windows_captured"] == 0, st_loaded)
+        check("the disagreeing windows[] entries are preserved, not discarded (still useful "
+              "audit context)", st_loaded["windows"] == all_below, st_loaded["windows"])
+        # And the positive case: a counter that already agrees with the array must round-trip
+        # unchanged (the invariant check must not be a "reset to 0" landmine).
+        stp3 = os.path.join(d, "state-agrees.json")
+        with open(stp3, "w") as f:
+            json.dump({"save_windows_captured": 2, "journal_cursor": "s=y;i=2", "done": False,
+                       "windows": mixed}, f)
+        st_agrees = load_state(stp3)
+        check("a counter that already agrees with windows[] is left alone",
+              st_agrees["save_windows_captured"] == 2, st_agrees)
 
         print("journal cursor parsing")
 
