@@ -178,6 +178,105 @@ _STOPWORDS = frozenset({
     "the", "a", "an", "of", "for", "in", "on", "to", "it",
 })
 
+# ---------------------------------------------------------------- domain synonym expansion
+# Stopword-stripping fixed the "grammatical filler" half of the vocabulary problem, but a real
+# incident (a live search for "Boar health" and "how much health does a Boar have" both losing to
+# "Boar Jerky") showed a second, different half: the querier's word and the CORPUS's word for the
+# same concept are sometimes just different tokens, and FTS5's default tokenizer does not stem --
+# "health" and "hp" share no characters in common as far as MATCH is concerned. That is not a
+# ranking bug: BM25 and the curated-boost comparability gate (_rank_with_curated_boost) both
+# behave correctly on the terms they are actually given. "Boar Jerky" (a food item) legitimately
+# contains BOTH "health" and "hp" in its own text, so on the query "boar health" it genuinely
+# matches better than a curated Boar record that only ever says "HP" -- the fix has to happen
+# before ranking, in what terms reach FTS5 at all.
+#
+# Every group below was checked against valheim-curated-numbers.jsonl's ACTUAL text (not chosen
+# because it "sounds right" -- see the incident this responds to, which was exactly that mistake):
+#   - health/hp/hitpoints: the Bonemass/Boar/Blob curated records say "HP"; the Blueberries
+#     record says BOTH "8 health" and "1 hp/tick" in the same sentence -- direct proof the real
+#     corpus uses both words interchangeably depending on which record you land on.
+#     "hitpoints" is included because this bug's own report used "Boar hitpoints star level" as a
+#     query a player would plausibly type.
+#   - damage/dmg: the corpus always spells this out ("Attack damage", "Poison damage", "Slash
+#     damage", "Blunt damage", "Pierce damage", "Chop (tree) damage" -- every weapon/creature
+#     record) and never abbreviates it; "dmg" is a querier-only shorthand that would otherwise
+#     match nothing. ("attack" is NOT added here -- curated text already pairs it with "damage"
+#     verbatim, e.g. "Attack damage by star level", so a query containing "attack" already matches
+#     the corpus directly with no gap to close.)
+#   - armor/armour: every curated armor stat (Bronze Buckler, Banded Shield: "Block armor by
+#     quality level") uses the US spelling; nothing in the corpus will ever match the UK spelling.
+#   - weak/weakness: the corpus states a weakness inline as "Weak to X" (adjective, e.g.
+#     Bonemass/Boar/Blob), never the singular noun "weakness" a player asks with -- those two
+#     share no token by default. Deliberately does NOT also include the plural "weaknesses" even
+#     though that's a conventional wiki section-heading name (as in this module's own e2e
+#     selftest fixture, heading="Weaknesses"): expanding to it was tried and reverted after it
+#     broke the pre-existing "comparable curated wins" selftest -- an exact heading-field match
+#     (5x weight, one-word field) handed the wiki record a large, artificial lead that had nothing
+#     to do with the query being asked, only with which page happens to title its section
+#     "Weaknesses" verbatim. "weak" alone already closes the real gap (the adjective vs. the
+#     singular noun) without that landmine.
+#   - resistance/resist/resistant: the same gap as weak/weakness -- the corpus says "resistant to
+#     X" / "very resistant to Y" (Bonemass, Blob), never the noun "resistance" or verb "resist" a
+#     question would contain. This also repairs a latent gap in the pre-existing ALIASES table:
+#     every "<element> resistance" entry expands to the literal word "Resistance", which without
+#     this group still would never have matched the corpus's "resistant".
+#   - drops/drop/loot: "Drops" is the corpus's own section-heading and prose vocabulary (see
+#     _RELATION_KEYWORDS' "drop"/"drops" canonicalization used elsewhere in this module for the
+#     same convention); "loot" is the common player-side word the corpus does not use.
+#   - spawn/spawns/found/location: creature pages describe where something appears as "found in
+#     the X biome" (see _sections_materially_differ()'s own worked example), never "spawns in" --
+#     "spawn" is what a player asks, "found"/"location" is the corpus's actual word.
+#   - craft/crafted/crafting/recipe: every curated crafting record says "crafted ... at a Forge"
+#     (verb), never the noun "recipe" a player is at least as likely to ask for.
+#   - tame/tameable: the curated Boar record literally says "(Meadows, tameable)" -- the one-word
+#     adjective, not the verb "tame" a player would naturally type ("can I tame a Boar").
+#
+# Deliberately NOT added, after checking rather than assuming: "stamina" (the corpus already just
+# says "stamina" -- e.g. Blueberries' "25 stamina" -- with no abbreviation observed anywhere to
+# bridge) and "durability" (every curated weapon/armor record already says "Durability by quality
+# level" verbatim, matching the most natural way to ask about it). Neither has an observed
+# corpus-vocabulary gap, and adding a synonym with nothing real to bridge only spends
+# _MAX_SYNONYM_EXPANSIONS' budget for no benefit.
+_SYNONYM_GROUPS = (
+    frozenset({"health", "hp", "hitpoints"}),
+    frozenset({"damage", "dmg"}),
+    frozenset({"armor", "armour"}),
+    frozenset({"weak", "weakness"}),
+    frozenset({"resistance", "resist", "resistant"}),
+    frozenset({"drops", "drop", "loot"}),
+    frozenset({"spawn", "spawns", "found", "location"}),
+    frozenset({"craft", "crafted", "crafting", "recipe"}),
+    frozenset({"tame", "tameable"}),
+)
+
+# Caps how many NEW terms a single query can gain from synonym expansion, independent of
+# _MAX_TERMS' overall backstop -- a query that happens to touch several groups at once (e.g. "weak
+# resistant hp drops") must not silently balloon the eventual OR expression far past what the
+# user actually typed.
+_MAX_SYNONYM_EXPANSIONS = 6
+
+
+def _expand_synonyms(terms):
+    """Return `terms` plus, for each _SYNONYM_GROUPS member already present, every OTHER member
+    of that group -- OR'd in exactly like every other term _build_match_expression produces,
+    never ANDed, so this can only ever widen recall, never narrow it. Order-preserving and capped
+    at _MAX_SYNONYM_EXPANSIONS total additions so a query touching several groups at once cannot
+    inflate the eventual MATCH expression without bound. Never raises; a plain list in, a plain
+    list out, exactly like _strip_stopwords()."""
+    present = set(terms)
+    added = []
+    for group in _SYNONYM_GROUPS:
+        if len(added) >= _MAX_SYNONYM_EXPANSIONS:
+            break
+        if not (present & group):
+            continue
+        for word in sorted(group - present):
+            if len(added) >= _MAX_SYNONYM_EXPANSIONS:
+                break
+            added.append(word)
+            present.add(word)
+    return terms + added
+
 
 def _strip_stopwords(terms):
     """Drop _STOPWORDS members from `terms` so the remaining entity words carry the query's full
@@ -215,11 +314,17 @@ def _build_match_expression(query):
     if not terms:
         return None
 
-    # Strip English filler AFTER alias expansion (so an alias's canonical terms are also subject
-    # to it -- moot today since no ALIASES value tokenizes to a stopword, but harmless either
-    # way) and BEFORE truncating to _MAX_TERMS, so the budget of terms that actually reach FTS5
-    # is spent on entity words first, not used up on "does"/"have"/"a". _strip_stopwords()
-    # guarantees this can never turn a non-empty `terms` into an empty one.
+    # Synonym expansion AFTER alias expansion (so e.g. an ALIASES-added "resistance" from "frost
+    # resistance" also pulls in "resistant" -- see _SYNONYM_GROUPS' comment) and BEFORE stopword
+    # stripping (moot either way today: every synonym is a content word, never a _STOPWORDS
+    # member, so the two passes cannot interact).
+    terms = _expand_synonyms(terms)
+
+    # Strip English filler AFTER alias/synonym expansion (so their added terms are also subject
+    # to it -- moot today since none of them tokenize to a stopword, but harmless either way) and
+    # BEFORE truncating to _MAX_TERMS, so the budget of terms that actually reach FTS5 is spent on
+    # entity words first, not used up on "does"/"have"/"a". _strip_stopwords() guarantees this can
+    # never turn a non-empty `terms` into an empty one.
     terms = _strip_stopwords(terms)
 
     quoted = []
@@ -1092,6 +1197,53 @@ def cmd_selftest():
           f"and must keep working: {old_norse_stripped!r} (want unchanged {old_norse_terms!r})")
     all_ok = all_ok and old_norse_untouched_ok
 
+    print("\n--- _expand_synonyms(): closing the vocabulary gap stopwords couldn't ---")
+    # "Boar health" and "how much health does a Boar have" both survived the stopword fix
+    # unbroken on the live index -- confirmed by the coordinator against the real 5,911-section
+    # index -- because the curated Boar record's actual text says "HP", never "health". This is
+    # the second, independent fix for that: see _SYNONYM_GROUPS' module comment for how each
+    # group was derived from the real corpus rather than assumed.
+    health_expanded = sorted(_expand_synonyms(["boar", "health"]))
+    health_expand_ok = health_expanded == sorted({"boar", "health", "hp", "hitpoints"})
+    print(f"{'PASS' if health_expand_ok else 'FAIL'} 'health' expands to include 'hp' and "
+          f"'hitpoints' (OR'd, not replacing the original term): {health_expanded!r}")
+    all_ok = all_ok and health_expand_ok
+
+    or_not_and_ok = "boar" in _expand_synonyms(["boar", "health"])
+    print(f"{'PASS' if or_not_and_ok else 'FAIL'} synonym expansion adds terms, it never removes "
+          f"the query's own terms -- expansion can only widen recall, never narrow it: "
+          f"{_expand_synonyms(['boar', 'health'])!r}")
+    all_ok = all_ok and or_not_and_ok
+
+    cap_probe_terms = ["health", "damage", "armor", "weak", "resistance", "drops", "spawn",
+                       "craft", "tame"]
+    cap_probe_expanded = _expand_synonyms(cap_probe_terms)
+    cap_added = len(cap_probe_expanded) - len(cap_probe_terms)
+    # Deliberately does NOT compare against the live _MAX_SYNONYM_EXPANSIONS constant -- a test
+    # that asks "did the code respect its own (possibly-just-broken) limit" is not a lock at all,
+    # it would pass no matter how large that constant were sabotaged to. Pinned instead against a
+    # literal 6 (today's actual designed cap) and against the true uncapped total, computed
+    # independently straight from _SYNONYM_GROUPS' real membership (one probe term per group,
+    # touching all nine groups defined above): 2+1+1+1+2+2+3+3+1 = 16 possible new terms with no
+    # cap at all, so a correctly-capped result must land strictly below that.
+    uncapped_total = sum(
+        len(group - set(cap_probe_terms)) for group in _SYNONYM_GROUPS
+        if set(cap_probe_terms) & group
+    )
+    cap_ok = cap_added == 6 and uncapped_total == 16 and cap_added < uncapped_total
+    print(f"{'PASS' if cap_ok else 'FAIL'} a query touching every synonym group at once gains "
+          f"exactly the pinned cap of 6 new terms, strictly fewer than the {uncapped_total} an "
+          f"uncapped expansion would add (one probe term per group): added={cap_added} "
+          f"result={cap_probe_expanded!r}")
+    all_ok = all_ok and cap_ok
+
+    old_norse_synonym_untouched = _expand_synonyms(old_norse_terms)
+    old_norse_synonym_ok = old_norse_synonym_untouched == old_norse_terms
+    print(f"{'PASS' if old_norse_synonym_ok else 'FAIL'} synonym expansion leaves Old Norse "
+          f"terms untouched (no group contains a non-English word): "
+          f"{old_norse_synonym_untouched!r} (want unchanged {old_norse_terms!r})")
+    all_ok = all_ok and old_norse_synonym_ok
+
     print("\n--- _STOPWORDS checked against the actual corpus -- never swallows a real entity ---")
     # This codifies the manual check performed before choosing _STOPWORDS (see its module-level
     # comment): every candidate word was looked up as an exact page title against BOTH live wikis
@@ -1154,23 +1306,30 @@ def cmd_selftest():
           f"swallowed={sabotaged_swallowed!r}")
     all_ok = all_ok and collision_check_catches_real_entity_ok
 
-    print("\n--- English stopword fix, end-to-end through a REAL FTS5 index with realistic "
+    print("\n--- stopword + synonym fix, end-to-end through a REAL FTS5 index with realistic "
           "decoys ---")
-    # Reproduces the actual live-deployment defect: a curated Boar record with the real HP
-    # numbers exists and is reachable, but loses to food items ("Boar Jerky", "Boar Meat") and to
-    # a generic "Health" page once a natural-language question brings enough English filler words
-    # into the query for their sheer incidental prose-matching volume to outscore the short,
-    # precisely-relevant curated record. The fandom "Boar" creature page and a "Poison >
-    # Stacking" page are included as further decoys -- with this exact fixture, sabotaging the
-    # fix (making _strip_stopwords a no-op) reproduces the exact observed wrong top result,
-    # "[fandom] Poison > Stacking", for the first query below.
-    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-stopwords-") as tmp_dir:
+    # Reproduces the actual live-deployment defect, TWICE over. The curated Boar record below
+    # uses its REAL text verbatim from valheim-curated-numbers.jsonl (source of truth for what
+    # the corpus actually says -- see _SYNONYM_GROUPS' module comment): it says "HP", never
+    # "health". Round 1 (stopwords) was verified against the live 5,911-section index and did NOT
+    # fix "Boar health" or "how much health does a Boar have" -- both still lost to Boar Jerky,
+    # because the curated record's real text simply does not contain the word "health" at all, so
+    # no amount of filler-stripping could have helped; the querier says "health", the corpus says
+    # "HP", and that is a vocabulary gap, not a ranking bug. The decoys below are real
+    # competition, not a fixture that quietly avoids the problem: "Boar Jerky", "Boar Meat", and
+    # "Whole Roasted Meadow Boar" (a real Valheim food item) all legitimately contain "health" in
+    # their own text, exactly like the live index's actual Boar Jerky page does. A generic
+    # "Health" page and a "Poison > Stacking" page are included too, reproducing the original
+    # stopword-fix scenario in the same fixture.
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-vocab-") as tmp_dir:
         records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
-        stopword_db = os.path.join(tmp_dir, "wiki.db")
+        vocab_db = os.path.join(tmp_dir, "wiki.db")
         boar_records = [
             {"title": "Boar", "heading": "Curated: Creature Stats",
-             "text": "Boar: 1-star 10 health, 2-star 20 health, 3-star 40 health. Deals 10 "
-                     "blunt damage.",
+             "text": "Boar (Meadows, tameable): HP by star level -- 0-star: 10, 1-star: 20, "
+                     "2-star: 30. Attack damage by star level -- 0-star: 10 Blunt, 1-star: 15 "
+                     "Blunt, 2-star: 20 Blunt (attack usable every 5s). Stagger threshold: 50%. "
+                     "Immune to Spirit damage.",
              "source": "curated", "revid": 1001,
              "url": "https://example.invalid/curated/boar", "timestamp": ""},
             {"title": "Boar", "heading": "Overview",
@@ -1180,16 +1339,23 @@ def cmd_selftest():
              "source": "fandom", "revid": 1002,
              "url": "https://example.invalid/fandom/boar", "timestamp": ""},
             {"title": "Boar Jerky", "heading": "Food",
-             "text": "Boar Jerky is a food item made from Boar Meat. It restores 25 health "
-                     "and 60 stamina over a duration of 1200 seconds. Boar Jerky is crafted at "
-                     "a Cooking Station using Boar Meat and salt.",
+             "text": "Boar Jerky is a food item made from Boar Meat. It restores 25 health, "
+                     "1.5 hp/tick regeneration, and 60 stamina over a duration of 1200 seconds. "
+                     "Boar Jerky is crafted at a Cooking Station using Boar Meat and salt.",
              "source": "fandom", "revid": 1003,
              "url": "https://example.invalid/fandom/boar-jerky", "timestamp": ""},
             {"title": "Boar Meat", "heading": "Raw Material",
-             "text": "Boar Meat is a raw material dropped by killing a Boar. It can be cooked "
-                     "over a campfire or used to craft Boar Jerky and other Boar meat dishes.",
+             "text": "Boar Meat is a raw food item dropped by killing a Boar. It must be "
+                     "cooked before eating -- the cooked version restores health. Also used to "
+                     "craft Boar Jerky.",
              "source": "fandom", "revid": 1004,
              "url": "https://example.invalid/fandom/boar-meat", "timestamp": ""},
+            {"title": "Whole Roasted Meadow Boar", "heading": "Food",
+             "text": "Whole Roasted Meadow Boar is a high-value food item made from an entire "
+                     "Boar. It restores a large amount of health and stamina over an extended "
+                     "duration.",
+             "source": "fandom", "revid": 1006,
+             "url": "https://example.invalid/fandom/whole-roasted-meadow-boar", "timestamp": ""},
             {"title": "Health", "heading": "Overview",
              "text": "Health is a core survival stat. A player's health does decrease when "
                      "they take damage and does regenerate over time. How much health a "
@@ -1201,17 +1367,17 @@ def cmd_selftest():
              "text": "Poison damage does stack when a player is hit multiple times. How much "
                      "poison a creature has applied does increase over time and does not "
                      "reset until it has worn off completely.",
-             "source": "fandom", "revid": 1006,
+             "source": "fandom", "revid": 1007,
              "url": "https://example.invalid/fandom/poison-stacking", "timestamp": ""},
         ]
         with open(records_path, "w", encoding="utf-8") as fh:
             for rec in boar_records:
                 fh.write(json.dumps(rec) + "\n")
-        build_index(records_path=records_path, db_path=stopword_db)
+        build_index(records_path=records_path, db_path=vocab_db)
 
         original_db_path = DB_PATH_DEFAULT
         try:
-            DB_PATH_DEFAULT = stopword_db
+            DB_PATH_DEFAULT = vocab_db
             _reset_cache_for_tests()
 
             def top_source_title(query):
@@ -1221,49 +1387,51 @@ def cmd_selftest():
             filler_query_result = top_source_title("how much health does a Boar have")
             filler_query_ok = filler_query_result == ("curated", "Boar")
             print(f"{'PASS' if filler_query_ok else 'FAIL'} REAL index: 'how much health does "
-                  f"a Boar have' -- the main reported failure -- now returns the curated Boar "
-                  f"record first instead of a food item or the generic Health page: "
-                  f"{filler_query_result!r}")
+                  f"a Boar have' -- the main reported failure -- returns the curated Boar record "
+                  f"first against real competing decoys (Boar Jerky, Boar Meat, Whole Roasted "
+                  f"Meadow Boar, generic Health, Poison>Stacking), even though the curated "
+                  f"record's own text never says the word 'health': {filler_query_result!r}")
             all_ok = all_ok and filler_query_ok
+
+            boar_health_result = top_source_title("Boar health")
+            boar_health_ok = boar_health_result == ("curated", "Boar")
+            print(f"{'PASS' if boar_health_ok else 'FAIL'} REAL index: 'Boar health' -- the "
+                  f"second reported failure, confirmed on the live index to survive the "
+                  f"stopword-only fix untouched -- now returns curated Boar first via synonym "
+                  f"expansion (health<->hp), against decoys that legitimately contain the "
+                  f"literal word 'health': {boar_health_result!r}")
+            all_ok = all_ok and boar_health_ok
 
             star_level_result = top_source_title("Boar hitpoints star level")
             star_level_ok = star_level_result == ("curated", "Boar")
             print(f"{'PASS' if star_level_ok else 'FAIL'} REAL index: 'Boar hitpoints star "
-                  f"level' (already correct pre-fix) still returns curated Boar first: "
-                  f"{star_level_result!r}")
+                  f"level' (already correct before either fix) still returns curated Boar "
+                  f"first: {star_level_result!r}")
             all_ok = all_ok and star_level_ok
 
+            # NOTE on the bare query 'Boar': tokenizes to ["boar"] alone -- no _STOPWORDS member
+            # and no _SYNONYM_GROUPS member, so neither fix can change _build_match_expression's
+            # output for it (confirmed: sabotaging either _strip_stopwords or _expand_synonyms
+            # into a no-op does not change this query's result in this fixture). Asserted below
+            # as a regression check on the pre-existing curated-boost + bm25 mechanism (tested in
+            # its own right earlier in this selftest) -- still, honestly, not a lock on either of
+            # this session's two fixes, for the same structural reason "Boar health" used to be
+            # (until the synonym fix gave IT a real vocabulary gap to close).
             bare_boar_result = top_source_title("Boar")
             bare_boar_ok = bare_boar_result == ("curated", "Boar")
             print(f"{'PASS' if bare_boar_ok else 'FAIL'} REAL index: the bare query 'Boar' "
-                  f"(already correct pre-fix) still returns curated Boar first: "
+                  f"still returns curated Boar first -- NOT a lock on either fix (no stopword or "
+                  f"synonym term is present to strip or expand; see the comment above): "
                   f"{bare_boar_result!r}")
             all_ok = all_ok and bare_boar_ok
 
             old_norse_result = top_source_title("hvat er heilsa Boar")
             old_norse_ok = old_norse_result == ("curated", "Boar")
             print(f"{'PASS' if old_norse_ok else 'FAIL'} REAL index: the Old Norse phrasing "
-                  f"'hvat er heilsa Boar' (already correct pre-fix, because its filler matches "
-                  f"nothing) still returns curated Boar first: {old_norse_result!r}")
+                  f"'hvat er heilsa Boar' (already correct before either fix, because its filler "
+                  f"matches nothing and neither fix touches non-English tokens) still returns "
+                  f"curated Boar first: {old_norse_result!r}")
             all_ok = all_ok and old_norse_ok
-
-            # NOTE on 'Boar health': tokenizes to ["boar", "health"] -- ZERO stopwords, so
-            # _build_match_expression("Boar health") is byte-identical with or without this fix
-            # (confirmed by temporarily making _strip_stopwords a no-op against this exact
-            # fixture: the result did not change). It is asserted below as a regression check on
-            # the current, already-correct ranking in THIS fixture (curated Boar's short
-            # title/text wins the bm25 + curated-boost comparison against the longer food-item
-            # decoys) -- NOT as a lock on the stopword fix, because no stopword-only change CAN
-            # affect a query that contains no stopwords. See this session's report for why the
-            # live 5,911-section index's "WRONG ORDER" result for this exact query is a separate
-            # ranking issue that stopword stripping does not address.
-            boar_health_result = top_source_title("Boar health")
-            boar_health_ok = boar_health_result == ("curated", "Boar")
-            print(f"{'PASS' if boar_health_ok else 'FAIL'} REAL index: 'Boar health' returns "
-                  f"curated Boar first in this fixture -- NOT a lock on the stopword fix (this "
-                  f"query has no stopwords to strip; see the comment above): "
-                  f"{boar_health_result!r}")
-            all_ok = all_ok and boar_health_ok
         finally:
             DB_PATH_DEFAULT = original_db_path
             _reset_cache_for_tests()
