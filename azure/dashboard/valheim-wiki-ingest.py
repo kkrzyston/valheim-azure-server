@@ -51,7 +51,7 @@ the original wording as self-contradictory):
 
 USAGE:
     python valheim-wiki-ingest.py [--out PATH] [--limit N] [--offline DIR] [--dump-path PATH]
-                                   [--contact TEXT] [-v]
+                                   [--contact TEXT] [--curated PATH] [-v]
 
     --out PATH        Output path for the JSONL corpus. Default: wiki-records.jsonl under
                        $VALHEIM_WIKI_ROOT (default /var/lib/valheim-wiki), matching
@@ -76,6 +76,23 @@ USAGE:
                        BASE_USER_AGENT below) sent with every live HTTP request. Also settable via
                        the WIKI_INGEST_CONTACT environment variable (this flag wins if both are
                        given). Meaningless with --offline.
+    --curated PATH     Path to the hand-curated, cross-wiki-verified facts JSONL (see
+                       valheim-curated-numbers.jsonl's own header and this task's report) merged
+                       into the emitted corpus verbatim, alongside the wiki-derived records --
+                       every entry there was confirmed present and IDENTICAL on both wikis before
+                       being written, so it carries `source: "curated"` rather than
+                       "fandom"/"weirdgloop" and is never re-derived or collapsed against the wiki
+                       records that happen to share its (title, heading). Default: the file's
+                       installed location, $VALHEIM_WIKI_ROOT/valheim-curated-numbers.jsonl (see
+                       WIKI_ROOT below -- install-dashboard.sh still needs a line copying the
+                       checked-in file there; not done as part of this task, see its report). A
+                       MISSING file at this path is not an error (the curated layer is optional
+                       and may not be installed yet) -- 0 curated facts are merged, logged at
+                       INFO. A file that EXISTS but is malformed (invalid JSON, a non-object line,
+                       a line missing a required field) IS a hard failure (see load_curated()):
+                       logged, nothing written, non-zero exit -- silently ingesting none (or a
+                       truncated subset) of the one layer the bot trusts most is exactly the quiet
+                       degradation this codebase's failure policy exists to catch elsewhere.
     -v / --verbose     DEBUG-level logging instead of INFO.
 
 Exit codes: 0 = wrote a corpus file (see FAILURE POLICY above for what "0" does and does not
@@ -248,6 +265,23 @@ ROW_TABLE_TEMPLATES = {
 # matter how many times the timer fired. See this task's report (C2) for the full chain.
 WIKI_ROOT = os.environ.get("VALHEIM_WIKI_ROOT", "/var/lib/valheim-wiki").rstrip("/")
 
+# ---------------------------------------------------------------- curated facts layer
+# Same WIKI_ROOT convention as --out's default above, for the same reason: an operator running
+# this script by hand and the weekly unit both find the curated file in the one place both this
+# script and valheim-wiki-index.py already agree is where THIS wiki's data lives -- not next to
+# the script itself under /usr/local/sbin, which ProtectSystem=strict makes read-only anyway (see
+# --out's own comment above for the C2 bug this exact mistake caused once already). Installing the
+# checked-in azure/dashboard/valheim-curated-numbers.jsonl to this path is install-dashboard.sh's
+# job, NOT done as part of this task -- see this task's report.
+DEFAULT_CURATED_PATH = os.path.join(WIKI_ROOT, "valheim-curated-numbers.jsonl")
+
+# The same 7 fields Record.to_json_line() emits for every wiki-derived record (see that class) --
+# a curated line must carry all of them so the index needs no special-casing (_load_records()
+# there checks for exactly this set). A curated line MAY carry additional fields beyond these
+# (e.g. "provenance" -- see valheim-curated-numbers.jsonl's own header) since both _load_records()
+# and build_index() there only ever read specific keys by name and ignore the rest.
+REQUIRED_CURATED_FIELDS = ("title", "heading", "text", "source", "revid", "timestamp", "url")
+
 _LOG = logging.getLogger("valheim-wiki-ingest")
 
 
@@ -296,6 +330,99 @@ class Record:
             ensure_ascii=False,
             sort_keys=True,
         )
+
+
+@dataclass
+class CuratedRecord:
+    """One hand-verified fact loaded verbatim from the curated facts file (see --curated /
+    load_curated()). Unlike Record (rebuilt fresh, field by field, from a freshly-parsed wiki page
+    every run), a CuratedRecord's JSON is exactly what the curated file's own author wrote -- this
+    class only adds sort_key()/to_json_line() so write_corpus() can sort and serialize curated and
+    wiki-derived records identically, in one pass, without reconstructing (and thereby silently
+    dropping) whatever fields the curated file carries beyond the 7 the corpus format requires
+    (see REQUIRED_CURATED_FIELDS and valheim-curated-numbers.jsonl's own header for the
+    provenance fields this preserves: which wiki(s) a fact came from, the page title(s), and the
+    revision id(s) it was read from)."""
+
+    raw: dict
+
+    def sort_key(self):
+        # Mirrors Record.sort_key() exactly (PLAN-v6.md step 7: sorted by (title, heading, source)
+        # for a byte-stable re-run) so curated and wiki-derived records interleave by title rather
+        # than curated records always sorting as one block regardless of subject.
+        return (self.raw.get("title", ""), self.raw.get("heading", ""), self.raw.get("source", ""))
+
+    def to_json_line(self) -> str:
+        # Re-serialized with the SAME json.dumps() arguments Record.to_json_line() uses
+        # (sort_keys=True, ensure_ascii=False) so a curated line's on-disk formatting is
+        # byte-for-byte indistinguishable in style from a wiki-derived line -- required for
+        # PLAN-v6.md step 7's byte-stable re-run, and this is also what "needs no special-casing"
+        # from the index actually means in practice: same shape in, same shape on disk.
+        return json.dumps(self.raw, ensure_ascii=False, sort_keys=True)
+
+
+class CuratedFileError(Exception):
+    """Raised by load_curated() for a MALFORMED curated file: invalid JSON on some line, a line
+    that isn't a JSON object, or one missing a field the corpus format requires. Per this task's
+    explicit requirement, a malformed curated file is a HARD failure -- logged, run() writes
+    nothing and returns 1 -- never a silently-skipped line. This file is the one layer the bot
+    ranks above the wikis themselves; silently ingesting none (or a truncated subset) of it would
+    be the exact quiet-degradation failure mode RunStats.record_skip()'s own docstring already
+    names as something this codebase has been bitten by twice on the wiki-fetch side. The trusted
+    layer either loads completely and correctly, or the run fails loudly -- no partial credit."""
+
+
+def load_curated(path: str) -> list:
+    """Load hand-curated, cross-wiki-verified facts from `path` (see --curated) as a list of
+    CuratedRecord, ready to concatenate onto the wiki-derived `records` list before write_corpus().
+
+    A MISSING file is NOT an error: the curated layer is optional, and before
+    valheim-curated-numbers.jsonl is installed alongside this script (see --curated's own --help
+    text on install-dashboard.sh), the default path simply does not exist yet on a given host.
+    Returns [] and logs at INFO -- the ordinary run() failure policy for the wiki sources
+    themselves is completely unaffected by this file being absent.
+
+    A file that EXISTS but cannot be parsed, or that has a line missing a field the corpus format
+    requires (REQUIRED_CURATED_FIELDS), or a `source` field that isn't literally "curated", or a
+    `revid` that isn't an int, raises CuratedFileError -- see that class's own docstring for why
+    this is a hard failure rather than a per-line skip (the usual per-PAGE skip/continue policy
+    the wiki-fetch side uses does not apply here: there is no plausible partial-trust reading of a
+    file whose entire purpose is being MORE trustworthy than the wikis it's ranked above)."""
+    if not os.path.isfile(path):
+        _LOG.info("no curated facts file at %s -- skipping curated merge (0 facts)", path)
+        return []
+
+    records = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise CuratedFileError(f"{path}: line {line_no}: invalid JSON -- {exc}") from exc
+            if not isinstance(obj, dict):
+                raise CuratedFileError(
+                    f"{path}: line {line_no}: expected a JSON object, got {type(obj).__name__}"
+                )
+            missing = [k for k in REQUIRED_CURATED_FIELDS if k not in obj]
+            if missing:
+                raise CuratedFileError(
+                    f"{path}: line {line_no}: missing required field(s) {missing!r}"
+                )
+            revid = obj.get("revid")
+            if not isinstance(revid, int) or isinstance(revid, bool):
+                raise CuratedFileError(
+                    f"{path}: line {line_no}: 'revid' must be an int, got {revid!r}"
+                )
+            if obj.get("source") != "curated":
+                raise CuratedFileError(
+                    f"{path}: line {line_no}: 'source' must be \"curated\", got {obj.get('source')!r}"
+                )
+            records.append(CuratedRecord(obj))
+    _LOG.info("curated: %d fact(s) loaded from %s", len(records), path)
+    return records
 
 
 @dataclass
@@ -1176,6 +1303,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="path to cache the decompressed Fandom dump XML at, or reuse it from if present",
     )
     p.add_argument("--contact", default=None, help="override the User-Agent contact token")
+    p.add_argument(
+        "--curated", default=DEFAULT_CURATED_PATH, metavar="PATH",
+        help="path to the curated facts JSONL merged into the corpus (see module docstring's "
+             "USAGE section); default: %(default)s -- a missing file is skipped, a malformed one "
+             "is a hard failure (see load_curated())",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     p.add_argument(
         "--selftest", action="store_true",
@@ -1278,8 +1411,21 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Curated facts are loaded and merged in AFTER the wiki-fetch failure policy above has already
+    # decided this run's wiki-derived records are trustworthy enough to write -- the curated layer
+    # is orthogonal to that decision (see load_curated()'s docstring): it's checked here, and only
+    # a MALFORMED curated file (never a missing one) turns into the same "write nothing" outcome a
+    # wiki-side hard failure would, per this task's explicit requirement.
     try:
-        written = write_corpus(records, args.out)
+        curated_records = load_curated(args.curated)
+    except CuratedFileError as exc:
+        _LOG.error(
+            "SUMMARY: hard failure -- curated facts file is malformed: %s -- writing nothing", exc,
+        )
+        return 1
+
+    try:
+        written = write_corpus(records + curated_records, args.out)
     except OSError as exc:
         _LOG.error("SUMMARY: could not write %s: %r -- writing nothing", args.out, exc)
         return 1
@@ -1287,9 +1433,10 @@ def run(args: argparse.Namespace) -> int:
     log_level = logging.WARNING if stats.skipped else logging.INFO
     _LOG.log(
         log_level,
-        "SUMMARY: wrote %d records (%d pages) to %s -- %d/%d pages attempted, %d skipped%s",
-        written, stats.succeeded, args.out, stats.succeeded, stats.attempted, stats.skipped,
-        (": " + ", ".join(stats.skipped_titles)) if stats.skipped_titles else "",
+        "SUMMARY: wrote %d records (%d pages, %d curated facts) to %s -- %d/%d pages attempted, "
+        "%d skipped%s",
+        written, stats.succeeded, len(curated_records), args.out, stats.succeeded, stats.attempted,
+        stats.skipped, (": " + ", ".join(stats.skipped_titles)) if stats.skipped_titles else "",
     )
     return 0
 
@@ -1548,9 +1695,15 @@ def selftest() -> int:
     # FABRICATED args namespace (no shelling out, no real argparse.parse_args() call) -- this is
     # what actually reproduces C1's real bug (a run that fetches nothing) and proves the fix, per
     # this task's requirement that --offline "was built for this and never wired into a test."
-    def _fabricate_args(out_path, offline_dir, limit=None):
+    def _fabricate_args(out_path, offline_dir, limit=None, curated=None):
+        # `curated` defaults to a path that provably does not exist (inside this call's own
+        # offline_dir, so it never collides with another check's fixtures) -- load_curated()
+        # treats a missing file as "0 curated facts, not an error" (see its own docstring), which
+        # is exactly the behavior every PRE-EXISTING check below this point (12-14) relies on:
+        # none of them are about the curated layer, so none of them should be affected by it.
         return argparse.Namespace(
             out=out_path, limit=limit, offline=offline_dir, dump_path=None, contact=None,
+            curated=curated or os.path.join(offline_dir, "__no_curated_file_here__.jsonl"),
         )
 
     def _write_fandom_fixture(fixture_dir, pages):
@@ -1635,6 +1788,135 @@ def selftest() -> int:
         check(
             "just-under-5% skip ratio exits 0 and writes every good page (skip logged, not dropped)",
             rc_c == 0 and wrote_all_good_pages,
+        )
+
+    # 15-18. The curated facts layer (--curated / load_curated() / CuratedRecord): a curated
+    # record survives into the corpus tagged source: "curated"; it is never dropped or collapsed
+    # by this script's own merge (even one sharing the exact (title, heading) of a real wiki
+    # record); a malformed curated file is a hard failure (logged, non-zero exit, nothing
+    # written) rather than a silent skip; and a re-run with a curated file present stays
+    # byte-identical. Same rule as every check above: each was watched to actually fail (by
+    # temporarily breaking the corresponding load_curated()/run() code) before being confirmed
+    # passing again -- see this task's report.
+    def _curated_fact(title="Test Curated Subject", heading="", revid=999001):
+        return {
+            "title": title,
+            "heading": heading,
+            "text": "Test Curated Subject: 12345 Test Units (synthetic selftest fixture).",
+            "source": "curated",
+            "revid": revid,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "url": "https://example.invalid/curated/test",
+        }
+
+    def _write_curated_file(path, lines):
+        with open(path, "w", encoding="utf-8") as fh:
+            for entry in lines:
+                fh.write(entry if isinstance(entry, str) else json.dumps(entry))
+                fh.write("\n")
+
+    def _read_jsonl(path):
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            return [json.loads(l) for l in fh if l.strip()]
+
+    with tempfile.TemporaryDirectory(prefix="wiki-ingest-selftest-curated-") as curated_tmpdir:
+        # (15) A curated record survives into the emitted corpus, tagged source: "curated".
+        fixtures_15 = os.path.join(curated_tmpdir, "fixtures_15")
+        _write_fandom_fixture(fixtures_15, _make_pages(total=3, bad_count=0))
+        curated_15 = os.path.join(curated_tmpdir, "curated_15.jsonl")
+        _write_curated_file(curated_15, [_curated_fact()])
+        out_15 = os.path.join(curated_tmpdir, "out_15.jsonl")
+        rc_15 = run(_fabricate_args(out_15, fixtures_15, curated=curated_15))
+        recs_15 = _read_jsonl(out_15) or []
+        curated_kept = [r for r in recs_15 if r.get("source") == "curated"]
+        check(
+            "a curated record survives into the emitted corpus tagged source: 'curated'",
+            rc_15 == 0 and len(curated_kept) == 1
+            and curated_kept[0]["title"] == "Test Curated Subject"
+            and "12345 Test Units" in curated_kept[0]["text"],
+        )
+
+        # (16) A curated record sharing the EXACT (title, heading) of a real wiki-derived record
+        # survives as its OWN extra line rather than being merged/deduped away by this script's
+        # own concatenation step -- W2's index owns the actual cross-wiki dedupe rule (and, per
+        # its own _dedupe() docstring, already passes any non-fandom/weirdgloop source through
+        # untouched); this check guards the merge THIS script does, in run(), specifically.
+        fixtures_16 = os.path.join(curated_tmpdir, "fixtures_16")
+        _write_fandom_fixture(fixtures_16, [
+            {"title": "Shared Subject", "wikitext": "Some real wiki prose here.",
+             "revid": 1, "timestamp": "2026-01-01T00:00:00Z"},
+        ])
+        curated_16 = os.path.join(curated_tmpdir, "curated_16.jsonl")
+        _write_curated_file(curated_16, [_curated_fact(title="Shared Subject", heading="")])
+        out_16 = os.path.join(curated_tmpdir, "out_16.jsonl")
+        rc_16 = run(_fabricate_args(out_16, fixtures_16, curated=curated_16))
+        recs_16 = _read_jsonl(out_16) or []
+        shared_group = [
+            r for r in recs_16 if r.get("title") == "Shared Subject" and r.get("heading") == ""
+        ]
+        check(
+            "a curated record sharing (title, heading) with a real wiki record survives as an "
+            "extra line, not merged/collapsed away by this script's own merge",
+            rc_16 == 0 and len(shared_group) == 2
+            and {r["source"] for r in shared_group} == {"fandom", "curated"},
+        )
+
+        # (17) A malformed curated file -- invalid JSON on some line, or a line missing a field
+        # the corpus format requires -- is a HARD failure: logged, non-zero exit, nothing
+        # written. Never a silently-skipped line, per this task's explicit requirement (this is
+        # the trusted layer; silently ingesting none of it must not look like success).
+        fixtures_17 = os.path.join(curated_tmpdir, "fixtures_17")
+        _write_fandom_fixture(fixtures_17, _make_pages(total=3, bad_count=0))
+
+        bad_json_17 = os.path.join(curated_tmpdir, "curated_bad_json.jsonl")
+        _write_curated_file(bad_json_17, ['{"title": "Broken", "heading": '])  # truncated JSON
+        out_17a = os.path.join(curated_tmpdir, "out_17a.jsonl")
+        log_handler_17 = _ListLogHandler()
+        _LOG.addHandler(log_handler_17)
+        try:
+            rc_17a = run(_fabricate_args(out_17a, fixtures_17, curated=bad_json_17))
+        finally:
+            _LOG.removeHandler(log_handler_17)
+        logged_hard_failure_17 = any(
+            r.levelno == logging.ERROR and "malformed" in r.getMessage()
+            for r in log_handler_17.records
+        )
+
+        missing_field_17 = os.path.join(curated_tmpdir, "curated_missing_field.jsonl")
+        _write_curated_file(missing_field_17, [
+            {"title": "Broken", "heading": "", "source": "curated", "revid": 1,
+             "timestamp": "2026-01-01T00:00:00Z"},  # missing "text" and "url"
+        ])
+        out_17b = os.path.join(curated_tmpdir, "out_17b.jsonl")
+        rc_17b = run(_fabricate_args(out_17b, fixtures_17, curated=missing_field_17))
+
+        check(
+            "a malformed curated file (invalid JSON, or a line missing a required field) is a "
+            "hard failure -- logged, non-zero exit, nothing written -- never a silent skip",
+            rc_17a != 0 and not os.path.exists(out_17a) and logged_hard_failure_17
+            and rc_17b != 0 and not os.path.exists(out_17b),
+        )
+
+        # (18) A re-run with a curated file present stays byte-identical (PLAN-v6.md step 7's
+        # byte-stable re-run guarantee, now proven to hold with the curated layer merged in too).
+        fixtures_18 = os.path.join(curated_tmpdir, "fixtures_18")
+        _write_fandom_fixture(fixtures_18, _make_pages(total=5, bad_count=0))
+        curated_18 = os.path.join(curated_tmpdir, "curated_18.jsonl")
+        _write_curated_file(curated_18, [
+            _curated_fact(title="Zeta Subject", revid=999002),
+            _curated_fact(title="Alpha Subject", revid=999003),
+        ])
+        out_18a = os.path.join(curated_tmpdir, "out_18a.jsonl")
+        out_18b = os.path.join(curated_tmpdir, "out_18b.jsonl")
+        rc_18a = run(_fabricate_args(out_18a, fixtures_18, curated=curated_18))
+        rc_18b = run(_fabricate_args(out_18b, fixtures_18, curated=curated_18))
+        bytes_18a = open(out_18a, "rb").read() if os.path.exists(out_18a) else None
+        bytes_18b = open(out_18b, "rb").read() if os.path.exists(out_18b) else None
+        check(
+            "a re-run with a curated file present stays byte-identical",
+            rc_18a == 0 and rc_18b == 0 and bytes_18a is not None and bytes_18a == bytes_18b,
         )
 
     ok = True
