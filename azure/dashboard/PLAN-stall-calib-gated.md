@@ -143,3 +143,89 @@ runs `--selftest` before touching the running unit, `daemon-reload`s, and `enabl
 deliberately enabled, not merely installed, since the whole point is to catch the next play
 session unattended. Idempotent: re-running the installer just re-installs the same files and
 re-runs selftest; it never touches `stallcalib-state.json` or the sample data.
+
+## Incident: idle-gap cursor sweep falsely marked calibration "done" (2026-09-15)
+
+PR#8's fix only seeded `journal_cursor` on the *first-ever* gate-open (`journal_cursor is None`).
+A session ran ~11:41-12:01 UTC and disconnected, leaving `journal_cursor` pointing at ~12:01. The
+server then sat empty until 14:56:54 UTC (~3 hours). On that reconnect the gate opened, sampling
+started -- but because a cursor already existed, nothing re-seeded it, so the very next journal
+poll ran `journalctl --after-cursor <12:01 cursor>`, which swept the *entire empty-server gap*:
+~6 saves at the ~30-min cadence, none of them with a player connected. All six were credited as
+"save windows with players connected" in one poll, jumping `save_windows_captured` 3 -> 8 in a
+single line and tripping the `done` state before the evening's real play session -- the one this
+whole calibration exists to capture -- could run at all. Live evidence:
+
+```
+{"save_windows_captured": 8, "journal_cursor": "s=e330ec...", "done": true, "done_at": "2026-09-15T21:56:54+00:00"}
+```
+```
+14:56:54  valheim-stall-calib: 1 player(s) online -- sampling at 10 Hz
+14:56:54  valheim-stall-calib: captured 5 save window(s) with players connected (8/5 total)
+14:56:54  valheim-stall-calib: calibration complete
+```
+all three lines in the same second, with zero new 10 Hz samples written in between -- the tell
+that the "5 windows" it just claimed were never actually sampled through, they were swept from
+journal history that predates the reconnect.
+
+**Fix 1 -- re-seed the cursor on EVERY gate-open, not just the first.** `maybe_seed_journal_cursor`
+(seed-if-missing) is now `reseed_journal_cursor_at_gate_open` (seed-unconditionally): every
+players 0->N transition discards whatever cursor was left over from before and starts the journal
+window fresh at the moment of reconnect. A save can only be credited if it happened after this
+moment, which by construction excludes anything from an idle gap, no matter how long the gap was.
+Locked by a selftest that reproduces this incident's exact shape (a stale cursor from "the previous
+session," reseed asserted, then an idle-gap `PrepareSave` shown to be structurally unreachable
+because `journalctl --after-cursor` is pointed at the fresh cursor) -- reverting the fix back to
+seed-if-missing makes that lock fail immediately (see PR mutation-test evidence).
+
+**Fix 2 -- repair state, re-arm.** The corrupted state (`save_windows_captured: 8, done: true`) was
+replaced with a recount of only the windows that genuinely had a player connected and sampled
+(from the raw `stallcalib-2026-09-15.jsonl`): three saves, 18:46:43 [205ms], 18:58:36 [146ms],
+19:00:41 [215ms], all inside the single continuous sampling stint 18:42:25-19:01:29 UTC. `done` is
+reset to `false` and the cursor is re-seeded at repair time so it cannot re-credit anything from
+before the fix was deployed.
+
+**Fix 3 -- require >= 2 concurrent players to COUNT a window (`STALLCALIB_MIN_PLAYERS_FOR_WINDOW`,
+default 2, env-configurable).** The 1-player stall symptom under investigation (position blinking,
+hit-registration mismatch) is reported only when several players are clustered together, and `rq`
+is quantized at 2112 bytes (one packet) -- a single player's inbound rate is a much smaller signal
+than several players' combined rate, so it is plausible that a ~150-200ms stall simply cannot push
+one player's backlog past even a single quantum step. All three of the "valid" windows above are
+1-player windows with `rq` flat at zero throughout -- consistent with *either* "no stall happened"
+*or* "the stall happened but was too small at n=1 to register," and the existing data cannot tell
+those two apart. A 1-player window is therefore weak evidence either way and must not retire the
+calibration target: sampling still runs at n=1 (the data stays useful context, e.g. for the rq
+excursion investigation below), but only a window where the minimum player count over the whole
+poll interval was >= the threshold moves `save_windows_captured`. Every counted window's player
+count is now recorded in `state["windows"]` for audit.
+
+## Investigation: 18 non-zero `rq` excursions with no nearby save (2026-09-15)
+
+In the existing capture (`stallcalib-2026-09-15.jsonl`, 11,443 samples, 18:42:25-19:01:29 UTC),
+`rq` is non-zero in exactly 18 samples -- quantized at multiples of 2112 bytes (max 6336),
+clustered 18:49:30-18:56:09 UTC with one straggler at 18:58:59 -- while flat zero through all
+three real (1-player) save windows. All 18 occurred at `n=1`.
+
+- **journal cross-reference:** the game's own journal is silent through the whole cluster except
+  for its routine ~10-minute `Connections N ZDOS:... sent:... recv:...` heartbeat line at 18:49:04
+  UTC (just before the cluster starts) -- no save, backup, spawn, or ZDO-burst log line falls
+  inside the 18:49:30-18:56:09 window. **Could not determine** a journal-visible cause.
+- **egress-probe cross-reference:** matching each excursion's timestamp to the nearest 1 Hz sample
+  in `egress-2026-09-15.jsonl`, 5 of the 18 land within ~1-2s of an unusually large outbound burst
+  (`txb` ~50-100 KB in one 1s sample vs. a ~1-1.3 KB baseline, average packet size near max MTU) --
+  suggestive of a bulk ZDO/terrain sync send to the one connected client. The other 13 have no
+  such burst at their nearest 1 Hz sample. This is a partial, unconfirmed correlation, not a
+  proven cause: the egress probe's 1 Hz granularity is far coarser than the 100ms-resolution `rq`
+  excursions, so exact causal alignment cannot be established, and it does not explain the
+  majority of the 18.
+- **Explicitly NOT concluding `rq` is "blind."** With only one player connected throughout this
+  capture, the same "too little inbound rate to push past one quantum" limitation that motivates
+  Fix 3 applies here too: these 18 excursions could be genuine (small) stall backlogs, or they
+  could be ordinary single-quantum jitter in a low, mostly-zero baseline -- the data as collected
+  cannot distinguish the two. Resolving this needs windows with >= 2 concurrent players, which is
+  exactly what Fix 3 is designed to collect going forward.
+
+**Verdict: could not determine** a definitive cause for the 18 `rq` excursions. Best lead is the
+partial outbound-burst correlation above; the open question (genuine small stall vs. quantization
+noise at low signal) is left for the >= 2-player data this fix now requires before counting a
+window.
