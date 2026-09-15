@@ -49,9 +49,27 @@ never fabricated -- same convention as valheim-egress-probe.py). Fields per line
   rtt_status  "ok" | "timeout" | "error:..." | absent (not an A2S tick)
 
 State (survives restart/reboot): $STALLCALIB_DIR/stallcalib-state.json --
-  {"save_windows_captured": N, "journal_cursor": "...", "done": bool, "done_at": "..."}
+  {"save_windows_captured": N, "journal_cursor": "...", "done": bool, "done_at": "...",
+   "windows": [{"at": "...", "players": N}, ...]}
 Once "done" is true the service idles forever (cheap status polling only, no sampling, no writes)
 until the state file is removed by an operator who wants to re-arm it.
+
+Journal cursor is re-seeded at EVERY gate-open (every players 0->N transition), not just the
+first-ever one. An idle gap between sessions (server empty, then a player reconnects) must never
+let a stale cursor from before the gap sweep in that gap's journal history and credit its save
+windows -- that happened once already (see PR write-up: an idle-period cursor swept ~3 hours of
+empty-server saves and jumped the counter 3->8 in one poll, tripping a false "done"). Re-seeding
+unconditionally on every gate-open closes that hole for good: only saves that occur after THIS
+connection can ever be credited, no matter how long the server sat empty before it.
+
+A window is only credited toward save_windows_captured if at least STALLCALIB_MIN_PLAYERS_FOR_WINDOW
+(default 2) players were online for the whole interval since the last journal poll (approximated
+as the minimum player count observed during that interval). Sampling itself still runs at n=1 --
+that data remains useful context -- but a 1-player window is weak evidence for what this
+calibration is trying to see: rq is quantized at 2112 bytes (one packet), and a single player's
+inbound rate may simply be too low for a ~150-200ms stall to push a backlog past that quantum, so
+a flat-zero 1-player window does not distinguish "no stall" from "stall too small to see at n=1".
+Every CREDITED window's player count is recorded in state["windows"] for audit.
 
 Drop accounting: every dropped sample increments an in-memory counter by reason, surfaced on
 every heartbeat log line (never silently discarded, never fabricated/interpolated).
@@ -152,6 +170,11 @@ HEARTBEAT_SEC = _env_num("STALLCALIB_HEARTBEAT_SEC", 1800.0)
 # coincidental packet-timing artifact while keeping the ask small: at one save every ~30 minutes,
 # 5 windows is ~2.5 hours of cumulative play time, realistic within a few evening sessions.
 TARGET_SAVE_WINDOWS = _env_num("STALLCALIB_TARGET_WINDOWS", 5, int)
+
+# A save window only counts toward TARGET_SAVE_WINDOWS if at least this many players were online
+# for the whole interval since the last journal poll -- see module docstring. Sampling still runs
+# at n=1; only the counter is gated.
+MIN_PLAYERS_FOR_WINDOW = _env_num("STALLCALIB_MIN_PLAYERS_FOR_WINDOW", 2, int)
 
 RETAIN_DAYS = _env_num("STALLCALIB_RETAIN_DAYS", 14, int)
 MAX_MB = _env_num("STALLCALIB_MAX_MB", 60.0)
@@ -305,20 +328,61 @@ def dt_is_sane(dt):
 
 # ---------------------------------------------------------------- state (persists the
 # calibration's progress and "done" flag across restarts/reboots)
+def _fresh_state():
+    return {"save_windows_captured": 0, "journal_cursor": None, "done": False, "windows": []}
+
+
+def credited_windows_count(windows, threshold=None):
+    """The number of entries in a state['windows'] audit list that meet the
+    STALLCALIB_MIN_PLAYERS_FOR_WINDOW threshold -- i.e. the ONLY authoritative source for
+    save_windows_captured. windows[] records EVERY observed save window (both counted and
+    below-threshold, for audit), each {"at": iso, "players": N}; a malformed entry (not a dict,
+    missing/non-int/bool 'players') is never counted, same defensive discipline as the rest of
+    this module's status/state parsing.
+
+    save_windows_captured must never be maintained as an independently-incrementable integer that
+    can drift from this array -- that drift is exactly how the 2026-09-15 incident's repair nearly
+    shipped a state where the cached counter (3, carried over from the OLD any-player criterion)
+    disagreed with what the array actually supports under the NEW >=2-player rule (0). Deriving
+    the counter FROM the array, every time, makes that class of drift structurally impossible."""
+    threshold = MIN_PLAYERS_FOR_WINDOW if threshold is None else threshold
+    count = 0
+    for w in windows or []:
+        if not isinstance(w, dict):
+            continue
+        players = w.get("players")
+        if isinstance(players, bool) or not isinstance(players, int):
+            continue
+        if players >= threshold:
+            count += 1
+    return count
+
+
 def load_state(path):
     try:
         with open(path) as f:
             st = json.load(f)
     except FileNotFoundError:
-        return {"save_windows_captured": 0, "journal_cursor": None, "done": False}
+        return _fresh_state()
     except Exception as e:
         log(f"WARNING: could not read state file {path} ({e!r}) -- starting fresh at 0 windows")
-        return {"save_windows_captured": 0, "journal_cursor": None, "done": False}
+        return _fresh_state()
     if not isinstance(st, dict):
-        return {"save_windows_captured": 0, "journal_cursor": None, "done": False}
+        return _fresh_state()
     st.setdefault("save_windows_captured", 0)
     st.setdefault("journal_cursor", None)
     st.setdefault("done", False)
+    st.setdefault("windows", [])
+
+    # Invariant: save_windows_captured must always equal credited_windows_count(windows). A
+    # mismatch means the file was hand-edited, written by an older version of this script, or
+    # corrupted -- never trust the cached integer over the array it is supposed to summarize.
+    expected = credited_windows_count(st["windows"])
+    if st["save_windows_captured"] != expected:
+        log(f"WARNING: state file save_windows_captured ({st['save_windows_captured']!r}) "
+            f"disagrees with the count recomputed from windows[] ({expected}) under the current "
+            f"{MIN_PLAYERS_FOR_WINDOW}-player threshold -- correcting to {expected}")
+        st["save_windows_captured"] = expected
     return st
 
 
@@ -351,8 +415,8 @@ def count_new_save_windows(unit, cursor):
     if cursor:
         cmd += ["--after-cursor", cursor]
     else:
-        # No cursor yet -- this should be rare: maybe_seed_journal_cursor() seeds one at
-        # gate-open (the first players>0 transition) precisely so this branch is not the normal
+        # No cursor yet -- this should be rare: reseed_journal_cursor_at_gate_open() seeds one at
+        # gate-open (every players 0->N transition) precisely so this branch is not the normal
         # path. If it IS hit (e.g. the seed call itself failed), keep the blind spot as narrow as
         # possible: a save in the preceding JOURNAL_POLL_SEC is indistinguishable from one during
         # play, but a save from minutes before player connect is not -- so this must never be a
@@ -385,10 +449,30 @@ def count_new_save_windows(unit, cursor):
     return count, new_cursor, None
 
 
+def credited_count(n_new, min_players_since_poll, threshold=None):
+    """How many of `n_new` newly-observed PrepareSave lines should be credited toward
+    save_windows_captured, given the minimum player count observed since the previous poll.
+
+    A window counts only if at least `threshold` (STALLCALIB_MIN_PLAYERS_FOR_WINDOW, default 2)
+    players were online for the ENTIRE interval since the last poll -- approximated here as the
+    minimum player count sampled during that interval, since a save may land anywhere inside it.
+    A single connected player is weak evidence for the stall this calibration is trying to see
+    (rq is quantized at 2112 bytes/1 packet; one player's inbound rate may be too low to push a
+    ~150-200ms stall's backlog past even that one quantum) -- so 1-player windows are still
+    sampled (the data stays useful context) but never counted toward the target.
+
+    Returns 0 if min_players_since_poll is None (no player-count sample landed in this interval,
+    e.g. the gate opened and closed between polls)."""
+    threshold = MIN_PLAYERS_FOR_WINDOW if threshold is None else threshold
+    if min_players_since_poll is None:
+        return 0
+    return n_new if min_players_since_poll >= threshold else 0
+
+
 def seed_journal_cursor(unit):
     """(cursor_or_None, error_or_None). Returns the journal cursor at "now" -- i.e. the position
     after 0 matched lines (`-n 0`) -- WITHOUT counting or skipping anything. Used to seed
-    state['journal_cursor'] at gate-open time (see maybe_seed_journal_cursor) so a later
+    state['journal_cursor'] at gate-open time (see reseed_journal_cursor_at_gate_open) so a later
     --after-cursor poll can only ever see journal entries written after this call, never anything
     from before. Shares count_new_save_windows's "rc=1 with empty stdout+stderr means nothing
     matched" convention (an empty journal for this unit)."""
@@ -407,29 +491,36 @@ def seed_journal_cursor(unit):
     return None, None
 
 
-def maybe_seed_journal_cursor(state, unit):
-    """Called once, exactly at the moment sampling starts (players 0 -> >0), and only when no
-    journal_cursor has EVER been recorded (state['journal_cursor'] is None). Mutates state in
-    place and returns True if it seeded a cursor (caller should persist state).
+def reseed_journal_cursor_at_gate_open(state, unit):
+    """Called every time sampling starts (every players 0 -> >0 transition), UNCONDITIONALLY --
+    not only on the first-ever gate-open. Mutates state in place and returns True if it (re)seeded
+    a cursor (caller should persist state).
 
-    This is the fix for item 1 of the PR#8 review: on the very first invocation ever,
-    journal_cursor is None, so count_new_save_windows() used to fall back to a multi-minute
-    lookback window. A PrepareSave in that window -- while the server was still empty -- was
-    indistinguishable from one during play and got credited toward save_windows_captured, which
-    defeats the entire purpose of the save-window target (ruling out a coincidental artifact:
-    that window would have had NO rq samples at all). Seeding the cursor at gate-open time means
-    only saves that occur after a player has actually connected can ever be counted."""
-    if state.get("journal_cursor") is not None:
-        return False
+    History: PR#8 fixed the "on the very first invocation ever, journal_cursor is None" case
+    (item 1 of that review) by seeding a cursor at gate-open, but only when journal_cursor was
+    still None. That reintroduced the identical defect on the SECOND+ gate-open: a session that
+    ran, disconnected leaving journal_cursor pointing at that session's end, then sat empty for
+    hours before someone reconnected, would poll --after-cursor <the old cursor> on reconnect --
+    sweeping the ENTIRE empty-server gap and crediting every save in it as "captured with players
+    connected". This is exactly what happened on 2026-09-15: a ~3-hour idle gap got swept in one
+    poll and jumped save_windows_captured 3->8, tripping a false "done" before the evening's real
+    play session could be captured.
+
+    The fix is to never trust an existing cursor across a gate transition: a save may only be
+    credited if it occurred while the gate was OPEN, and the only way to guarantee that is to
+    discard all journal history up to the moment of THIS gate-open, every time, regardless of
+    whether a cursor already existed."""
     cursor, err = seed_journal_cursor(unit)
     if err:
         log(f"WARNING: could not seed journal cursor at gate-open ({err}) -- falling back to "
             f"the narrow {JOURNAL_POLL_SEC:g}s lookback on the next poll instead")
         return False
     if cursor:
+        had_prior = state.get("journal_cursor") is not None
         state["journal_cursor"] = cursor
-        log("seeded journal cursor at gate-open -- only save windows after this moment can be "
-            "credited toward the target")
+        log(("re-seeded" if had_prior else "seeded") +
+            " journal cursor at gate-open -- discarding any prior/idle-period journal history; "
+            "only save windows from this moment forward can be credited toward the target")
         return True
     return False
 
@@ -560,6 +651,7 @@ def run(state_path=None):
     last_prune_wall = 0.0
     was_sampling = False
     last_why = None
+    min_players_since_poll = None
 
     log(f"started: target {TARGET_SAVE_WINDOWS} save window(s) with players connected, "
         f"{state['save_windows_captured']} already captured, done={state['done']}, "
@@ -605,13 +697,15 @@ def run(state_path=None):
 
         if sampling and not was_sampling:
             log(f"{players} player(s) online -- sampling at {SAMPLE_HZ:g} Hz")
-            if maybe_seed_journal_cursor(state, VALHEIM_UNIT):
+            if reseed_journal_cursor_at_gate_open(state, VALHEIM_UNIT):
                 save_state(state_path, state)
+            min_players_since_poll = None
         elif was_sampling and not sampling:
             log("server empty -- sampling stopped")
             if buf:
                 buf = flush_records(LIB, buf)
             last_mono = None
+            min_players_since_poll = None
             heartbeat("idle")
         was_sampling = sampling
 
@@ -619,6 +713,9 @@ def run(state_path=None):
             time.sleep(IDLE_POLL_SEC)
             next_tick = time.monotonic()
             continue
+
+        min_players_since_poll = (players if min_players_since_poll is None
+                                   else min(min_players_since_poll, players))
 
         # --- count save windows that occurred while someone was connected, on a slow poll
         if mono >= next_journal_poll:
@@ -630,10 +727,32 @@ def run(state_path=None):
             else:
                 state["journal_cursor"] = new_cursor
                 if n_new:
-                    state["save_windows_captured"] += n_new
-                    log(f"captured {n_new} save window(s) with players connected "
-                        f"({state['save_windows_captured']}/{TARGET_SAVE_WINDOWS} total)")
+                    # Record EVERY newly-observed save window in the audit array, counted or
+                    # not -- these are real observations and the raw samples are useful context
+                    # even when they don't meet the threshold (see module docstring). The
+                    # credited counter is then DERIVED from the array (never incremented
+                    # independently) so it cannot drift from what the array actually supports.
+                    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    for _ in range(n_new):
+                        state["windows"].append({"at": now_iso, "players": min_players_since_poll})
+                    before = state["save_windows_captured"]
+                    state["save_windows_captured"] = credited_windows_count(state["windows"])
+                    credited = state["save_windows_captured"] - before
+                    skipped = n_new - credited
+                    if credited:
+                        log(f"captured {credited} save window(s) with >= {MIN_PLAYERS_FOR_WINDOW} "
+                            f"player(s) connected ({state['save_windows_captured']}/"
+                            f"{TARGET_SAVE_WINDOWS} total; min players in this interval: "
+                            f"{min_players_since_poll})")
+                    if skipped:
+                        log(f"saw {skipped} save window(s) but did NOT count them -- only "
+                            f"{min_players_since_poll} player(s) online during this interval, "
+                            f"below the {MIN_PLAYERS_FOR_WINDOW}-player threshold for counting "
+                            f"(recorded in state['windows'] for audit)")
                     save_state(state_path, state)
+                # Reset the per-interval player-count floor for the NEXT poll interval,
+                # regardless of whether this poll found any new save lines.
+                min_players_since_poll = players
                 if state["save_windows_captured"] >= TARGET_SAVE_WINDOWS:
                     state["done"] = True
                     state["done_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -743,9 +862,10 @@ def selftest(keep=False):
         stp = os.path.join(d, "state.json")
         st0 = load_state(stp)
         check("fresh state starts at 0 windows, not done", st0 == {"save_windows_captured": 0,
-              "journal_cursor": None, "done": False})
+              "journal_cursor": None, "done": False, "windows": []})
         st0["save_windows_captured"] = 3
         st0["journal_cursor"] = "s=abc;i=1"
+        st0["windows"] = [{"at": "2026-01-01T00:00:00+00:00", "players": 2} for _ in range(3)]
         save_state(stp, st0)
         st1 = load_state(stp)
         check("state round-trips through save/load", st1["save_windows_captured"] == 3 and
@@ -753,7 +873,50 @@ def selftest(keep=False):
         with open(stp, "w") as f:
             f.write("{not json")
         check("corrupt state file does not crash -- restarts at 0, not done",
-              load_state(stp) == {"save_windows_captured": 0, "journal_cursor": None, "done": False})
+              load_state(stp) == {"save_windows_captured": 0, "journal_cursor": None,
+                                   "done": False, "windows": []})
+
+        print("save_windows_captured is DERIVED from windows[], never an independently-drifting "
+              "counter (the exact defect the 2026-09-15 repair almost re-shipped: a cached "
+              "counter of 3 surviving under the NEW >=2-player rule when all 3 recorded windows "
+              "were 1-player)")
+        check("credited_windows_count of an empty list is 0", credited_windows_count([]) == 0)
+        all_below = [{"at": "t1", "players": 1}, {"at": "t2", "players": 1},
+                     {"at": "t3", "players": 1}]
+        check("THE lock: all-below-threshold windows[] must report 0 credited, never the raw "
+              "list length", credited_windows_count(all_below) == 0, credited_windows_count(all_below))
+        mixed = all_below + [{"at": "t4", "players": 2}, {"at": "t5", "players": 3}]
+        check("only entries meeting the threshold are credited, in a mixed list",
+              credited_windows_count(mixed) == 2, credited_windows_count(mixed))
+        malformed = [{"at": "t1", "players": "two"}, {"at": "t2"}, "not a dict",
+                     {"at": "t3", "players": True}, {"at": "t4", "players": 2}]
+        check("malformed entries (non-int/bool/missing players, non-dict) are never counted, "
+              "never crash", credited_windows_count(malformed) == 1, credited_windows_count(malformed))
+        check("threshold is configurable on credited_windows_count too",
+              credited_windows_count(all_below, threshold=1) == 3)
+
+        print("load_state enforces the save_windows_captured <-> windows[] invariant -- THE lock "
+              "for item 2 (a stale/hand-edited/legacy counter must never be trusted over the "
+              "array it is supposed to summarize)")
+        stp2 = os.path.join(d, "state-invariant.json")
+        with open(stp2, "w") as f:
+            json.dump({"save_windows_captured": 3, "journal_cursor": "s=x;i=1", "done": False,
+                       "windows": all_below}, f)   # exactly the bad repair shape: cached 3,
+                                                    # array only supports 0 under the new rule
+        st_loaded = load_state(stp2)
+        check("THE lock: a loaded counter that disagrees with windows[] is corrected on load, "
+              "not trusted verbatim", st_loaded["save_windows_captured"] == 0, st_loaded)
+        check("the disagreeing windows[] entries are preserved, not discarded (still useful "
+              "audit context)", st_loaded["windows"] == all_below, st_loaded["windows"])
+        # And the positive case: a counter that already agrees with the array must round-trip
+        # unchanged (the invariant check must not be a "reset to 0" landmine).
+        stp3 = os.path.join(d, "state-agrees.json")
+        with open(stp3, "w") as f:
+            json.dump({"save_windows_captured": 2, "journal_cursor": "s=y;i=2", "done": False,
+                       "windows": mixed}, f)
+        st_agrees = load_state(stp3)
+        check("a counter that already agrees with windows[] is left alone",
+              st_agrees["save_windows_captured"] == 2, st_agrees)
 
         print("journal cursor parsing")
 
@@ -881,17 +1044,11 @@ def selftest(keep=False):
                   "-n" in m.call_args[0][0] and
                   m.call_args[0][0][m.call_args[0][0].index("-n") + 1] == "0", m.call_args)
 
-        st_seed = {"save_windows_captured": 0, "journal_cursor": None, "done": False}
+        st_seed = {"save_windows_captured": 0, "journal_cursor": None, "done": False, "windows": []}
         with mock.patch("subprocess.run", return_value=FakeCompleted("-- cursor: s=seed;i=5\n")):
-            changed = maybe_seed_journal_cursor(st_seed, "valheim.service")
+            changed = reseed_journal_cursor_at_gate_open(st_seed, "valheim.service")
         check("first-ever gate-open seeds the cursor",
               changed and st_seed["journal_cursor"] == "s=seed;i=5", st_seed)
-
-        st_already = {"save_windows_captured": 1, "journal_cursor": "s=existing;i=1", "done": False}
-        with mock.patch("subprocess.run") as m2:
-            changed2 = maybe_seed_journal_cursor(st_already, "valheim.service")
-            check("a cursor that already exists is never re-seeded (only the first-ever gate-open)",
-                  not changed2 and not m2.called, (changed2, m2.called))
 
         # THE lock this item exists for: a PrepareSave that happened while the server was still
         # empty (i.e. before the seeded cursor) must never be credited once the cursor is seeded.
@@ -902,6 +1059,57 @@ def selftest(keep=False):
                   "--after-cursor" in m3.call_args[0][0], m3.call_args)
             check("a save after the seeded cursor IS counted (the instrument still works)",
                   n == 1 and err2 is None, (n, err2))
+
+        print("journal cursor is RE-seeded on EVERY gate-open, not just the first-ever one -- "
+              "this is THE fix for tonight's false-'done' bug (an idle gap between sessions must "
+              "never let a stale cursor sweep that gap's saves once a player reconnects)")
+        # A second (or Nth) gate-open arrives with a journal_cursor already set, left over from
+        # the PREVIOUS session -- exactly the shape of the live incident: a player disconnected
+        # at ~12:01, the server sat empty for ~3 hours, then someone reconnected at 14:56:54 with
+        # the stale ~12:01 cursor still in state.
+        st_stale = {"save_windows_captured": 3, "journal_cursor": "s=stale_from_prev_session;i=1",
+                    "done": False, "windows": []}
+        with mock.patch("subprocess.run",
+                         return_value=FakeCompleted("-- cursor: s=fresh_at_reconnect;i=99\n")) as m4:
+            changed4 = reseed_journal_cursor_at_gate_open(st_stale, "valheim.service")
+        check("gate-open re-seeds EVEN THOUGH a journal_cursor already existed from a prior "
+              "session -- THE assertion this whole item is for",
+              changed4 and st_stale["journal_cursor"] == "s=fresh_at_reconnect;i=99", st_stale)
+        check("the reseed call itself still asks for 0 lines (must not count anything)",
+              "-n" in m4.call_args[0][0] and
+              m4.call_args[0][0][m4.call_args[0][0].index("-n") + 1] == "0", m4.call_args)
+
+        # End-to-end shape of the live incident: with the cursor now pointing at the moment of
+        # reconnect, a poll for new save windows must query --after-cursor from THAT fresh point,
+        # so an idle-gap save (one that happened before reconnect, while the server sat empty)
+        # is structurally unreachable -- it is before the cursor journalctl is told to start from.
+        with mock.patch("subprocess.run", return_value=FakeCompleted(
+                "-- cursor: s=fresh_at_reconnect;i=99\n")) as m5:   # no PrepareSave lines: the
+            # idle-gap saves are before this cursor and journalctl --after-cursor cannot see them
+            n5, cur5, err5 = count_new_save_windows("valheim.service", st_stale["journal_cursor"])
+            args5 = m5.call_args[0][0]
+            check("poll after re-seed queries --after-cursor from the FRESH (post-reconnect) "
+                  "cursor, not the stale pre-idle-gap one",
+                  "--after-cursor" in args5 and
+                  args5[args5.index("--after-cursor") + 1] == "s=fresh_at_reconnect;i=99", args5)
+            check("no idle-gap windows are credited (journalctl only sees post-reconnect entries)",
+                  n5 == 0 and err5 is None, (n5, err5))
+
+        print("counted-window player-count gate: >= STALLCALIB_MIN_PLAYERS_FOR_WINDOW players "
+              "required for the WHOLE interval to count a window (item 3) -- a lone player is "
+              "still sampled but must never move save_windows_captured")
+        check("default threshold is 2", MIN_PLAYERS_FOR_WINDOW == 2, MIN_PLAYERS_FOR_WINDOW)
+        check("1 player online for the interval: window is seen but NOT credited",
+              credited_count(1, 1) == 0)
+        check("2 players (the default threshold) online: window IS credited",
+              credited_count(1, 2) == 1)
+        check("more than the threshold: still credited (>= not ==)", credited_count(1, 5) == 1)
+        check("multiple new windows in one poll are all credited/withheld together",
+              credited_count(3, 2) == 3 and credited_count(3, 1) == 0)
+        check("no player-count sample landed this interval (None) -- never credited, not even "
+              "with a low explicit threshold", credited_count(1, None, threshold=1) == 0)
+        check("threshold is configurable via the credited_count() argument",
+              credited_count(1, 1, threshold=1) == 1 and credited_count(1, 1, threshold=2) == 0)
 
         # Defense in depth: even if seeding itself failed (cursor still None when polling), the
         # blind-spot window must be bounded to JOURNAL_POLL_SEC, never the old 5-minute fallback.
