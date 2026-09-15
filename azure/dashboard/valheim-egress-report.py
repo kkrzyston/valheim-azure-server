@@ -2,60 +2,60 @@
 """valheim-egress-report.py -- offline analysis of the 1 Hz egress samples. Run by hand.
 
 THE HYPOTHESIS UNDER TEST (H): game egress is limited by Valheim's own per-peer send budget
-(ZDOMan's m_dataPerSec, historically 61440 B/s), not by the VM, the kernel or the network. If H
-holds, adding players or world activity does not buy more bytes -- it buys staler updates, which
-is what players describe when they say it only stutters when everyone is in one place.
+(ZDOMan's m_dataPerSec), not by the VM, the kernel or the network. If H holds, adding players or
+world activity does not buy more bytes -- it buys staler updates, which is what players describe
+when they say it only stutters when everyone is in one place.
 
 This script exists to be able to say NO. A plateau in a graph is not evidence of a ceiling: a
-server that is simply never asked for more than 250 KB/s also produces a flat line. So the report
-leads with six refutation conditions, and prints REFUTED the moment one fires:
+server that is simply never asked for more than 250 KB/s draws the same flat line. So it leads
+with six refutation conditions and prints REFUTED the moment one fires:
 
-  R1  any clean 1-second sample above the arithmetic ceiling (+5%). A budget you exceed is not a
-      budget. This is the cheapest and most decisive test in the whole file.
+  R1  any clean sample above the arithmetic ceiling (+5%). A budget you exceed is not a budget.
   R2  the plateau does not scale with player count. A per-PEER budget must be per-peer; a level
       that is the same for two players and for five is some other limit wearing its clothes.
   R3  players report lag while egress is well below the ceiling. Then the ceiling, real or not,
-      is not what they are feeling, and fixing it fixes nothing.
-  R4  mean packet size inside plateaus is small. A saturated BYTE budget fills packets; small
-      packets at a fixed byte rate mean the limit is packets, syscalls or a tick, not bytes.
-  R5  the socket send queue is non-empty. Then the kernel is holding bytes back and the
-      application is not the binding constraint.
-  R6  A2S round trips spike while egress is below the ceiling. Then the server is struggling for
-      some reason that has nothing to do with how much it is sending.
+      is not what they are feeling, and raising it would fix nothing.
+  R4  mean packet size inside plateaus is small. A saturated BYTE budget fills packets.
+  R5  the socket send queue is non-empty. Then the kernel is holding bytes back.
+  R6  A2S round trips spike while egress is below the ceiling.
 
-And one positive test that is worth more than all the plateau statistics: the matched-window
-comparison. Compare raid windows against non-raid windows AT THE SAME PLAYER COUNT. A raid is a
-large, involuntary, externally-timed increase in world activity. If egress and packet rate are
-statistically indistinguishable across that, demand went up and supply did not move -- which is
-what supply-limited means, and is very hard to explain any other way.
+AND A POSITIVE VERDICT IS ONLY EVER AS STRONG AS THE TESTS THAT ACTUALLY RAN. Every gate below
+is conditional on its own evidence: with one player count there is no slope to measure, so R2 has
+not passed -- it has not been attempted -- and the verdict is INCONCLUSIVE, not CONFIRMED. An
+earlier version printed "they scale with player count" three lines above a caveat saying that
+test could not run. That is the failure mode this whole report is supposed to guard against, so
+it now refuses to print prose for a test it did not perform.
+
+READ THIS BEFORE TRUSTING ANY VERDICT. The per-peer prior is weak and the arithmetic says so.
+The 30-day maximum from the per-minute collector data is 276,425 B/s; 4.5 x 61440 = 276,480,
+which is exactly 270 KiB/s -- the observed hard maximum sits within 55 bytes, 0.02%, of a round
+GLOBAL number, and that is not what n x 61440 looks like for the three players who were online.
+The operator has since measured observed maxima exceeding n x 61440 by 12-51% at n=1..4, which
+refutes the per-peer model outright on that data. A single server-wide cap is currently the
+better-supported story. R2 is the test that separates them -- a global cap produces a plateau
+that does not scale with n -- which is exactly why a verdict reached without two or more player
+counts is worthless, and why --budget is a parameter rather than a constant.
+
+The strongest positive test is the matched-window comparison: raid windows against non-raid
+windows at the same player count AND the same INBOUND rate. A raid is a large, involuntary,
+externally-timed increase in world activity. If egress is indistinguishable across it, demand
+rose and supply did not -- which is what supply-limited means.
 
 Inputs (all read-only, none modified):
   /var/lib/valheim-status/egress-YYYY-MM-DD.jsonl   1 Hz samples from valheim-egress-probe.py
-  /var/lib/valheim-status/samples.jsonl             per-minute collector samples (`pg` per-peer ping)
+  /var/lib/valheim-status/samples.jsonl             per-minute collector samples (`pg` peer ping)
   /var/lib/valheim-status/events.jsonl              raid markers and `!lag` reports
 
   python3 valheim-egress-report.py                  full report over everything on disk
   python3 valheim-egress-report.py --days 7         only the last 7 days
-  python3 valheim-egress-report.py --selftest       run against two synthetic worlds -- one
-                                                    genuinely budget-limited, one demand-limited
-                                                    -- and check the verdict comes out right.
-
-READ THIS BEFORE TRUSTING A "CONFIRMED". The prior is already shaky, and in an interesting way.
-The 30-day maximum from the per-minute collector data is 276,425 B/s. 4.5 x 61440 = 276,480, and
-276,480 B/s is exactly 270 KiB/s. The observed hard maximum is within 55 bytes -- 0.02% -- of a
-round 270 KiB/s. That is not what n x 61440 looks like for the three players who were online; it
-is what a single GLOBAL cap looks like. If the real limit is one server-wide 270 KiB/s budget
-rather than a per-peer one, the per-peer hypothesis is wrong even though every plateau graph will
-look identical. R2 is the test that separates them: a global cap produces a plateau that does NOT
-scale with player count, and R2 fires. Run with several distinct player counts before concluding
-anything, and treat --budget as the parameter it is rather than as a known constant -- 61440 is a
-figure from an older build, and this server runs l-1.0.12.
+  python3 valheim-egress-report.py --selftest       fifteen synthetic worlds with known answers
 
 A NOTE ON WHAT THE BYTES ARE. nftables counters at the filter hooks count what the kernel sees at
-layer 3: IP header + UDP header + payload, 28 bytes of header per packet. They do NOT include the
-14-byte Ethernet header. So --hdr defaults to 28, not the 42 you would use against a NIC counter.
-Getting this backwards inflates the predicted ceiling by about 1% -- small, but the whole question
-is whether a measured value sits above or below a computed one, so it is not a rounding detail.
+layer 3: IP header + UDP header + payload, 28 bytes per packet. They do NOT include the 14-byte
+Ethernet header. So --hdr defaults to 28, not the 42 you would use against a NIC counter. The
+meter also keeps the Steam query port in its own counter, so master-server scrapes are not in
+txb; if you are comparing against samples.jsonl's `tx` (a NIC counter) expect it to read higher
+for both reasons.
 """
 import argparse
 import glob
@@ -69,7 +69,7 @@ import time
 from datetime import datetime
 
 LIB = os.environ.get("EGRESS_DIR", "").strip() or "/var/lib/valheim-status"
-BUDGET = 61440          # ZDOMan m_dataPerSec, bytes per second per peer
+BUDGET = 61440          # a figure from an older build than the one running here -- a parameter
 HDR = 28                # IP(20) + UDP(8), which is what an nftables counter counts
 DEFAULT_PAYLOAD = 1200  # only used when the data has no usable packet-size measurement
 
@@ -101,8 +101,8 @@ def pct(xs, p):
 def perm_test(a, b, n_perm=2000, seed=1, cap=1500):
     """Two-sided permutation test on the difference of means. No scipy on this box, and a
     permutation test needs no distributional assumption anyway -- which matters, because
-    per-second egress is emphatically not normal. Returns a p-value; large p means the two
-    windows are indistinguishable, which for the matched-window test is the interesting result."""
+    per-second egress is emphatically not normal. Large p means the two windows are
+    indistinguishable, which for the matched-window test is the interesting result."""
     if len(a) < 5 or len(b) < 5:
         return float("nan")
     rnd = random.Random(seed)
@@ -122,6 +122,18 @@ def human(b):
     return f"{b/1000:,.1f} KB/s" if b == b else "n/a"
 
 
+def dur(s):
+    if s != s:
+        return "n/a"
+    if s < 90:
+        return f"{s:.0f}s"
+    if s < 5400:
+        return f"{s/60:.0f}m"
+    if s < 2 * 86400:
+        return f"{s/3600:.1f}h"
+    return f"{s/86400:.1f}d"
+
+
 # ---------------------------------------------------------------- the arithmetic ceiling
 def predicted_ceiling(n, budget=BUDGET, payload=DEFAULT_PAYLOAD, hdr=HDR, k=0.0):
     """Counted bytes per second at the nftables hook, if every peer's ZDO budget were saturated:
@@ -129,7 +141,6 @@ def predicted_ceiling(n, budget=BUDGET, payload=DEFAULT_PAYLOAD, hdr=HDR, k=0.0)
         wire(n) = n*budget                      the ZDO payload itself
                 + (n*budget / payload) * hdr    one header per packet needed to carry it
                 + n*k                           per-peer traffic that is not ZDO data at all
-                                                (acks, RPCs, pings, the routed-RPC chatter)
 
     payload (S) and k are parameters, not magic numbers: S is measured from the data when the
     data has packet counts, and k is unknown without reading the game's source, so it defaults to
@@ -140,8 +151,38 @@ def predicted_ceiling(n, budget=BUDGET, payload=DEFAULT_PAYLOAD, hdr=HDR, k=0.0)
 
 
 # ---------------------------------------------------------------- loading
+def _usable(r):
+    """A row is usable only if every field the analysis divides, sorts or compares by is a real
+    number. A non-numeric `t` used to kill the whole report with a TypeError inside sort() --
+    thirty days of data lost to a formatting problem at the last possible moment."""
+    if not isinstance(r, dict):
+        return False
+    for key in ("t", "txb", "n"):
+        v = r.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+    dt = r.get("dt", 1.0)
+    if isinstance(dt, bool) or not isinstance(dt, (int, float)) or dt <= 0:
+        return False
+    return True
+
+
+def normalize(rows):
+    """Turn counter deltas into rates using the interval each row actually spans. Rows written
+    before `dt` existed are treated as one second, which is what they claimed to be."""
+    for r in rows:
+        dt = r.get("dt", 1.0)
+        r["_dt"] = dt
+        r["_tx"] = r["txb"] / dt
+        r["_rx"] = r.get("rxb", 0) / dt
+        r["_pk"] = r.get("txp", 0) / dt
+    return rows
+
+
 def load_egress(lib, since=None):
-    rows = []
+    """(rows, skipped). The skip count is returned rather than swallowed: a file quietly dropping
+    a third of its lines and a file that is fine look identical if nobody counts."""
+    rows, skipped = [], 0
     for path in sorted(glob.glob(os.path.join(lib, "egress-*.jsonl"))):
         try:
             with open(path) as f:
@@ -152,8 +193,10 @@ def load_egress(lib, since=None):
                     try:
                         r = json.loads(line)
                     except Exception:
-                        continue        # one torn line at the tail of a file being written
-                    if not isinstance(r, dict) or "t" not in r or "txb" not in r or "n" not in r:
+                        skipped += 1
+                        continue
+                    if not _usable(r):
+                        skipped += 1
                         continue
                     if since and r["t"] < since:
                         continue
@@ -161,11 +204,11 @@ def load_egress(lib, since=None):
         except OSError as e:
             print(f"  ! could not read {path}: {e}", file=sys.stderr)
     rows.sort(key=lambda r: r["t"])
-    return rows
+    return normalize(rows), skipped
 
 
 def load_jsonl(path, since=None):
-    out = []
+    out, skipped = [], 0
     try:
         with open(path) as f:
             for line in f:
@@ -175,38 +218,43 @@ def load_jsonl(path, since=None):
                 try:
                     r = json.loads(line)
                 except Exception:
+                    skipped += 1
                     continue
-                if isinstance(r, dict) and (not since or r.get("t", 0) >= since):
+                if not isinstance(r, dict) or isinstance(r.get("t"), bool) \
+                        or not isinstance(r.get("t"), (int, float)):
+                    skipped += 1
+                    continue
+                if not since or r["t"] >= since:
                     out.append(r)
     except FileNotFoundError:
         pass
     except OSError as e:
         print(f"  ! could not read {path}: {e}", file=sys.stderr)
-    out.sort(key=lambda r: r.get("t", 0))
-    return out
+    out.sort(key=lambda r: r["t"])
+    return out, skipped
 
 
 # ---------------------------------------------------------------- plateau detection
 def plateaus(rows, frac=0.95, min_run=3, hi_pct=0.995):
     """Split samples by player count and mark the ones sitting at that count's own upper edge.
 
-    A "plateau" here means: at or above `frac` of the 99.5th percentile of egress for this player
+    A "plateau" means: at or above `frac` of the 99.5th percentile of egress for this player
     count (the 99.5th rather than the max, so one jittery second cannot define the edge), AND
-    part of a run of at least `min_run` consecutive seconds at that level. The run requirement is
+    part of a run of at least `min_run` consecutive samples at that level. The run requirement is
     what separates a ceiling from a burst: a single high second is a spike, several in a row at
-    the same level is a limit. Both are knobs, and both are printed in the report, because the
-    definition of "plateau" is doing real work in the conclusion and should not be buried."""
+    the same level is a limit. Both are knobs and both are printed, because the definition of
+    "plateau" does real work in the conclusion and should not be buried."""
     by_n, out = {}, {}
     for r in rows:
         by_n.setdefault(r["n"], []).append(r)
     for n, rs in by_n.items():
         if n <= 0:
             continue
-        edge = pct([r["txb"] for r in rs], hi_pct)
+        edge = pct([r["_tx"] for r in rs], hi_pct)
         thresh = edge * frac
         run, marked = [], []
         for r in rs:
-            if r["txb"] >= thresh:
+            if r["_tx"] >= thresh:
                 run.append(r)
             else:
                 if len(run) >= min_run:
@@ -219,7 +267,10 @@ def plateaus(rows, frac=0.95, min_run=3, hi_pct=0.995):
 
 
 def measured_payload(rows, hdr=HDR):
-    """Mean payload bytes per packet, from the samples themselves."""
+    """Mean payload bytes per packet, or None when there is nothing to measure -- which happens
+    for real: build_record legitimately emits txp=0 for a silent second, and a whole window of
+    those divides by zero. Every caller must handle the None; one that did not used to crash the
+    report at the very end of a thirty-day run."""
     tot_b = sum(r["txb"] for r in rows if r.get("txp"))
     tot_p = sum(r["txp"] for r in rows if r.get("txp"))
     if not tot_p:
@@ -227,349 +278,543 @@ def measured_payload(rows, hdr=HDR):
     return tot_b / tot_p - hdr
 
 
+def fmt_payload(v):
+    return "n/a" if v is None or v != v else f"{v:.0f}B"
+
+
 # ---------------------------------------------------------------- the report
-def analyse(rows, samples, events, args, out=print):
+def analyse(rows, samples, events, args, skipped=0, out=print):
     fired = []          # refutation conditions that fired, with a one-line reason
-    blocked = []        # tests that could not run at all, which is why a verdict can be INCONCLUSIVE
+    blocked = []        # missing evidence that a CONFIRMED verdict would otherwise have asserted
+    caveats = []        # refutation conditions that could not be attempted -- weakens, not blocks
+    #
+    # The distinction matters. A CONFIRMED verdict states three things in prose: the plateaus are
+    # flat, they scale with player count, and matched raids do not move them. Anything those three
+    # claims rest on goes in `blocked` and forces INCONCLUSIVE. A refutation condition that simply
+    # had nothing to chew on -- no lag reports, no packet counts -- did not pass, but a positive
+    # verdict never claimed it did, so it belongs in `caveats` and is printed alongside.
+    now = time.time()
 
-    if not rows:
-        out("No egress samples found. Has valheim-egress.service been running while players were online?")
-        return "INCONCLUSIVE", ["no data"], ["every test"]
-
-    span = rows[-1]["t"] - rows[0]["t"]
     out("=" * 78)
     out("Valheim egress ceiling report")
     out("=" * 78)
-    out(f"samples          {len(rows):,} at 1 Hz over {span/3600:.1f} h "
-        f"({datetime.fromtimestamp(rows[0]['t']):%Y-%m-%d %H:%M} -> {datetime.fromtimestamp(rows[-1]['t']):%Y-%m-%d %H:%M})")
+
+    # ---- coverage: what evidence is actually here? --------------------------------------------
+    # Answered FIRST and allowed to veto a positive verdict, because "three hours of month-old
+    # data" and "thirty days of continuous data" produce identically confident-looking output
+    # unless someone says how much there is.
+    if not rows:
+        out("No usable egress samples found. Has valheim-egress.service been running while")
+        out("players were online?  systemctl status valheim-egress")
+        out("")
+        out("VERDICT: INCONCLUSIVE -- there is no data.")
+        return "INCONCLUSIVE", [], ["no samples at all"]
+
+    span = rows[-1]["t"] - rows[0]["t"]
+    sampled = sum(r["_dt"] for r in rows)
+    gaps = [rows[i + 1]["t"] - rows[i]["t"] for i in range(len(rows) - 1)]
+    biggest = max(gaps) if gaps else 0.0
+    newest_age = now - rows[-1]["t"]
+    counts = sorted({r["n"] for r in rows if r["n"] > 0})
+    out(f"requested        {('last %g days' % args.days) if args.days else 'everything on disk'}")
+    out(f"wall-clock span  {dur(span)}  "
+        f"({datetime.fromtimestamp(rows[0]['t']):%Y-%m-%d %H:%M} -> "
+        f"{datetime.fromtimestamp(rows[-1]['t']):%Y-%m-%d %H:%M})")
+    out(f"actually sampled {len(rows):,} rows, {dur(sampled)} of measured time "
+        f"({sampled/span*100 if span else float('nan'):.1f}% of the span -- the probe only runs "
+        f"while players are online, so this is expected to be well under 100%)")
+    out(f"largest gap      {dur(biggest)}        newest sample {dur(newest_age)} old")
+    out(f"player counts    {counts or 'none'}")
+    if skipped:
+        out(f"skipped lines    {skipped:,} unreadable or malformed "
+            f"({skipped/(skipped+len(rows))*100:.1f}% of the file)")
+    out("")
+
+    if newest_age > args.max_stale * 3600:
+        blocked.append(f"the newest sample is {dur(newest_age)} old (limit {args.max_stale:g}h) -- "
+                       f"this is a report about the past, not about the server as it is now; "
+                       f"check that valheim-egress.service is still running")
+    if sampled < args.min_samples:
+        blocked.append(f"only {dur(sampled)} of measured time (need {dur(args.min_samples)}); "
+                       f"keep the probe running through more busy evenings")
+    if skipped and skipped > args.max_skip * (skipped + len(rows)):
+        blocked.append(f"{skipped/(skipped+len(rows)):.1%} of lines were unreadable (limit "
+                       f"{args.max_skip:.0%}) -- fix that before trusting any of the rest")
+
     pay = args.payload if args.payload else measured_payload(rows, args.hdr)
     if pay is None:
         pay = DEFAULT_PAYLOAD
         blocked.append("no packet counts in the data, so packet size is assumed, not measured")
-    out(f"assumed budget   {args.budget:,} B/s per peer   headers {args.hdr} B/packet "
+    out(f"assumed budget   {args.budget:,.0f} B/s per peer   headers {args.hdr:g} B/packet "
         f"(layer 3, as nftables counts)   k {args.k:g} B/s per peer")
-    out(f"payload/packet   {pay:,.0f} B  ({'measured from the samples' if not args.payload else 'given on the command line'})")
+    out(f"payload/packet   {pay:,.0f} B  "
+        f"({'measured from the samples' if not args.payload else 'given on the command line'})")
     out("")
 
     pl = plateaus(rows, frac=args.plateau_frac, min_run=args.min_run)
     out(f"--- per-player-count distribution (plateau = >={args.plateau_frac:.0%} of the 99.5th "
-        f"percentile, in runs of >={args.min_run}s) ---")
+        f"percentile, in runs of >={args.min_run}) ---")
     out(f"{'n':>3} {'samples':>8} {'plateau':>8} {'median':>12} {'p99.5':>12} {'plateau mean':>13} "
         f"{'CV':>7} {'per player':>11} {'pkt size':>9} {'predicted':>12}")
     per_player = {}
     for n in sorted(pl):
         d = pl[n]
         p = d["plateau"]
-        allb = [r["txb"] for r in d["all"]]
-        pb = [r["txb"] for r in p]
+        pb = [r["_tx"] for r in p]
         pmean = mean(pb) if pb else float("nan")
-        psz = measured_payload(p, args.hdr) if p else float("nan")
         predicted = predicted_ceiling(n, args.budget, pay, args.hdr, args.k)
-        if pb and len(pb) >= args.min_plateau:
+        if len(pb) >= args.min_plateau:
             per_player[n] = pmean / n
-        out(f"{n:>3} {len(d['all']):>8,} {len(p):>8,} {human(statistics.median(allb)):>12} "
-            f"{human(d['edge']):>12} {human(pmean):>13} {cv(pb)*100 if pb else float('nan'):>6.2f}% "
-            f"{human(pmean/n) if pb else 'n/a':>11} {psz:>8.0f}B {human(predicted):>12}")
+        out(f"{n:>3} {len(d['all']):>8,} {len(p):>8,} "
+            f"{human(statistics.median([r['_tx'] for r in d['all']])):>12} "
+            f"{human(d['edge']):>12} {human(pmean):>13} "
+            f"{cv(pb)*100 if pb else float('nan'):>6.2f}% "
+            f"{human(pmean/n) if pb else 'n/a':>11} "
+            f"{fmt_payload(measured_payload(p, args.hdr)):>9} {human(predicted):>12}")
     out("")
 
     # ---- R1: anything above the ceiling at all -------------------------------------------------
     lim = 1.0 + args.r1_slack
     over = [r for r in rows if r["n"] > 0
-            and r["txb"] > predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k) * lim]
-    worst = max((r["txb"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k) for r in rows if r["n"] > 0),
-                default=float("nan"))
+            and r["_tx"] > predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k) * lim]
+    worst = max((r["_tx"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k)
+                 for r in rows if r["n"] > 0), default=float("nan"))
     out(f"R1  samples above the ceiling x{lim:.2f}: {len(over):,} of {len(rows):,}   "
-        f"(highest observed second reached {worst*100:.1f}% of its predicted ceiling)")
+        f"(the highest sample reached {worst*100:.1f}% of its predicted ceiling)")
     if len(over) >= args.r1_min:
-        ex = over[0]
-        fired.append(f"R1: {len(over)} sample(s) exceeded the ceiling, e.g. {ex['txb']:,} B/s at n={ex['n']} "
-                     f"({datetime.fromtimestamp(ex['t']):%Y-%m-%d %H:%M:%S}). A budget you exceed is not a budget.")
+        ex = max(over, key=lambda r: r["_tx"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k))
+        fired.append(f"R1: {len(over)} sample(s) exceeded the ceiling, worst {ex['_tx']:,.0f} B/s at "
+                     f"n={ex['n']} ({datetime.fromtimestamp(ex['t']):%Y-%m-%d %H:%M:%S}). "
+                     f"A budget you exceed is not a budget.")
 
     # ---- R2: does the plateau scale with n? ----------------------------------------------------
+    spread = None
     if len(per_player) >= 2:
         lo, hi = min(per_player.values()), max(per_player.values())
         spread = (hi - lo) / hi
         out(f"R2  plateau per player across n={sorted(per_player)}: {human(lo)} .. {human(hi)}  "
             f"(spread {spread:.1%}, tolerance {args.r2_tol:.0%})")
         if spread > args.r2_tol:
-            fired.append(f"R2: the plateau does not scale with player count -- per-player egress varies "
-                         f"{spread:.0%} across n={sorted(per_player)}. A per-peer budget cannot do that.")
+            fired.append(f"R2: the plateau does not scale with player count -- per-player egress "
+                         f"varies {spread:.0%} across n={sorted(per_player)}. A per-peer budget "
+                         f"cannot do that; a single global cap does exactly that.")
     else:
-        out(f"R2  not testable: need >={args.min_plateau} plateau samples at two or more player counts, "
-            f"have {sorted(per_player) or 'none'}")
-        blocked.append("R2 (only one player count has enough plateau data)")
+        out(f"R2  NOT TESTABLE: needs >={args.min_plateau} plateau samples at two or more player "
+            f"counts; only {sorted(per_player) or 'none'} qualify. One point has no slope.")
+        blocked.append("R2 -- per-player scaling was never tested: fewer than two player counts "
+                       "have enough plateau data, and one point has no slope. This is the test "
+                       "that separates a per-peer budget from a single global cap, so without it "
+                       "the two rival explanations are indistinguishable")
 
     # ---- R4: packet size inside plateaus -------------------------------------------------------
     allp = [r for n in pl for r in pl[n]["plateau"]]
     psz_all = measured_payload(allp, args.hdr) if allp else None
     if psz_all is None:
-        out("R4  not testable: no packet counts inside plateaus")
-        blocked.append("R4 (no packet counts)")
+        out("R4  NOT TESTABLE: no packet counts inside plateaus")
+        caveats.append("R4 -- no packet counts inside plateaus")
     else:
-        out(f"R4  mean payload inside plateaus: {psz_all:.0f} B (floor {args.r4_min} B)")
+        out(f"R4  mean payload inside plateaus: {psz_all:.0f} B (floor {args.r4_min:g} B)")
         if psz_all < args.r4_min:
-            fired.append(f"R4: mean payload inside plateaus is {psz_all:.0f} B, well short of an MTU. "
-                         f"A saturated byte budget fills packets; this looks packet- or tick-limited.")
+            fired.append(f"R4: mean payload inside plateaus is {psz_all:.0f} B, well short of an "
+                         f"MTU. A saturated byte budget fills packets; this looks packet- or "
+                         f"tick-limited.")
 
     # ---- R5: is the kernel holding bytes? ------------------------------------------------------
-    sq = [r["sq"] for r in allp if isinstance(r.get("sq"), int)]
+    sq = [r["sq"] for r in allp if isinstance(r.get("sq"), int) and not isinstance(r.get("sq"), bool)]
     if not sq:
-        out("R5  not testable: no socket send-queue readings inside plateaus")
-        blocked.append("R5 (no sq readings)")
+        out("R5  NOT TESTABLE: no socket send-queue readings inside plateaus")
+        caveats.append("R5 -- no socket send-queue readings inside plateaus")
     else:
         nz = [v for v in sq if v > 0]
         frac_nz = len(nz) / len(sq)
-        out(f"R5  send queue inside plateaus: {len(nz):,}/{len(sq):,} samples non-zero ({frac_nz:.2%}), "
-            f"max {max(sq):,} B (tolerance {args.r5_frac:.1%})")
-        # A tolerance rather than "any non-zero": a momentarily non-empty tx_queue is normal even on
-        # an idle socket. Sustained backpressure is the claim being tested, and that shows up as a
-        # fraction, not a single sample.
+        out(f"R5  send queue inside plateaus: {len(nz):,}/{len(sq):,} samples non-zero "
+            f"({frac_nz:.2%}), max {max(sq):,} B (tolerance {args.r5_frac:.1%})")
+        # A tolerance rather than "any non-zero": a momentarily non-empty tx_queue is normal even
+        # on an idle socket. Sustained backpressure is the claim, and that shows up as a fraction.
+        # Note also that UDP tx_queue is very often structurally zero, so R5 NOT firing is weak
+        # evidence -- it is here because a non-zero reading would be decisive, not because a zero
+        # one proves much.
         if frac_nz > args.r5_frac:
-            fired.append(f"R5: the socket send queue was non-empty in {frac_nz:.1%} of plateau samples "
-                         f"(max {max(sq):,} B). The kernel is holding bytes back, so the application is "
-                         f"not the binding constraint.")
+            fired.append(f"R5: the socket send queue was non-empty in {frac_nz:.1%} of plateau "
+                         f"samples (max {max(sq):,} B). The kernel is holding bytes back, so the "
+                         f"application is not the binding constraint.")
 
     # ---- R6: does the server hurt while it is NOT at the ceiling? ------------------------------
-    rtts = [(r["t"], r["rtt"], r["txb"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k))
-            for r in rows if isinstance(r.get("rtt"), (int, float)) and r["n"] > 0]
-    if len(rtts) < 30:
-        out("R6  not testable: fewer than 30 A2S round trips recorded")
-        blocked.append("R6 (too few A2S samples)")
-    else:
-        med = statistics.median([v for _, v, _ in rtts])
-        thresh = args.rtt_spike if args.rtt_spike else med * 3
-        spikes = [(t, v, f) for t, v, f in rtts if v > thresh]
-        low = [s for s in spikes if s[2] < args.low_frac]
-        out(f"R6  A2S rtt median {med:.1f} ms, spikes >{thresh:.1f} ms: {len(spikes)} "
-            f"({len(low)} of them while egress was below {args.low_frac:.0%} of the ceiling)")
-        if low and len(low) >= max(3, 0.5 * len(spikes)):
-            fired.append(f"R6: {len(low)} of {len(spikes)} A2S latency spikes happened while egress was "
-                         f"below {args.low_frac:.0%} of the ceiling. Something else is hurting the server.")
+    def frac_of_ceiling(r):
+        return r["_tx"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k)
 
-    # ---- the matched-window test: raid vs non-raid, same n -------------------------------------
+    seen_rtt = [r for r in rows if r["n"] > 0 and ("rtt" in r or "rtt_to" in r)]
+    censored = [r for r in seen_rtt if "rtt_to" in r]
+    ok_rtt = [r for r in seen_rtt if isinstance(r.get("rtt"), (int, float))]
+    if len(seen_rtt) < args.r6_min:
+        out(f"R6  NOT TESTABLE: fewer than {args.r6_min} A2S round trips recorded")
+        caveats.append("R6 -- too few A2S round trips recorded")
+    elif len(censored) > args.r6_max_censored * len(seen_rtt):
+        out(f"R6  NOT TESTABLE: {len(censored)}/{len(seen_rtt)} A2S probes timed out "
+            f"({len(censored)/len(seen_rtt):.0%}, limit {args.r6_max_censored:.0%}) -- the latency "
+            f"series is censored above the timeout bound and its median is meaningless")
+        caveats.append(f"R6 -- {len(censored)/len(seen_rtt):.0%} of A2S probes timed out, so the "
+                       f"latency distribution is censored and no threshold derived from its "
+                       f"median would mean anything")
+    else:
+        med = statistics.median([r["rtt"] for r in ok_rtt]) if ok_rtt else 0.0
+        # max(), not med*3: a median that rounds to 0.0 would collapse the threshold to zero and
+        # make literally every sample a "spike".
+        thresh = args.rtt_spike if args.rtt_spike else max(med * 3, med + 5.0, 2.0)
+        # A timeout IS a spike -- it is a round trip longer than the bound. Counting it as one is
+        # the whole reason the probe records rtt_to instead of dropping the sample.
+        spikes = [r for r in ok_rtt if r["rtt"] > thresh] + censored
+        low = [r for r in spikes if frac_of_ceiling(r) < args.low_frac]
+        out(f"R6  A2S rtt median {med:.1f} ms, spikes >{thresh:.1f} ms (timeouts counted as "
+            f"spikes): {len(spikes)} ({len(low)} while egress was below {args.low_frac:.0%} of "
+            f"the ceiling)")
+        if low and len(low) >= max(3, 0.5 * len(spikes)):
+            fired.append(f"R6: {len(low)} of {len(spikes)} A2S latency spikes happened while "
+                         f"egress was below {args.low_frac:.0%} of the ceiling. Something other "
+                         f"than the send budget is hurting the server.")
+
+    # ---- the matched-window test ---------------------------------------------------------------
     out("")
-    out(f"--- matched windows: raid vs non-raid at the same player count ({args.raid_window}s after onset) ---")
-    raids = [e["t"] for e in events if e.get("kind") == "raid" and isinstance(e.get("t"), (int, float))]
-    matched_ok, matched_any = [], False
+    out(f"--- matched windows: raid vs non-raid, same player count AND same inbound rate "
+        f"({args.raid_window:g}s after onset) ---")
+    raids = [e["t"] for e in events if e.get("kind") == "raid"]
+    matched_ok, matched_tested = [], []
     if not raids:
         out("  no raid markers in events.jsonl for this window -- this test could not run.")
-        blocked.append("matched-window raid comparison (no raids recorded)")
+        blocked.append("the matched raid/non-raid comparison (no raids recorded)")
     else:
         def in_raid(t):
             return any(rt <= t < rt + args.raid_window for rt in raids)
         out(f"  {len(raids)} raid(s) in range")
-        # MATCHED ON INBOUND, NOT JUST ON n. Comparing raid seconds against every other second at
-        # the same player count is not a matched comparison -- it is a raid against an empty
-        # forest, and those differ even under a perfectly saturated budget, because nobody was
-        # asking for anything during the lull. The comparison set has to be seconds of comparable
-        # DEMAND, and demand has to be measured by something that is not the quantity under test.
-        # rxb is exactly that: client-to-server traffic is not subject to the server's send
-        # budget, so it is an independent proxy for how much is going on. Selecting the control
-        # set by egress instead would be circular and would guarantee the answer we are hoping for.
+        # MATCHED ON INBOUND, NOT ON EGRESS. Selecting the control set by egress would guarantee
+        # the answer: it picks non-raid seconds that already have the same egress as the raid, so
+        # the two sides are equal by construction whether or not anything is supply-limited.
+        # Inbound is client-to-server traffic, which no server-side send budget constrains, so it
+        # is an independent proxy for how much is going on. (The selftest includes a world where
+        # demand and egress genuinely decouple, specifically so that the circular version of this
+        # selection produces the wrong verdict and gets caught.)
         for n in sorted(pl):
             rs = [r for r in pl[n]["all"] if "rxb" in r]
             raid_rows = [r for r in rs if in_raid(r["t"])]
             if len(raid_rows) < args.min_matched:
-                out(f"  n={n}: only {len(raid_rows)}s of raid -- skipped")
+                out(f"  n={n}: only {len(raid_rows)} raid sample(s), need {args.min_matched} -- skipped")
                 continue
-            target = statistics.median([r["rxb"] for r in raid_rows])
+            target = statistics.median([r["_rx"] for r in raid_rows])
             quiet_rows = [r for r in rs if not in_raid(r["t"])
-                          and target and abs(r["rxb"] - target) <= args.match_tol * target]
-            a, ap = [r["txb"] for r in raid_rows], [r["txp"] for r in raid_rows if "txp" in r]
-            b, bp = [r["txb"] for r in quiet_rows], [r["txp"] for r in quiet_rows if "txp" in r]
-            if len(b) < args.min_matched:
-                out(f"  n={n}: raid inbound {target:,.0f} B/s, but only {len(b)}s of non-raid time "
-                    f"within {args.match_tol:.0%} of it -- no comparable control, skipped")
+                          and target and abs(r["_rx"] - target) <= args.match_tol * target]
+            if len(quiet_rows) < args.min_matched:
+                out(f"  n={n}: raid inbound {target:,.0f} B/s, but only {len(quiet_rows)} non-raid "
+                    f"sample(s) within {args.match_tol:.0%} of it -- no comparable control, skipped")
                 continue
-            out(f"  n={n}: matched on inbound {target:,.0f} +/-{args.match_tol:.0%} B/s")
-            matched_any = True
+            a, b = [r["_tx"] for r in raid_rows], [r["_tx"] for r in quiet_rows]
+            ap, bp = [r["_pk"] for r in raid_rows], [r["_pk"] for r in quiet_rows]
             pb_ = perm_test(a, b, args.perms, seed=args.seed)
-            pp_ = perm_test(ap, bp, args.perms, seed=args.seed) if ap and bp else float("nan")
-            out(f"  n={n}: raid {human(mean(a))} ({len(a)}s) vs quiet {human(mean(b))} ({len(b)}s)  "
+            pp_ = perm_test(ap, bp, args.perms, seed=args.seed)
+            matched_tested.append(n)
+            out(f"  n={n}: matched on inbound {target:,.0f} +/-{args.match_tol:.0%} B/s")
+            out(f"       raid {human(mean(a))} ({len(a)}) vs control {human(mean(b))} ({len(b)})  "
                 f"delta {(mean(a)-mean(b))/mean(b)*100:+.1f}%  p(bytes)={pb_:.3f}  p(packets)={pp_:.3f}")
             if pb_ == pb_ and pb_ > args.alpha:
                 matched_ok.append(n)
-                out(f"       -> indistinguishable at n={n}: demand rose, supply did not. That is the "
-                    f"signature of a supply-limited sender.")
+                out(f"       -> indistinguishable at n={n}: demand rose, supply did not.")
             else:
-                out(f"       -> raids DO move egress at n={n}. Whatever the plateau is, it is not a hard ceiling here.")
-        if not matched_any:
-            blocked.append("matched-window raid comparison (no player count had enough of both)")
+                out(f"       -> raids DO move egress at n={n}. Whatever the plateau is, it is not "
+                    f"a hard ceiling here.")
+        if not matched_tested:
+            blocked.append("the matched raid/non-raid comparison (no player count had enough of both)")
 
     # ---- R3 + the human signal -----------------------------------------------------------------
     out("")
     out("--- player lag reports ---")
-    reports = [e for e in events if e.get("kind") == "lagreport" and isinstance(e.get("t"), (int, float))]
+    reports = [e for e in events if e.get("kind") == "lagreport"]
     if not reports:
-        out("  none. Without them this report can show that a ceiling exists, but not that it is what")
-        out("  anyone is feeling -- which is the question that actually matters. Ask players to use !lag.")
-        blocked.append("R3 (no !lag reports)")
+        out("  none. Without them this report can show that a ceiling exists, but not that it is")
+        out("  what anyone is feeling -- the question that actually matters. Ask players to use !lag.")
+        caveats.append("R3 -- no !lag reports, so nothing says whether players felt any of this")
     else:
         by_t = {r["t"]: r for r in rows}
         times = sorted(by_t)
         pings = {s["t"]: s["pg"] for s in samples if isinstance(s.get("pg"), dict)}
         base_pg = [v for d in pings.values() for v in d.values() if isinstance(v, (int, float))]
         base_med = statistics.median(base_pg) if base_pg else float("nan")
-        lows = 0
+        lows, usable = 0, 0
         for e in reports:
             near = [by_t[t] for t in times if abs(t - e["t"]) <= args.report_window]
+            when = datetime.fromtimestamp(e["t"])
             if not near:
-                out(f"  {datetime.fromtimestamp(e['t']):%Y-%m-%d %H:%M} {e.get('name','?')}: "
-                    f"no egress samples within {args.report_window}s (server empty, or probe not running)")
+                out(f"  {when:%Y-%m-%d %H:%M} {e.get('name','?')}: no egress samples within "
+                    f"{args.report_window:g}s (server empty, or the probe was not running)")
                 continue
-            lvl = statistics.median([r["txb"] for r in near])
+            usable += 1
+            lvl = statistics.median([r["_tx"] for r in near])
             n = statistics.median([r["n"] for r in near])
             f = lvl / predicted_ceiling(n, args.budget, pay, args.hdr, args.k) if n else float("nan")
             npg = [v for t, d in pings.items() if abs(t - e["t"]) <= args.report_window
                    for v in d.values() if isinstance(v, (int, float))]
             pg_txt = (f"peer ping {statistics.median(npg):.0f} ms vs {base_med:.0f} ms baseline"
                       if npg else "no peer ping recorded")
-            flag = "  <-- BELOW CEILING" if f < args.low_frac else ""
             if f < args.low_frac:
                 lows += 1
-            out(f"  {datetime.fromtimestamp(e['t']):%Y-%m-%d %H:%M} {e.get('name','?')}: "
-                f"egress {human(lvl)} = {f:.0%} of ceiling at n={n:.0f}, {pg_txt}{flag}")
-        usable = [e for e in reports if any(abs(t - e["t"]) <= args.report_window for t in times)]
+            out(f"  {when:%Y-%m-%d %H:%M} {e.get('name','?')}: egress {human(lvl)} = {f:.0%} of "
+                f"ceiling at n={n:.0f}, {pg_txt}"
+                + ("  <-- BELOW CEILING" if f < args.low_frac else ""))
         if usable:
-            out(f"  {lows} of {len(usable)} correlatable report(s) came while egress was below "
+            out(f"  {lows} of {usable} correlatable report(s) came while egress was below "
                 f"{args.low_frac:.0%} of the ceiling")
-            if lows >= max(1, 0.5 * len(usable)):
-                fired.append(f"R3: {lows} of {len(usable)} lag reports happened while egress was below "
-                             f"{args.low_frac:.0%} of the ceiling. Whatever players are feeling, it is not "
-                             f"this ceiling -- raising it would not help them.")
+            if lows >= max(1, 0.5 * usable):
+                fired.append(f"R3: {lows} of {usable} lag reports happened while egress was below "
+                             f"{args.low_frac:.0%} of the ceiling. Whatever players are feeling, "
+                             f"it is not this ceiling -- raising it would not help them.")
         else:
-            blocked.append("R3 (no lag report could be matched to egress samples)")
+            caveats.append("R3 -- no lag report could be matched to egress samples")
 
     # ---- verdict -------------------------------------------------------------------------------
-    plateau_total = sum(len(pl[n]["plateau"]) for n in pl)
-    cvs = {n: cv([r["txb"] for r in pl[n]["plateau"]]) for n in pl if len(pl[n]["plateau"]) >= args.min_plateau}
-    flat = {n: v for n, v in cvs.items() if v <= args.cv_max}
+    # Each gate is conditional on ITS OWN evidence. A positive verdict may only be reached when
+    # every test it would then assert in prose actually ran and actually passed.
+    cvs = {n: cv([r["_tx"] for r in pl[n]["plateau"]])
+           for n in pl if len(pl[n]["plateau"]) >= args.min_plateau}
+    flat = {n: v for n, v in cvs.items() if v == v and v <= args.cv_max}
+    if not fired:
+        if len(flat) < 2:
+            blocked.append(
+                f"a flat plateau at two or more player counts is required and "
+                f"{sorted(flat) if flat else 'none'} qualified "
+                + (f"(best CV {min(cvs.values()):.2%}, needs <={args.cv_max:.1%})" if cvs else
+                   f"(no player count reached {args.min_plateau} plateau samples)"))
+        if not matched_ok:
+            blocked.append("the matched raid/non-raid comparison never came out indistinguishable, "
+                           "so the plateau is not yet shown to be a supply limit rather than a "
+                           "demand ceiling")
+
     out("")
     out("=" * 78)
-    if fired:
-        verdict = "REFUTED"
-    elif plateau_total < args.min_plateau:
-        verdict = "INCONCLUSIVE"
-        blocked.append(f"only {plateau_total} plateau samples (need {args.min_plateau}); "
-                       f"keep the probe running through more busy evenings")
-    elif not flat:
-        verdict = "INCONCLUSIVE"
-        blocked.append(f"no player count has a plateau flatter than CV {args.cv_max:.1%} "
-                       f"(best {min(cvs.values()):.2%}); a saturated budget is flatter than this")
-    elif not matched_ok:
-        verdict = "INCONCLUSIVE"
-        blocked.append("the matched raid/non-raid comparison never came out indistinguishable, so the "
-                       "plateau is not yet shown to be a supply limit rather than a demand ceiling")
-    else:
-        verdict = "CONFIRMED"
+    verdict = "REFUTED" if fired else ("INCONCLUSIVE" if blocked else "CONFIRMED")
     out(f"VERDICT: {verdict}")
+    out(f"         on {dur(sampled)} of measured time, {len(rows):,} samples, player counts "
+        f"{counts or 'none'}, {len(raids)} raid(s), {len(reports)} lag report(s)")
     out("=" * 78)
     if fired:
         out("Refuted by:")
         for f in fired:
             out("  * " + f)
         out("")
-        out("The per-peer send budget is NOT the binding constraint. Do not spend another day on it;")
-        out("the reason named above is the thread to pull.")
+        out("The per-peer send budget is NOT the binding constraint on this data. The reason named")
+        out("above is the thread to pull -- and note that a single global cap explains a plateau")
+        out("that does not scale with n just as well, without any per-peer budget at all.")
     elif verdict == "CONFIRMED":
-        out(f"No refutation condition fired. Plateaus at n={sorted(flat)} are flat to within "
-            f"{max(flat.values()):.2%}, they scale with player count, and raids at matched player")
-        out(f"counts ({sorted(matched_ok)}) do not move egress. Demand rose, supply did not.")
-        out("Consistent with a per-peer application send budget of about "
-            f"{args.budget:,} B/s. Next: confirm against the game's own ZDOMan rate, and test whether")
-        out("raising it is even possible server-side before planning around it.")
+        # Only claims that were actually measured, with the measurement beside each.
+        out(f"No refutation condition fired, and every test below actually ran:")
+        out(f"  * plateaus at n={sorted(flat)} are flat to within {max(flat.values()):.2%} "
+            f"(CV, limit {args.cv_max:.1%})")
+        out(f"  * per-player plateau varies {spread:.1%} across n={sorted(per_player)} "
+            f"(limit {args.r2_tol:.0%}), so it does scale with player count")
+        out(f"  * raids at n={sorted(matched_ok)}, matched on inbound rate, do not move egress: "
+            f"demand rose and supply did not")
+        out("")
+        out(f"That is consistent with a per-peer send budget near {args.budget:,.0f} B/s -- but")
+        out("'consistent with' is not 'established'. A single global cap divided by the player")
+        out("count can fit the same numbers whenever the player counts sampled are few or close")
+        out("together, and on the operator's 30-day data the observed maxima exceed n x 61440 by")
+        out("12-51%. Before planning around this: check the spread of player counts above is wide")
+        out("enough to distinguish the two, confirm the constant against the running build rather")
+        out("than an older one, and test whether it can be raised server-side at all.")
     else:
         out("Not enough evidence either way. Specifically:")
         for b in blocked:
             out("  * " + b)
-    if blocked and verdict != "INCONCLUSIVE":
+    if caveats or (blocked and verdict == "REFUTED"):
         out("")
-        out("Caveats -- these tests could not run:")
-        for b in blocked:
+        out("Tests that could not run at all:")
+        for b in caveats + (blocked if verdict == "REFUTED" else []):
             out("  * " + b)
-    return verdict, fired, blocked
+    return verdict, fired, blocked + caveats
 
 
 # ---------------------------------------------------------------- synthetic worlds for --selftest
-def synth(kind, seed=7, hours=3, budget=BUDGET, payload=1192, hdr=HDR):
-    """Two fake servers with known answers.
+def synth(kind, args, seed=7, hours=7):
+    """Fake servers with known answers -- one per refutation condition, plus the ways a verdict
+    can legitimately be INCONCLUSIVE. Each returns (rows, samples, events).
 
-    'budget'  -- a genuinely supply-limited server: busy periods pin at exactly the arithmetic
-                 ceiling with only measurement jitter, raids do not move it, queues stay empty.
-    'demand'  -- a server that simply is not asked for much, and bursts well past the budget when
-                 it is. Same plateau-shaped graph at a glance; must come out REFUTED.
+    `demand` is what the world is asking the server to send. It drives BOTH the inbound rate,
+    which no server-side send budget constrains, and the would-be outbound rate. In most worlds
+    those move together; in `circular_trap` they deliberately do not, which is what makes that
+    world able to tell two selection rules apart.
     """
+    budget, payload, hdr = args.budget, 1192.0, args.hdr
     rnd = random.Random(seed)
-    t0 = time.time() - hours * 3600
+    t0 = time.time() - hours * 3600 - 60
     rows, events = [], []
     t = t0
-    for block in range(hours * 6):          # ten-minute blocks
-        n = [2, 3, 5][block % 3]            # deterministic, so every n sees a raid and a control
+    single = kind == "single_n"
+    for block in range(hours * 6):
+        n = 3 if single else [2, 3, 5][block % 3]
         raid = block % 7 == 3
         busy = raid or block % 5 != 0
+        peak = block % 5 == 1
         if raid:
             events.append({"t": round(t, 1), "kind": "raid", "name": "army_goblin"})
         ceil_ = predicted_ceiling(n, budget, payload, hdr, 0.0)
-        # `demand` is what the world is asking the server to send, independent of what it can.
-        # It drives BOTH the inbound rate (which no send budget constrains) and the would-be
-        # outbound rate -- which is the whole point: the two worlds below differ only in whether
-        # anything stops the outbound side from following it.
         demand = 1.0 if raid else (0.85 if busy else 0.30)
         for s in range(600):
             d = demand * rnd.uniform(0.96, 1.04)
             want = ceil_ * d * 1.6          # at d>=0.63 the world wants more than the budget allows
-            txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0))) if kind == "budget" else int(want)
-            txp = max(1, round(txb / (payload + hdr)))
             rxb = int(n * 900 * d)
-            rec = {"t": round(t, 1), "txb": txb, "txp": txp, "rxb": rxb,
-                   "rxp": max(1, round(rxb / (120 + hdr))),
-                   "sz": round(txb / txp, 1), "n": n, "sq": 0}
+            sq, rtt = 0, round(rnd.uniform(11.0, 13.0), 1)
+            pay = payload
+            if kind == "budget":
+                txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+            elif kind == "demand":
+                txb = int(want)                                  # nothing caps it -> R1
+            elif kind == "global":
+                cap = predicted_ceiling(3, budget, payload, hdr, 0.0)   # one server-wide cap
+                txb = int(min(want, cap * rnd.uniform(0.997, 1.0)))     # -> R2
+            elif kind == "smallpkt":
+                txb, pay = int(min(want, ceil_ * rnd.uniform(0.997, 1.0))), 300.0   # -> R4
+            elif kind == "queued":
+                txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+                sq = 8192 if busy else 0                                # -> R5
+            elif kind == "spiky":
+                txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+                if not busy and s % 25 == 0:
+                    rtt = 400.0                                          # -> R6, at low egress
+            elif kind == "noisy":
+                txb = int(min(want, ceil_ * rnd.uniform(0.80, 1.0)))     # plateau far too loose
+            elif kind == "bursty":
+                # the ceiling is touched for one isolated second at a time -- a burst, not a
+                # plateau. min_run must refuse to call these runs.
+                txb = int(ceil_ * 0.999) if (busy and s % 4 == 0) else int(ceil_ * 0.40)
+            elif kind == "raidmoves":
+                # a clean plateau, but raids really do buy more bytes -- the matched test must
+                # notice, and must not be satisfied by a p-value that is always 1.0
+                txb = int(ceil_ * (0.95 if raid else 0.55) * rnd.uniform(0.997, 1.0))
+            elif kind == "thin_raid":
+                txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+            elif kind == "circular_trap":
+                # Demand and egress DECOUPLE here, which is the point. Raids are entity churn
+                # with little player input (low inbound, high egress); "peak" blocks are players
+                # running about (high inbound, high egress); ordinary busy blocks share the
+                # raid's inbound band at half the egress.
+                #   matching on inbound (correct): control = busy blocks -> raids clearly move
+                #     egress -> not indistinguishable -> INCONCLUSIVE.
+                #   matching on egress (circular): control = peak blocks, equal by construction
+                #     -> "indistinguishable" -> CONFIRMED. Wrong.
+                if raid:
+                    txb, rxb = int(ceil_ * 0.90 * rnd.uniform(0.997, 1.0)), int(n * 400)
+                elif peak:
+                    txb, rxb = int(ceil_ * 0.90 * rnd.uniform(0.997, 1.0)), int(n * 1600)
+                elif busy:
+                    txb, rxb = int(ceil_ * 0.45 * rnd.uniform(0.99, 1.0)), int(n * 400)
+                else:
+                    txb, rxb = int(ceil_ * 0.30 * rnd.uniform(0.99, 1.0)), int(n * 1000)
+            else:
+                txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+            txp = max(1, round(txb / (pay + hdr)))
+            rec = {"t": round(t, 1), "dt": 1.0, "txb": txb, "txp": txp, "rxb": rxb,
+                   "rxp": max(1, round(rxb / (120 + hdr))), "sz": round(txb / txp, 1),
+                   "n": n, "na": 1, "np": n, "sq": sq}
             if s % 5 == 0:
-                rec["rtt"] = round(rnd.uniform(11.0, 13.0), 1)
+                rec["rtt"] = rtt
             rows.append(rec)
             t += 1
-    # one lag report in the middle of a busy stretch, so R3 must not fire on the budget world
-    busy_rows = [r for r in rows if r["txb"] > predicted_ceiling(r["n"], budget, payload, hdr, 0.0) * 0.9]
-    if busy_rows:
-        events.append({"t": busy_rows[len(busy_rows) // 2]["t"], "kind": "lagreport", "name": "Bjorn"})
-    samples = [{"t": int(t0 + 60 * i), "p": 3, "pg": {"Bjorn": 45, "Astrid": 47}} for i in range(hours * 60)]
-    return rows, samples, events
+        if kind == "thin_raid" and raid:
+            # only ten seconds of raid: too thin to compare, and min_matched must say so
+            keep = [r for r in rows if not (r["t"] >= events[-1]["t"] + 10
+                                            and r["t"] < events[-1]["t"] + args.raid_window)]
+            rows = keep
+
+    if kind == "laggy":
+        # reports land in the quiet stretches, while egress is nowhere near the ceiling -> R3
+        quiet = [r for r in rows
+                 if r["txb"] < predicted_ceiling(r["n"], budget, payload, hdr, 0.0) * 0.5]
+        for r in quiet[::max(1, len(quiet) // 6)][:6]:
+            events.append({"t": r["t"], "kind": "lagreport", "name": "Bjorn"})
+    elif kind != "empty":
+        # A report is only a useful control if the SURROUNDING minute is at the ceiling -- that is
+        # the window the report actually averages over. Placing one on a single high second in a
+        # world of isolated bursts fired R3 for reasons that had nothing to do with R3.
+        for i in range(120, len(rows) - 120, 60):
+            win = rows[i - 60:i + 60]
+            ceil_ = predicted_ceiling(win[0]["n"], budget, payload, hdr, 0.0)
+            if all(r["n"] == win[0]["n"] for r in win) and                     statistics.median([r["txb"] for r in win]) > ceil_ * 0.85:
+                events.append({"t": rows[i]["t"], "kind": "lagreport", "name": "Bjorn"})
+                break
+    if kind == "stale":
+        shift = 40 * 86400
+        for r in rows:
+            r["t"] -= shift
+        for e in events:
+            e["t"] -= shift
+    if kind == "empty":
+        rows, events = [], []
+    samples = [{"t": int(t0 + 60 * i), "p": 3, "pg": {"Bjorn": 45, "Astrid": 47}}
+               for i in range(hours * 60)]
+    return normalize(rows), samples, events
 
 
-def selftest(args):
+WORLDS = [
+    ("budget",        "CONFIRMED",    None),
+    ("demand",        "REFUTED",      "R1"),
+    ("global",        "REFUTED",      "R2"),
+    ("laggy",         "REFUTED",      "R3"),
+    ("smallpkt",      "REFUTED",      "R4"),
+    ("queued",        "REFUTED",      "R5"),
+    ("spiky",         "REFUTED",      "R6"),
+    ("single_n",      "INCONCLUSIVE", None),
+    ("empty",         "INCONCLUSIVE", None),
+    ("noisy",         "INCONCLUSIVE", None),
+    ("bursty",        "INCONCLUSIVE", None),
+    ("stale",         "INCONCLUSIVE", None),
+    ("raidmoves",     "INCONCLUSIVE", None),
+    ("thin_raid",     "INCONCLUSIVE", None),
+    ("circular_trap", "INCONCLUSIVE", None),
+]
+
+
+def selftest(verbose=False):
+    """Hermetic: it builds its own argument namespace from the parser defaults rather than using
+    whatever the operator typed, so `--selftest --budget 30000` cannot fail for reasons unrelated
+    to any defect."""
+    args = build_parser().parse_args([])
     ok = True
-    for kind, want in (("budget", "CONFIRMED"), ("demand", "REFUTED")):
+    for kind, want, want_rule in WORLDS:
         lines = []
-        rows, samples, events = synth(kind)
+        rows, samples, events = synth(kind, args)
         verdict, fired, blocked = analyse(rows, samples, events, args, out=lines.append)
-        got = "ok" if verdict == want else "FAIL"
-        print(f"  {got}   synthetic '{kind}' world -> {verdict} (expected {want})")
-        if verdict != want:
-            ok = False
+        rules = [f.split(":")[0] for f in fired]
+        good = verdict == want and (want_rule is None or want_rule in rules)
+        print(("  ok   " if good else "  FAIL ") + f"{kind:<14} -> {verdict}"
+              + (f" [{', '.join(rules)}]" if rules else "")
+              + (f"   (expected {want}" + (f" via {want_rule}" if want_rule else "") + ")"
+                 if not good else ""))
+        if not good or verbose:
+            ok = ok and good
             print("\n".join("      " + l for l in lines))
-        elif fired:
-            print("        fired: " + "; ".join(f.split(":")[0] for f in fired))
     print("")
     print("selftest passed" if ok else "selftest FAILED")
     return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- CLI
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--dir", default=LIB, help="directory holding egress-*.jsonl / samples.jsonl / events.jsonl")
     ap.add_argument("--days", type=float, default=0, help="only consider the last N days (0 = everything)")
-    ap.add_argument("--selftest", action="store_true", help="run against two synthetic worlds with known answers")
+    ap.add_argument("--selftest", action="store_true", help="run the synthetic worlds with known answers")
+    ap.add_argument("--verbose", action="store_true", help="with --selftest, print every report in full")
     # the model
     ap.add_argument("--budget", type=float, default=BUDGET, help="per-peer send budget, B/s")
     ap.add_argument("--payload", type=float, default=0, help="payload bytes/packet (0 = measure it from the data)")
     ap.add_argument("--hdr", type=float, default=HDR, help="header bytes/packet (28 = IP+UDP, as nftables counts; 42 adds Ethernet)")
     ap.add_argument("--k", type=float, default=0.0, help="non-ZDO per-peer traffic, B/s (0 keeps the ceiling a lower bound)")
+    # how much evidence is enough
+    ap.add_argument("--min-samples", type=float, default=6 * 3600, help="seconds of measured time before any verdict is offered")
+    ap.add_argument("--max-stale", type=float, default=48, help="hours: refuse a verdict if the newest sample is older")
+    ap.add_argument("--max-skip", type=float, default=0.02, help="fraction of unreadable lines that blocks a positive verdict")
     # plateau definition
     ap.add_argument("--plateau-frac", type=float, default=0.95, help="fraction of the p99.5 edge that counts as plateau")
-    ap.add_argument("--min-run", type=int, default=3, help="consecutive seconds needed to call it a plateau, not a burst")
-    ap.add_argument("--min-plateau", type=int, default=120, help="plateau samples needed before a player count is used")
+    ap.add_argument("--min-run", type=int, default=3, help="consecutive samples needed to call it a plateau, not a burst")
+    ap.add_argument("--min-plateau", type=int, default=1800, help="plateau samples needed before a player count is used")
     ap.add_argument("--cv-max", type=float, default=0.02, help="CV a plateau must be under to count as flat")
     # refutation thresholds
     ap.add_argument("--r1-slack", type=float, default=0.05, help="R1: fraction above the ceiling that still counts as noise")
@@ -577,27 +822,36 @@ def main():
     ap.add_argument("--r2-tol", type=float, default=0.20, help="R2: allowed spread in per-player plateau across n")
     ap.add_argument("--r4-min", type=float, default=600, help="R4: minimum plausible mean payload, bytes")
     ap.add_argument("--r5-frac", type=float, default=0.01, help="R5: fraction of plateau samples with a non-empty send queue")
-    ap.add_argument("--rtt-spike", type=float, default=0, help="R6: ms that counts as a spike (0 = 3x the median)")
+    ap.add_argument("--r6-min", type=int, default=30, help="R6: A2S samples needed before it is testable")
+    ap.add_argument("--r6-max-censored", type=float, default=0.20, help="R6: timeout fraction above which the latency series is too censored to use")
+    ap.add_argument("--rtt-spike", type=float, default=0, help="R6: ms that counts as a spike (0 = max(3x median, median+5ms, 2ms))")
     ap.add_argument("--low-frac", type=float, default=0.70, help="R3/R6: 'below the ceiling' threshold")
     # windows and tests
     ap.add_argument("--raid-window", type=float, default=300, help="seconds after a raid marker treated as a raid window")
     ap.add_argument("--report-window", type=float, default=60, help="seconds around a !lag report to average over")
-    ap.add_argument("--min-matched", type=int, default=60, help="seconds needed on each side of a matched comparison")
-    ap.add_argument("--match-tol", type=float, default=0.25,
-                    help="how close a non-raid second's INBOUND rate must be to the raid median to serve as its control")
-    ap.add_argument("--alpha", type=float, default=0.05, help="p above which raid and quiet count as indistinguishable")
+    ap.add_argument("--min-matched", type=int, default=60, help="samples needed on each side of a matched comparison")
+    ap.add_argument("--match-tol", type=float, default=0.25, help="how close a non-raid sample's INBOUND rate must be to the raid median to serve as its control")
+    ap.add_argument("--alpha", type=float, default=0.05, help="p above which raid and control count as indistinguishable")
     ap.add_argument("--perms", type=int, default=2000, help="permutations in the matched-window test")
     ap.add_argument("--seed", type=int, default=1, help="seed, so the same data gives the same p-values")
-    a = ap.parse_args()
+    return ap
 
+
+def main():
+    a = build_parser().parse_args()
     if a.selftest:
-        return selftest(a)
+        return selftest(verbose=a.verbose)
     since = time.time() - a.days * 86400 if a.days else None
-    rows = load_egress(a.dir, since)
-    samples = load_jsonl(os.path.join(a.dir, "samples.jsonl"), since)
-    events = load_jsonl(os.path.join(a.dir, "events.jsonl"), since)
-    verdict, _, _ = analyse(rows, samples, events, a)
-    return 0 if verdict != "REFUTED" else 0    # a refutation is a successful run, not an error
+    rows, skipped = load_egress(a.dir, since)
+    samples, s_skip = load_jsonl(os.path.join(a.dir, "samples.jsonl"), since)
+    events, e_skip = load_jsonl(os.path.join(a.dir, "events.jsonl"), since)
+    if s_skip or e_skip:
+        print(f"  ! skipped {s_skip} unreadable line(s) in samples.jsonl and {e_skip} in "
+              f"events.jsonl", file=sys.stderr)
+    analyse(rows, samples, events, a, skipped=skipped)
+    # A refutation is a successful run of this program, not an error: exit 0 either way, so that
+    # nobody wires this into a script that treats "the hypothesis was wrong" as a crash.
+    return 0
 
 
 if __name__ == "__main__":
