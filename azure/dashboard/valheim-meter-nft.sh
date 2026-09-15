@@ -9,12 +9,23 @@
 # collector can learn peer addresses the same way. Two rules and a set element update per
 # packet is a few tens of nanoseconds; a packet tap is a copy to userspace.
 #
-#   valheim-meter-nft.sh install   create/replace the table (idempotent; run from ExecStartPre=)
+#   valheim-meter-nft.sh ensure    create the table ONLY if it is missing or malformed. This is
+#                                  what ExecStartPre= runs: a probe that crash-loops on a bad
+#                                  evening must not flush the counters and the collector's peer
+#                                  set every RestartSec. The probe reads counters as deltas, so
+#                                  it has no need for them to start at zero.
+#   valheim-meter-nft.sh install   unconditionally create/replace the table, resetting counters.
 #   valheim-meter-nft.sh show      print the current table
 #   valheim-meter-nft.sh remove    delete the table (leaves every other table untouched)
 #
 # Ports come from the environment (VALHEIM_GAME_PORT / VALHEIM_QUERY_PORT, defaults 2456/2457)
 # so nothing installation-specific is baked in -- same convention as every other script here.
+# VALHEIM_PEER_TIMEOUT (default 2m) is how long an address lingers in the `peers` set after it
+# stops sending. It is deliberately short: the probe cross-checks its player count against the
+# size of this set to catch a join that status.json has not caught up with yet, and a long
+# timeout would leave departed players in the set for that whole window, making the check noisy.
+# The collector only needs an address to be present while the player is actively sending, and an
+# active Valheim client sends tens of packets a second, so 2m is generous for that purpose.
 #
 # SAFETY -- why this cannot change what the server does with a packet:
 #   * Separate table. nftables tables are independent rule sets; `table inet valheim_meter`
@@ -50,10 +61,15 @@ port() {
 }
 GAME_PORT=$(port VALHEIM_GAME_PORT "${VALHEIM_GAME_PORT:-2456}")
 QUERY_PORT=$(port VALHEIM_QUERY_PORT "${VALHEIM_QUERY_PORT:-2457}")
+PEER_TIMEOUT="${VALHEIM_PEER_TIMEOUT:-2m}"
+if ! [[ "$PEER_TIMEOUT" =~ ^[0-9]{1,4}[smh]$ ]]; then
+  echo "valheim-meter-nft: VALHEIM_PEER_TIMEOUT=$PEER_TIMEOUT is not an nft timeout (e.g. 30s, 2m, 1h)" >&2
+  exit 2
+fi
 
 case "$ACTION" in
-  install|show|remove) ;;
-  *) echo "usage: valheim-meter-nft.sh install|show|remove" >&2; exit 64 ;;
+  ensure|install|show|remove) ;;
+  *) echo "usage: valheim-meter-nft.sh ensure|install|show|remove" >&2; exit 64 ;;
 esac
 
 if ! command -v nft >/dev/null; then
@@ -62,6 +78,20 @@ if ! command -v nft >/dev/null; then
 fi
 
 case "$ACTION" in
+  ensure)
+    # A table that exists but is missing a counter or the set is worse than no table: the probe
+    # would read a partial ruleset and the collector would silently lose peer discovery. So
+    # "present" is not enough -- check that all three objects are actually there before deciding
+    # to leave it alone.
+    if have=$(nft list table $TABLE 2>/dev/null); then
+      if printf '%s' "$have" | grep -q 'counter game_tx'          && printf '%s' "$have" | grep -q 'counter game_rx'          && printf '%s' "$have" | grep -q 'set peers'; then
+        echo "valheim-meter-nft: table $TABLE already present and complete -- left alone (counters not reset)"
+        exit 0
+      fi
+      echo "valheim-meter-nft: table $TABLE is present but incomplete -- rebuilding" >&2
+    fi
+    exec "$0" install
+    ;;
   show)
     exec nft list table $TABLE
     ;;
@@ -89,13 +119,15 @@ table $TABLE {
   counter game_tx { }
   counter game_rx { }
 
-  # Addresses seen sending to the game port in the last 15 minutes. This replaces the
+  # Addresses seen sending to the game port within VALHEIM_PEER_TIMEOUT. This replaces the
   # per-minute tcpdump the collector used to run purely to learn who to ping. Entries expire
   # on their own, so nothing has to prune them, and the set never grows past the player cap.
+  # The probe also compares the size of this set against its player count, which is how a join
+  # is noticed before status.json catches up -- see the header.
   set peers {
     type ipv4_addr
     flags timeout
-    timeout 15m
+    timeout $PEER_TIMEOUT
   }
 
   chain out {
