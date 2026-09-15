@@ -1,0 +1,55 @@
+[Unit]
+Description=Valheim dashboard: player-gated rq stall calibration (lag investigation)
+Documentation=file:/usr/local/sbin/valheim-stall-calib.py
+After=network-online.target
+# Same discipline as valheim-egress.service: a crash-looping instrument stopped and marked
+# failed is strictly better than one thrashing unnoticed. This one additionally self-stops for
+# good once it has captured enough save windows -- see the script's own module docstring -- so a
+# start-limit trip here means something is actually broken, not "calibration finished".
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/valheim-server.env
+EnvironmentFile=-/etc/valheim-alert.env
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-stall-calib.py
+Restart=always
+RestartSec=10
+
+# THE CRITICAL CONSTRAINT (see the PR write-up): this VM is 2 vCPU = 1 physical core + its SMT
+# sibling, and Valheim's server loop is effectively single-threaded. This sampler runs exactly
+# when players are online -- the one time added load is unacceptable, because the whole
+# investigation is about player-visible lag and an instrument that perturbs the game corrupts its
+# own measurement as well as harming real players. Hardened at least as strictly as
+# valheim-egress.service, not merely as strictly:
+Nice=10
+IOWeight=50
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/valheim-status
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryMax=96M
+TasksMax=16
+CPUQuota=15%
+
+# DELIBERATELY ABSENT, same reasons as valheim-egress.service (do not "finish the hardening"
+# without a reboot test -- see that unit's own comment block for the ProtectKernelModules /
+# CapabilityBoundingSet / SystemCallFilter history):
+#   ProtectKernelModules=yes, CapabilityBoundingSet=, SystemCallFilter=
+# This unit calls no `nft` at all (it only reads /proc/net/udp and status.json, both already
+# covered by ProtectSystem=strict + ReadWritePaths above), so it needs none of the capabilities
+# those exclusions were about in the first place -- narrower than valheim-egress.service by
+# construction, not by an untested guess.
+
+[Install]
+WantedBy=multi-user.target

@@ -96,6 +96,16 @@ install -m 0755 valheim-meter-nft.sh /usr/local/sbin/valheim-meter-nft.sh
 install -m 0755 valheim-egress-probe.py /usr/local/sbin/valheim-egress-probe.py
 install -m 0755 valheim-egress-report.py /usr/local/sbin/valheim-egress-report.py
 install -m 0644 valheim-egress.service /etc/systemd/system/
+# --- stall calibration (rq proxy, lag investigation) -------------------------------------------
+# Player-gated: idles at near-zero cost while the server is empty (see the script's own module
+# docstring), samples at 10 Hz only while players are connected, and stops itself for good once
+# it has captured enough world-save windows with players online -- state is persisted to
+# /var/lib/valheim-status/stallcalib-state.json, so this survives a restart or reboot without
+# re-arming. `selftest` is run here, before the unit is (re)started, so a bad deploy fails loudly
+# instead of silently shipping a broken sampler to run unattended the next time players log on.
+install -m 0755 valheim-stall-calib.py /usr/local/sbin/valheim-stall-calib.py
+/usr/bin/python3 /usr/local/sbin/valheim-stall-calib.py --selftest
+install -m 0644 valheim-stall-calib.service /etc/systemd/system/
 # Hermodr (Discord Q&A bot) -- its own venv so discord.py never touches the system Python used by
 # the collector/alert/medals scripts above. Installed but NOT started: it needs DISCORD_BOT_TOKEN
 # (and HERMODR_CHANNEL_ID or HERMODR_CHANNEL_NAME) in /etc/valheim-alert.env first, and there is no
@@ -146,6 +156,10 @@ systemctl enable --now valheim-status.timer
 # Started before the collector's first run, so the meter table (and its `peers` set) exists by the
 # time valheim-status-collect.py first looks for it.
 systemctl enable --now valheim-egress.service
+# Enabled, not merely installed: the whole point is to catch the next play session
+# unattended. It idles at near-zero cost until players are online (see the unit's own comment
+# block) and stops itself once enough save windows are captured -- see valheim-stall-calib.py.
+systemctl enable --now valheim-stall-calib.service
 systemctl start valheim-status.service
 systemctl enable --now caddy
 systemctl reload caddy
