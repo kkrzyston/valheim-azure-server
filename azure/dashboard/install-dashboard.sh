@@ -107,6 +107,33 @@ install -d -m 0755 /opt/hermodr
 /opt/hermodr/venv/bin/pip install --upgrade discord.py
 install -m 0755 valheim-bot.py /usr/local/sbin/valheim-bot.py
 install -m 0644 valheim-bot.service /etc/systemd/system/valheim-bot.service
+# Wiki knowledge base: its own venv, separate from Hermodr's, because
+# mwparserfromhell/requests (requirements-ingest.txt) have nothing to do with discord.py and mixing
+# the two would make a future dependency bump in either one risk breaking the other. The index
+# builder itself is stdlib-only (sqlite3/json/re) and runs under the system python3 above, same
+# split as the collector scripts vs. Hermodr.
+install -d -m 0755 /opt/valheim-wiki
+[ -x /opt/valheim-wiki/venv/bin/python ] || python3 -m venv /opt/valheim-wiki/venv
+/opt/valheim-wiki/venv/bin/pip install --upgrade pip >/dev/null
+/opt/valheim-wiki/venv/bin/pip install --upgrade -r requirements-ingest.txt
+install -m 0755 valheim-wiki-ingest.py valheim-wiki-index.py /usr/local/sbin/
+# Owned by valheim-bot: it is the only account either script (both run as valheim-bot -- see
+# valheim-wiki-refresh.service) ever writes wiki-records.jsonl or wiki.db into.
+install -d -m 0755 -o valheim-bot -g valheim-bot /var/lib/valheim-wiki
+# The hand-curated, cross-wiki-verified facts layer (valheim-wiki-ingest.py's --curated flag,
+# default $VALHEIM_WIKI_ROOT/valheim-curated-numbers.jsonl -- see that script's own header).
+# Without this line the default path never existed on a deployed host and the curated layer was
+# silently skipped (0 facts merged, logged at INFO -- not an error, just quietly never on). Same
+# ownership as the directory above: valheim-bot is the only account that ever reads it (it never
+# writes it back -- read-only reference data, mode 0644, not 0600/0640 like the writable spool
+# dirs above).
+install -m 0644 -o valheim-bot -g valheim-bot valheim-curated-numbers.jsonl /var/lib/valheim-wiki/
+# Installed but NOT enabled, same deliberate convention as valheim-bot.service above: a fresh
+# deploy has no corpus yet (wiki-records.jsonl/wiki.db do not exist), so the first run should be
+# an owner-supervised one by hand -- `systemctl start valheim-wiki-refresh.service` and watch the
+# journal -- not an unattended timer firing into a box nobody is looking at. Once that first run is
+# clean, `systemctl enable --now valheim-wiki-refresh.timer` turns on the weekly schedule.
+install -m 0644 valheim-wiki-refresh.service valheim-wiki-refresh.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now valheim-offsite.timer valheim-digest.timer valheim-medals-daily.timer valheim-medals-web.timer
 # The executor ships DISARMED: valheim-restart-exec.service carries Environment=VR_DRY_RUN=1, so

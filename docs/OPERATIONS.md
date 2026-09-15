@@ -119,7 +119,7 @@ the tracking-start date, so it never claims "all-time" means longer ago than tha
 **no tools** and cannot take any action — its only effect is the text reply it posts back to
 the same channel, which is always sent with `allowed_mentions` set to none (so pings are
 inert at the Discord API level) with a second-layer strip of any literal `@everyone`/`@here`
-the model types anyway, capped at roughly 500 model tokens and truncated to Discord's
+the model types anyway, capped at roughly 700 model tokens and truncated to Discord's
 2000-char limit on a word boundary. A user's own message text is never folded into the
 system prompt — it goes in as a separate untrusted `user` message, with the system prompt
 stating plainly that any instructions embedded in it must be ignored. Per-user rate limit
@@ -140,6 +140,44 @@ builds and prints the context (no Discord, no AI call); `python3 valheim-bot.py 
 managed identity exists; fails with a clear message anywhere else). Log:
 `/var/log/hermodr.log` (the bot token is never written to it, redacted defensively even from
 tracebacks).
+
+**Hermóðr answers in Old Norse by default**: the model is instructed to write plain
+Latin-letter Old Norse (never runes itself), and a pure-Python transliterator
+(`to_futhark()`) prepends a Younger Futhark, long-branch (Danish) rendering of that same text
+before it is posted — so every reply shows the runic line first, then the Old Norse sentence
+beneath it. (Elder Futhark, the older 24-rune script, is not used anywhere in this codebase —
+Younger Futhark is the Viking Age script and the only one Hermóðr renders.) Player
+names, medal names, the server address, and any number/date the model returns are
+backtick-wrapped by the model and left untouched by the transliterator, along with URLs,
+Discord mentions, and anything else with a digit in it (IPs, ports, timestamps). Asking for
+English explicitly in the same message ("in English", "translate that", "speak English", "á
+ensku", ...) gets that one reply back in plain English with no runic line; the switch is a
+deterministic Python regex (`ENGLISH_RE`), not something the model decides for itself, since
+a prompt hard-instructed to never use English would otherwise refuse its own escape hatch.
+
+**Hermóðr's game-knowledge corpus** gives Hermóðr a second kind of answer alongside the live
+server data above: game-mechanics questions ("what is a Fenring weak to?", "how much health
+does a Boar have?") answered from a wiki-derived reference corpus instead of the model's own
+memory. The corpus is built entirely offline, never fetched live during a conversation —
+`valheim-wiki-ingest.py` (its own venv, dependencies pinned in `requirements-ingest.txt`:
+`mwparserfromhell` and `requests`, kept out of Hermóðr's own stdlib-only process on purpose)
+walks the community Valheim wikis' published content, parses wikitext properly with
+`mwparserfromhell` (not regex), sanitizes it (no leftover template markup, no literal
+`@everyone`/`@here`), and writes `wiki-records.jsonl`; `valheim-wiki-index.py` builds that
+into a stdlib-only SQLite FTS5 index, `wiki.db`, that Hermóðr's `search()` call queries at
+question time. A game-knowledge answer is appended to the model's system prompt as its own
+clearly labelled GAME KNOWLEDGE block, separate from the trusted server-context block, with
+every such answer required to cite the page it came from, both wikis' entries shown side by
+side if they disagree, and a plain "unverified" flag when the corpus has nothing relevant. The
+corpus refreshes itself weekly (`valheim-wiki-refresh.service`/`.timer`) by running the
+ingest and then the index build back to back as the unprivileged `valheim-bot` user, writing
+to `/var/lib/valheim-wiki/`; a failed run leaves the previous `wiki.db` in place, since a
+stale index beats no index. Like every other timer in this stack, **it ships installed but
+not enabled** — a fresh deploy has no corpus yet, so the first run should be an
+owner-supervised `sudo systemctl start valheim-wiki-refresh.service`, and only once that
+comes back clean does `sudo systemctl enable --now valheim-wiki-refresh.timer` turn on the
+weekly schedule. Both source wikis' licences require attribution; the full required notices
+are in `dashboard/ATTRIBUTION.md`.
 
 How it works on the VM: `valheim-status.timer` runs
 `/usr/local/sbin/valheim-status-collect.py` every minute (reads the service journal
@@ -449,11 +487,13 @@ Budgets.)
   `valheim-alert.env` template, `valheim-world-scan.py`, `valheim-offsite-backup.sh`,
   `valheim-offsite.service`/`.timer`, `valheim-digest.py`,
   `valheim-digest.service`/`.timer`, `valheim-medals.py`,
-  `valheim-medals-daily.service`/`.timer`, `valheim-egress-probe.py` +
-  `valheim-egress.service` + `valheim-meter-nft.sh` + `valheim-egress-report.py` (the 1 Hz
-  egress probe, its nftables meter table, and the offline analysis), PWA `manifest.webmanifest` +
-  `icon.svg`/`icon-192.png`/`icon-512.png`, `install-dashboard.sh`, and the `PLAN-v*.md`
-  design notes).
+  `valheim-medals-daily.service`/`.timer`, `valheim-bot.py`/`valheim-bot.service`
+  (Hermóðr), its wiki knowledge base (`valheim-wiki-ingest.py`, `requirements-ingest.txt`,
+  `valheim-wiki-index.py`, `valheim-wiki-refresh.service`/`.timer`, `ATTRIBUTION.md`),
+  `valheim-egress-probe.py` + `valheim-egress.service` + `valheim-meter-nft.sh` +
+  `valheim-egress-report.py` (the 1 Hz egress probe, its nftables meter table, and the offline
+  analysis), PWA `manifest.webmanifest` + `icon.svg`/`icon-192.png`/`icon-512.png`,
+  `install-dashboard.sh`, and the `PLAN-v*.md` design notes).
 - `migrate-world.sh` — checksum-verified world placement; arms the service.
 - `verify-valheim.sh` — health check (service, ports, log evidence, on-disk integrity).
 - `set-crossplay.sh` — `sudo bash /home/azureuser/set-crossplay.sh on|off` on the VM toggles

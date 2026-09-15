@@ -1,0 +1,17 @@
+[Unit]
+Description=Weekly Valheim wiki corpus refresh, Wednesdays ~04:15 local (randomized)
+
+[Timer]
+OnCalendar=Wed *-*-* 04:15:00
+# Both wikis are third-party services the owner does not control; a fleet of installs (or even
+# just this box, re-armed after downtime) all hitting weirdgloop.org/fandom.com at the same
+# predictable second is exactly the "hammer the wikis at a predictable instant" PLAN-v6 W4 says to
+# avoid. Spread real starts across a 30-minute window instead of a fixed clock tick.
+RandomizedDelaySec=30min
+AccuracySec=5min
+# Catch up on a missed week (box was down at 04:15 Wednesday) rather than silently waiting a full
+# week for the next tick -- same reasoning as valheim-digest.timer/valheim-medals-daily.timer.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
