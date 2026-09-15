@@ -63,18 +63,29 @@ signal only, and an RFC1918/loopback check. It answers, for the next real join, 
 observed source address looks like a direct client connection or a Valve-operated hop -- crossplay
 is off (no `-crossplay` in the unit's `ExecStart`), so direct was expected, but the game log
 (`Got connection SteamID <id>`, no IP) and an idle `ip_of` map meant that had never actually been
-checked against a real address.
+checked against a real address. A miss against the known-range table is reported as
+`no_known_relay_range_hit` with `confidence=low` -- not as a "direct" verdict -- because the
+table is small and community-sourced; a real SDR relay outside those five blocks would otherwise
+be silently indistinguishable from a genuine direct client. A hit carries `confidence=medium_high`
+(strong but not authoritative), and the `private`/RFC1918 branch is `confidence=definitive`.
+
+Persistence is bounded on every write, not by a separate cleanup job: `--retain-days` (default 7)
+drops records older than that, and `--max-lines` (default 500) caps the file to its most recent
+surviving records, both enforced before each write so the bound holds across kill/restart. The
+persisted `ip` field is masked to its /24 (IPv4) or /48 (IPv6) network prefix -- the exact host
+address is only ever classified and printed to stdout for the operator watching in real time, and
+is not needed on disk once the classification is recorded.
 
 **Validated end-to-end without a real player**, since nobody was online: the capture was started
 on the VM (`--timeout 60`, backgrounded), then a synthetic UDP packet was sent to the VM's public
 game port from the operator's own machine over the network (not loopback, not spoofed -- a real
 socket send from outside the VM, so it traverses `eth0` as genuine ingress the same way a real
 client's packet would). The capture correctly detected the new `peer_rx` element within one poll
-interval, classified it (`likely_direct_client`, PTR resolved to a real ISP hostname, no Valve
-range hit), and wrote the JSON record. The test output file (which necessarily contained a real,
-non-Valve client IP address -- the operator's own) was deleted from the VM immediately after and
-was never committed; this repo and this script's own `--selftest`/examples only ever use RFC 5737
-documentation-range addresses or Cloudflare's well-known `1.1.1.1`.
+interval, classified it (`no_known_relay_range_hit`, PTR resolved to a real ISP hostname, no
+Valve range hit), and wrote the JSON record. The test output file (which necessarily contained a
+real, non-Valve client IP address -- the operator's own) was deleted from the VM immediately
+after and was never committed; this repo and this script's own `--selftest`/examples only ever
+use RFC 5737 documentation-range addresses or Cloudflare's well-known `1.1.1.1`.
 
 ## Non-disturbance verification
 
