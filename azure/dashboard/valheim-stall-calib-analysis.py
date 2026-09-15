@@ -40,6 +40,7 @@ Lines starting with # are comments. Blank lines are ignored.
 """
 import argparse
 import json
+import math
 import statistics
 import sys
 from datetime import datetime, timezone, timedelta
@@ -177,12 +178,65 @@ def baseline_test(rows, saves, field, peak_value):
     }
 
 
+# ---------------------------------------------------------------- significance (rate-based)
+
+def poisson_p_at_least_one(rate_per_hour, window_seconds):
+    """Under a null model where excursions >= the observed peak occur as a Poisson process at
+    the measured non-save `rate_per_hour`, what is the probability of seeing >=1 such excursion
+    by chance alone inside a window of `window_seconds`? This is exactly the test the sampler was
+    too small (N=1) to run: with only one save, "it moved once" and "it moves ~1300 times an
+    hour anyway" cannot be told apart by eye. p close to 1 means the observed peak is UNsurprising
+    -- indistinguishable from the background rate. p close to 0 means it would be a genuine
+    surprise for the background alone to explain it."""
+    if rate_per_hour is None:
+        return None
+    lam = rate_per_hour * (window_seconds / 3600.0)  # expected count in the window, under H0
+    return 1.0 - math.exp(-lam)
+
+
+def pooled_significance(save_results, baseline_results, window_seconds=WINDOW_S):
+    """Combine all save windows into one test: total observed excursions (1 per window that
+    moved) vs. the count expected by chance alone across the SAME total window time, using each
+    window's own local baseline rate (all windows share one non-save distribution here, but the
+    formula stays per-window-correct if that ever changes). Returns None if no windows had usable
+    baseline results."""
+    entries = []
+    total_expected = 0.0
+    total_observed = 0
+    for sr, bt in zip(save_results, baseline_results):
+        if bt is None or sr["peak_during"] is None:
+            continue
+        p = poisson_p_at_least_one(bt["rate_per_hour"], window_seconds)
+        moved = sr["baseline_before"] is not None and sr["peak_during"] > sr["baseline_before"]
+        entries.append({
+            "peak": sr["peak_during"],
+            "rate_per_hour": bt["rate_per_hour"],
+            "p_by_chance": round(p, 4) if p is not None else None,
+            "moved": moved,
+        })
+        total_expected += p if p is not None else 0.0
+        total_observed += 1 if moved else 0
+    if not entries:
+        return None
+    # Probability of observing `total_observed` or more "moved" windows by chance, treating each
+    # window as an independent Bernoulli trial with its own p_by_chance (Poisson-binomial mean
+    # approximated by summing the per-window probabilities -- fine for the tiny N here).
+    return {
+        "per_window": entries,
+        "n_windows": len(entries),
+        "n_moved_observed": total_observed,
+        "n_moved_expected_by_chance": round(total_expected, 3),
+    }
+
+
 # ---------------------------------------------------------------- verdicts
 
-def verdict_for_signal(field, save_results, baseline_results, n_saves):
-    """VALIDATED / BLIND / INCONCLUSIVE, per-signal, adversarially. Never rounds N=1 up to a
-    population-level VALIDATED. A signal that is flat through a real stall is a positive BLIND
-    finding, not a failed test -- it says the signal cannot see main-loop stalls, full stop."""
+def verdict_for_signal(field, save_results, baseline_results, n_saves, pooled=None):
+    """VALIDATED / BLIND / INCONCLUSIVE, per-signal, adversarially. Never rounds a larger N up to
+    a population-level VALIDATED just because it's larger -- the bar is the pooled by-chance
+    probability, not the sample count. A signal that is flat through a real stall is a positive
+    BLIND finding, not a failed test -- it says the signal cannot see main-loop stalls, full
+    stop."""
     if n_saves == 0:
         return "INCONCLUSIVE", "no save events fell inside the capture window"
 
@@ -210,7 +264,25 @@ def verdict_for_signal(field, save_results, baseline_results, n_saves):
             "baseline rate below for how likely that coincidence is"
         )
 
-    # n_saves >= 3 and at least one moved: lean on the baseline rate.
+    # n_saves >= 3 and at least one moved: the bar is the POOLED by-chance probability, not the
+    # raw count. If the number of windows that moved is no more than what the baseline's own
+    # excursion rate would predict by chance, this is noise wearing a save's clothes.
+    if pooled is not None:
+        expected = pooled["n_moved_expected_by_chance"]
+        observed = pooled["n_moved_observed"]
+        # Observed must clear expected by a real margin, not just nominally exceed it, given how
+        # few windows there are to begin with (n_saves is typically single digits here).
+        if observed > 0 and observed >= max(expected * 2, expected + 1):
+            return "VALIDATED", (
+                f"{observed}/{pooled['n_windows']} windows moved above their own pre-save "
+                f"baseline, vs {expected:.2f} expected by chance from the non-save excursion "
+                "rate alone -- more than chance predicts"
+            )
+        return "INCONCLUSIVE", (
+            f"{observed}/{pooled['n_windows']} windows moved, but chance alone predicts "
+            f"{expected:.2f} -- not distinguishable from the non-save baseline noise rate"
+        )
+
     rates = [b["rate_per_hour"] for b in baseline_results if b is not None]
     if rates and max(rates) < 1.0:
         return "VALIDATED", f"moved in {moved_count}/{len(save_results)} windows; baseline rate < 1/hr"
@@ -259,10 +331,25 @@ def run_report(samples_path, saves_path):
                       f"{field} value occurred {bt['n_equal_or_greater']} time(s) across "
                       f"{bt['n_non_save_samples']} non-save samples "
                       f"({bt['rate_per_hour']}/hour, spanning {bt['span_hours']}h)")
+                p = poisson_p_at_least_one(bt["rate_per_hour"], WINDOW_S)
+                if p is not None:
+                    print(f"    SIGNIFICANCE: P(>=1 excursion this size in a random "
+                          f"{WINDOW_S:.0f}s window, by chance alone) = {p:.4f}")
             else:
                 print("    BASELINE TEST: could not run (no non-save samples or no peak value)")
 
-        verdict, reason = verdict_for_signal(field, save_results, baseline_results, len(saves))
+        pooled = pooled_significance(save_results, baseline_results)
+        if pooled:
+            print(f"\n  POOLED across {pooled['n_windows']} window(s): "
+                  f"{pooled['n_moved_observed']} moved above their own pre-save baseline, "
+                  f"vs. {pooled['n_moved_expected_by_chance']:.3f} expected by chance alone "
+                  f"(sum of each window's own by-chance probability, given the shared non-save "
+                  f"exceedance rate).")
+            for i, e in enumerate(pooled["per_window"], 1):
+                print(f"    window {i}: peak={e['peak']}  baseline_rate={e['rate_per_hour']}/hr  "
+                      f"P(by chance)={e['p_by_chance']}  moved={e['moved']}")
+
+        verdict, reason = verdict_for_signal(field, save_results, baseline_results, len(saves), pooled)
         print(f"\n  VERDICT ({field}): {verdict} -- {reason}")
 
     return 0
@@ -356,6 +443,49 @@ def _selftest():
         return "VALIDATED"
     check("inverted (comparison-deleted) implementation disagrees with ours on the BLIND case",
           inverted_verdict(sr4, 1) != v4)
+
+    # ---- poisson_p_at_least_one: a rare baseline (0.5/hr) makes a 2s window very unlikely to
+    # hit by chance; a loud baseline (5000/hr, close to the real rtt measurement) makes it likely.
+    p_rare = poisson_p_at_least_one(0.5, WINDOW_S)
+    p_loud = poisson_p_at_least_one(5000.0, WINDOW_S)
+    check("poisson_p_at_least_one: rare baseline gives low p", p_rare < 0.01)
+    check("poisson_p_at_least_one: loud baseline gives high p", p_loud > 0.5)
+    check("poisson_p_at_least_one: loud baseline is more surprising-proof than rare",
+          p_loud > p_rare)
+
+    # ---- pooled_significance + verdict: 3 windows, all moved, against a RARE baseline
+    # (<<1 expected hit by chance) -- this is the shape a real detection should have.
+    sr_rare = {"peak_during": 40, "baseline_before": 2}
+    bt_rare = {"rate_per_hour": 0.2, "n_equal_or_greater": 0, "n_non_save_samples": 10000,
+               "span_hours": 1.0, "hit_fraction": 0.0}
+    pooled_rare = pooled_significance([sr_rare] * 3, [bt_rare] * 3)
+    check("pooled_significance: rare baseline -> expected << observed",
+          pooled_rare["n_moved_expected_by_chance"] < 0.5 and pooled_rare["n_moved_observed"] == 3)
+    v_rare, _ = verdict_for_signal("rq", [sr_rare] * 3, [bt_rare] * 3, 3, pooled_rare)
+    check("verdict_for_signal: VALIDATED when observed clears the by-chance expectation",
+          v_rare == "VALIDATED")
+
+    # ---- same 3-window shape, but against a LOUD baseline (this is the real rtt measurement's
+    # shape: ~1291/hr). Expected-by-chance should be close to 3, and the verdict must NOT be
+    # VALIDATED even though all 3 windows nominally "moved" -- this is the exact case the task
+    # brief warns about: a larger N tempting an upgrade it hasn't earned.
+    sr_loud = {"peak_during": 45.6, "baseline_before": 29.6}
+    bt_loud = {"rate_per_hour": 1291.0, "n_equal_or_greater": 461, "n_non_save_samples": 6322,
+               "span_hours": 0.357, "hit_fraction": 0.073}
+    pooled_loud = pooled_significance([sr_loud] * 3, [bt_loud] * 3)
+    check("pooled_significance: loud baseline -> expected is close to observed",
+          pooled_loud["n_moved_expected_by_chance"] > 1.5)
+    v_loud, reason_loud = verdict_for_signal("rtt_ms", [sr_loud] * 3, [bt_loud] * 3, 3, pooled_loud)
+    check("verdict_for_signal: NOT VALIDATED when a loud baseline explains the moves",
+          v_loud != "VALIDATED")
+
+    # ---- inversion check for the pooled path: an implementation that dropped the `expected`
+    # comparison and just checked observed > 0 would call the loud case VALIDATED. Confirm ours
+    # disagrees -- the pooled test is a real lock, not a status-only assert.
+    def inverted_pooled_verdict(pooled):
+        return "VALIDATED" if pooled["n_moved_observed"] > 0 else "INCONCLUSIVE"
+    check("inverted (expected-check-deleted) pooled verdict disagrees with ours on the loud case",
+          inverted_pooled_verdict(pooled_loud) != v_loud)
 
     sys.exit(0 if ok else 1)
 
