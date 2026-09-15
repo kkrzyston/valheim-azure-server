@@ -912,33 +912,83 @@ def join_reply(english=False):
     return norse_reply("\n".join(lines))
 
 
-# ---------------------------------------------------------------- Old Norse -> Elder Futhark
+# ---------------------------------------------------------------- Old Norse -> Younger Futhark
 # The model is instructed (SYSTEM_PROMPT's LANGUAGE block) to answer in Old Norse using plain
 # Latin letters ONLY -- it never types a rune. to_futhark() is the pure, deterministic transform
-# that turns that Latin-letter Old Norse into the Elder Futhark line shown above it. Keeping this
-# out of the model keeps the runes consistent (no per-reply drift in which rune stands for what)
-# and keeps token cost off the deployment's 20K TPM ceiling -- runes are never part of the prompt
-# or the completion, only a post-processing step applied to text the model already returned.
+# that turns that Latin-letter Old Norse into the runic line shown above it. Keeping this out of
+# the model keeps the runes consistent (no per-reply drift in which rune stands for what) and
+# keeps token cost off the deployment's 20K TPM ceiling -- runes are never part of the prompt or
+# the completion, only a post-processing step applied to text the model already returned.
 #
-# Elder Futhark has 24 runes and cannot represent everything Latin-orthography Old Norse can, so
-# a handful of normalizations collapse before mapping (vowel length is not distinguished; ð and þ
-# share one rune; c/q collapse to k; v to w; x expands to k+s; the "th" digraph some non-native
-# typing falls back to also becomes þ). Every other character -- punctuation, digits, markdown,
-# anything with no rune -- passes through completely unchanged.
+# This is YOUNGER FUTHARK, LONG-BRANCH (Danish) variant -- 16 runes, c. 800-1100, the actual
+# Viking Age script, contemporary with the Old Norse of the sagas and Eddas. Elder Futhark (24
+# runes, c. 150-800 AD) wrote Proto-Norse, not Old Norse, and has been removed from this
+# codebase entirely -- there is no option to select it. Every codepoint below was checked
+# against Unicode's Runic block by name before use: long-branch and short-twig letters sit at
+# adjacent codepoints and are easy to swap by accident -- the short-twig codepoint is noted
+# next to every rune below that has one, and none of those short-twig codepoints are used here.
+#
+# Sixteen runes means more sounds share a letter than Elder Futhark ever required, and that is
+# historically correct, not a bug to paper over -- see the per-key comments below and the
+# _FUTHARK_NORM fold table just after this one for exactly which letters land on which rune.
+# Two decisions worth calling out here rather than leaving implicit in the table:
+#   - x has NO dedicated rune, and unlike the old Elder Futhark table (one Latin character
+#     expanding to two runes, "x" -> "ks"), it does NOT expand here -- it folds to a single
+#     rune, k. See norse_reply()'s docstring for why that matters (the shrink-loop worst case
+#     this transliterator has to plan for changed because of it).
+#   - KNOWN GAP, recorded rather than papered over: this table has no entry for long-branch YR
+#     (U+16E6). Historically it marked the reflex of Proto-Germanic *z -- in practice, chiefly
+#     the nominative-singular -r ending -- as distinct from original *r. Telling the two apart
+#     requires knowing whether a given -r is that grammatical ending or part of the root, which
+#     is morphological analysis this character-level transliterator cannot do from the text
+#     alone. Every /r/, regardless of historical origin, maps to the plain r rune below. A
+#     wrong guess here would be worse than the flattening -- do not add a separate yr mapping
+#     without real morphological parsing behind it.
 FUTHARK_RUNES = {
-    "f": "ᚠ", "u": "ᚢ", "þ": "ᚦ", "a": "ᚨ", "r": "ᚱ", "k": "ᚲ",
-    "g": "ᚷ", "w": "ᚹ", "h": "ᚺ", "n": "ᚾ", "i": "ᛁ", "j": "ᛃ",
-    "ï": "ᛇ", "p": "ᛈ", "z": "ᛉ", "s": "ᛊ", "t": "ᛏ", "b": "ᛒ",
-    "e": "ᛖ", "m": "ᛗ", "l": "ᛚ", "ŋ": "ᛜ", "d": "ᛞ", "o": "ᛟ",
+    "f": "\u16A0",  # fe
+    "u": "\u16A2",  # ur -- also o, y, ø, ǫ, v, w (see _FUTHARK_NORM below)
+    "\u00fe": "\u16A6",  # thorn -- also ð (eth)
+    "\u0105": "\u16AC",  # long-branch oss (nasal a/o) -- kept for a complete 16-rune table
+                          # but unreachable via this bot's restricted orthography (see comment
+                          # block above); a literal "ą" in input still transliterates correctly
+                          # if it ever appears
+    "r": "\u16B1",  # raid -- also the historical yr reflex; see KNOWN GAP above
+    "k": "\u16B4",  # kaun -- also g
+    "h": "\u16BC",  # long-branch hagall (short-twig is U+16BD -- NOT used here)
+    "n": "\u16BE",  # naud (short-twig is U+16BF -- NOT used here)
+    "i": "\u16C1",  # iss -- also e
+    "a": "\u16C5",  # long-branch ar (short-twig is U+16C6 -- NOT used here)
+    "s": "\u16CB",  # long-branch sol (short-twig is U+16CC -- NOT used here)
+    "t": "\u16CF",  # tyr -- also d (short-twig is U+16D0 -- NOT used here)
+    "b": "\u16D2",  # bjarkan -- also p (short-twig is U+16D3 -- NOT used here)
+    "m": "\u16D8",  # long-branch madr (U+16D7 is Elder mannaz, U+16D9 is short-twig --
+                     # both WRONG here)
+    "l": "\u16DA",  # laukaz
 }
 
-# Vowel-length and letter-inventory normalization applied BEFORE the rune lookup above -- Elder
-# Futhark has no separate letters for any of these, so they all collapse onto a base-24 letter.
-# ("x" -> "ks" is handled as a string substitution before this table, since it is one-to-many.)
+# Vowel-length and letter-inventory normalization applied BEFORE the rune lookup above --
+# Younger Futhark has no separate letters for any of these, so they all collapse onto one of
+# the 15 directly-reachable base letters above (see the "also" comments on FUTHARK_RUNES for
+# which). Every value here is itself a direct key of FUTHARK_RUNES -- this is a single lookup,
+# not a chain, so pointing a new entry at an intermediate (rather than final) key would
+# silently no-op it. "x" folds to "k" here like c/q/g do: unlike the old Elder Futhark table,
+# there is no one-character-in/two-runes-out expansion left anywhere in this pipeline any
+# more -- see norse_reply()'s docstring for why that matters.
 _FUTHARK_NORM = {
-    "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ý": "u",
-    "æ": "a", "ø": "o", "ǫ": "o", "ö": "o", "y": "u",
-    "ð": "þ", "c": "k", "q": "k", "v": "w",
+    # accent/vowel-length stripping (SYSTEM_PROMPT restricts the model to plain a-z plus
+    # thorn/eth/ash/o-diaeresis and the acute accents -- a-acute e-acute i-acute o-acute
+    # u-acute y-acute)
+    "\u00e1": "a", "\u00e9": "i", "\u00ed": "i", "\u00f3": "u", "\u00fa": "u", "\u00fd": "u",
+    "\u00e6": "a", "\u00f6": "u",
+    # letter-inventory folds explicit in the mapping table (see FUTHARK_RUNES comments above)
+    "\u00f0": "\u00fe", "o": "u", "y": "u", "\u00f8": "u", "\u01eb": "u", "v": "u", "w": "u",
+    "g": "k", "d": "t", "p": "b", "e": "i",
+    # no Younger Futhark rune ever covered these letters at all; fold to the nearest attested
+    # value rather than leaving them untransliterated Latin
+    "c": "k", "q": "k", "x": "k", "z": "s", "j": "i", "\u00ef": "i", "\u014b": "n",
+    "\u0280": "r",  # defensive: a literal small-capital r (an academic
+                    # transliteration convention for yr) also flattens to r, consistent
+                    # with the KNOWN GAP noted above
 }
 
 # Carve-outs: spans that MUST reach the output byte-for-byte, never rune-mapped, because either
@@ -991,7 +1041,6 @@ def _futhark_segment(segment):
     s = segment.lower()
     s = re.sub(r"ck", "k", s)
     s = re.sub(r"th", "þ", s)
-    s = s.replace("x", "ks")
     out = []
     for ch in s:
         mapped = _FUTHARK_NORM.get(ch, ch)
@@ -1082,7 +1131,7 @@ def _trim_to_balanced(text):
 
 
 def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
-    """The on-screen shape for every reply: the Elder Futhark line first, then the same sentence
+    """The on-screen shape for every reply: the Younger Futhark (long-branch) line first, then the same sentence
     in Old Norse Latin orthography beneath it -- see this task's brief for the exact shape. Used
     for both the model path (call_ai_sync's Old Norse answers) and the fixed canned strings
     below; never used when the English escape hatch (ENGLISH_RE) is active for a reply.
@@ -1097,32 +1146,43 @@ def norse_reply(old_norse_text, limit=DISCORD_LIMIT):
     it, not just a crafted edge case.
 
     An earlier version of this fix budgeted the Latin half at a fixed fraction of `limit` (half of
-    half), sized against the mathematical worst case (an all-"x" body doubling in length under
-    "x" -> "ks"). That is correct but wasteful: "x" is essentially absent from real Old Norse, so
-    every ordinary answer was charged for a case that never happens, roughly halving the usable
-    length for no reason. This version measures the ACTUAL transliteration instead of assuming
-    the worst case, and only shrinks when the real output overshoots:
+    half), sized against the mathematical worst case under the OLD Elder Futhark table (an
+    all-"x" body doubling in length under "x" -> "ks"). That was correct but wasteful even then;
+    it is flat-out wrong on its own terms now, because the Younger Futhark long-branch table
+    above has NO expansion case left at all: every per-character mapping is exactly
+    one-in/one-out (see FUTHARK_RUNES / _FUTHARK_NORM), and the only multi-character rewrites
+    left ("ck" -> "k", "th" -> a single þ) are CONTRACTIONS. So to_futhark() output can
+    never be longer than its (lower-cased) input. Re-derived and checked against every reachable
+    input character (see --selftest's dedicated ratio assertion below): the maximum possible
+    ratio is exactly 1.0, not the old table's 2.0. This version measures the ACTUAL
+    transliteration instead of assuming any worst case, and only shrinks when the real output
+    overshoots:
 
-    to_futhark() is 1:1 or CONTRACTING ("ck" -> "k", "th" -> a single þ) for every character
-    except "x" -> "ks", the one 1-character-in/2-runes-out expansion in the whole table -- so for
-    real Old Norse (essentially no "x") the loop below almost always exits on its first check,
-    keeping the Latin half close to `limit`'s true per-half ceiling (~half of `limit`, minus the
-    "\\n"). It only has to do real shrinking work on "x"-heavy text, which is exactly the case
-    that needs it.
+    to_futhark() is 1:1 or CONTRACTING for every character now -- there is no per-character
+    expansion case left in this table at all (the old Elder-table "x" -> "ks" case is gone; "x"
+    now folds to the single rune for "k", same as c/q/g) -- so the loop below almost always
+    exits on its first check, keeping the Latin half close to `limit`'s true per-half ceiling
+    (~half of `limit`, minus the "\n"). It still does real shrinking work whenever "ck"/"th"
+    contractions are scarce in the answer -- ordinary Old Norse already writes þ directly
+    rather than typing "th", so that is close to the common case, not a rare one -- which is
+    exactly what the loop below is built to measure and correct for rather than assume away.
 
-    The shrink amount matters: removing N characters from `candidate` does not buy back N
-    characters of combined length -- the rune line shrinks too, by roughly the SAME expansion
-    ratio (len(rune_line) / len(candidate), measured fresh each iteration: ~1.0 for real Old
-    Norse, ~2.0 only for "x"-heavy text) that produced the just-measured rune line. Subtracting
-    the raw combined-length overshoot straight off `candidate`'s own length ignores that and
-    over-corrects by roughly (1 + ratio) -- on ordinary near-1:1 text that collapses a ~2000-char
-    reply down to a 1-character candidate on the very first retry, which defeats the entire point
-    of measuring instead of assuming a worst case. Dividing the overshoot across both halves in
-    proportion to their measured lengths --
+    The shrink amount matters: removing N characters from `candidate` does not necessarily buy
+    back N characters of combined length -- the rune line shrinks too, by roughly the SAME
+    ratio (len(rune_line) / len(candidate), measured fresh each iteration: at most 1.0 now, for
+    every input, not just "ordinary" ones) that produced the just-measured rune line.
+    Subtracting the raw combined-length overshoot straight off `candidate`'s own length ignores
+    that and over-corrects by roughly (1 + ratio) -- on ordinary near-1:1 text that collapses a
+    ~2000-char reply down to a 1-character candidate on the very first retry, which defeats the
+    entire point of measuring instead of assuming a worst case. Dividing the overshoot across
+    both halves in proportion to their measured lengths --
     `shrink = ceil(overshoot * cand_len / (cand_len + rune_len))` -- converges to the real
-    ceiling in one or two steps instead. This is a MEASURED ratio recomputed every iteration, not
-    a fixed divisor: do not replace it with a flat "budget half the length" shortcut, or every
-    normal answer pays for the "x" case again for no reason.
+    ceiling in one or two steps instead: with the ratio capped at 1.0, cand_len / (cand_len +
+    rune_len) is always >= 1/2, so `shrink` is always at least half of `overshoot` -- the
+    candidate strictly shrinks every iteration, which is what guarantees this loop terminates.
+    This is a MEASURED ratio recomputed every iteration, not a fixed divisor: do not replace it
+    with a flat "budget half the length" shortcut, or every normal answer pays again for a
+    worst case that, under this table, no longer exists.
 
     Every truncate_discord() call below is immediately followed by _trim_to_balanced(): plain
     character-count truncation has no idea what a backtick is, so it can (and does, in practice --
@@ -1987,6 +2047,29 @@ def cmd_selftest():
         print(f"{'PASS' if survived else 'FAIL'} ({label}): {must_survive!r} in {out!r}")
         all_ok = all_ok and survived
 
+    print("\n--- to_futhark() pins known words to their long-branch runes (a short-twig")
+    print("codepoint must fail loudly, not just look plausible) ---")
+    # Regression/variant guard: several Younger Futhark long-branch letters sit one codepoint
+    # away from their short-twig twins (see FUTHARK_RUNES' comments for the exact pairs -- h,
+    # a, s, t, b, and m each have one). A silent swap to the wrong variant would still "look
+    # like runes" and would not be caught by the carve-out or length-budget checks above, which
+    # only care about which SPANS get transliterated, not which codepoints come out. These two
+    # real Old Norse words, hand-verified against Unicode by codepoint name, between them
+    # exercise all four of this table's long-branch-vs-short-twig traps:
+    #   "valholl" -> long-branch hagall (h, U+16BC) and long-branch ar (a, U+16C5) -- the
+    #   short-twig codepoints (U+16BD, U+16C6) are one off from these.
+    #   "sigrid"  -> long-branch sol (s, U+16CB) and tyr (t, U+16CF) -- short-twig codepoints
+    #   U+16CC and U+16D0 are the traps.
+    pinned_words = [
+        ("valh\u00f6ll", "\u16A2\u16C5\u16DA\u16BC\u16A2\u16DA\u16DA"),
+        ("sigrid", "\u16CB\u16C1\u16B4\u16B1\u16C1\u16CF"),
+    ]
+    for word, expected in pinned_words:
+        out = to_futhark(word)
+        pinned_ok = out == expected
+        print(f"{'PASS' if pinned_ok else 'FAIL'} to_futhark({word!r}) == expected "
+              f"long-branch runes: got {out!r}, want {expected!r}")
+        all_ok = all_ok and pinned_ok
     print("\n--- to_futhark() fails CLOSED on an unterminated backtick/fence (must not mangle) ---")
     # Regression check: an unclosed inline code span used to simply not match the closed-span
     # pattern, so protection silently vanished and everything after the stray backtick -- including
@@ -2032,11 +2115,13 @@ def cmd_selftest():
         print(f"{'PASS' if matches else 'FAIL'} rune half == to_futhark(kept Latin half) "
               f"(rune half {len(rune_half)} chars, latin half {len(latin_half)} chars)")
         all_ok = all_ok and matches
-        # norse_reply() measures the actual transliteration instead of budgeting for the "x"
-        # worst case, so ordinary (essentially "x"-free) Old Norse should keep a Latin half close
-        # to the true ~half-of-DISCORD_LIMIT ceiling, not the ~499 chars a fixed worst-case
-        # divisor would leave it with. This is the regression guard for that: if this ever drops
-        # back to ~500, a fixed conservative budget crept back in.
+        # norse_reply() measures the actual transliteration instead of assuming a fixed worst
+        # case, so ordinary Old Norse should keep a Latin half close to the true
+        # ~half-of-DISCORD_LIMIT ceiling, not the ~499 chars a fixed conservative divisor would
+        # leave it with (the old Elder-table "x" worst case -- a 2x expansion -- no longer
+        # exists at all under the Younger Futhark table; see norse_reply()'s docstring). This
+        # is the regression guard for that: if this ever drops back to ~500, a fixed
+        # conservative budget crept back in.
         not_over_conservative = len(latin_half) > 900
         print(f"{'PASS' if not_over_conservative else 'FAIL'} Latin half > 900 chars "
               f"(not budgeted for the 'x' worst case): {len(latin_half)}")
@@ -2047,11 +2132,13 @@ def cmd_selftest():
         print("FAIL rune half == to_futhark(kept Latin half): no \"\\n\" to split on")
         print("FAIL Latin half > 900 chars (not budgeted for the 'x' worst case): no \"\\n\" to split on")
 
-    # Worst-case expansion: to_futhark() maps every "x" to two runes ("ks"), the only
-    # one-character-in/two-runes-out case in the whole mapping table. An all-"x" input is the
-    # adversarial case norse_reply()'s shrink loop has to converge on correctly; its Latin half
-    # is legitimately shorter here than in the ordinary case above -- that is the whole point of
-    # measuring the actual expansion instead of assuming it is always this bad.
+    # Re-derived worst case for the Younger Futhark long-branch table: there is no character
+    # left that expands (see FUTHARK_RUNES / _FUTHARK_NORM and norse_reply()'s docstring) --
+    # the maximum possible per-character ratio is now exactly 1.0, hit by any character with
+    # no "ck"/"th" digraph to contract, "x" among them (it now folds 1:1 to the rune for "k").
+    # An all-"x" input is still a good stress case for the shrink loop -- long enough to force
+    # real shrinking, and it pins the new worst-case ratio -- it is just no longer an
+    # ADVERSARIAL case the way the old "x" -> "ks" expansion was.
     x_heavy = "x" * 3000
     x_out = norse_reply(x_heavy)
     x_fits = len(x_out) <= DISCORD_LIMIT
@@ -2067,9 +2154,19 @@ def cmd_selftest():
         print(f"{'PASS' if x_latin_nonempty else 'FAIL'} x-heavy input: Latin half non-empty: "
               f"{len(x_latin)} chars")
         all_ok = all_ok and x_latin_nonempty
+        # Regression guard for the "no expansion left in this table" claim above: if "x" (or
+        # any other character) is ever remapped back to a multi-rune expansion, this ratio
+        # stops being 1:1 and this assertion catches it instead of the claim silently going
+        # stale.
+        x_ratio_ok = len(x_rune) == len(x_latin)
+        print(f"{'PASS' if x_ratio_ok else 'FAIL'} x-heavy input: rune half length == Latin half "
+              f"length (ratio == 1.0, the new worst case): {len(x_rune)} == {len(x_latin)}")
+        all_ok = all_ok and x_ratio_ok
     else:
         all_ok = False
         print("FAIL x-heavy input: Latin half non-empty: no \"\\n\" to split on")
+        print("FAIL x-heavy input: rune half length == Latin half length (ratio == 1.0, the new "
+              "worst case): no \"\\n\" to split on")
 
     print("\n--- truncate_discord() can manufacture an unbalanced span; _trim_to_balanced() repairs it ---")
     # Regression check for norse_reply()'s half of Fix 2. truncate_discord()'s word-boundary

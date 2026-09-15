@@ -143,8 +143,10 @@ tracebacks).
 
 **Hermóðr answers in Old Norse by default**: the model is instructed to write plain
 Latin-letter Old Norse (never runes itself), and a pure-Python transliterator
-(`to_futhark()`) prepends an Elder Futhark rendering of that same text before it is posted —
-so every reply shows the runic line first, then the Old Norse sentence beneath it. Player
+(`to_futhark()`) prepends a Younger Futhark, long-branch (Danish) rendering of that same text
+before it is posted — so every reply shows the runic line first, then the Old Norse sentence
+beneath it. (Elder Futhark, the older 24-rune script, is not used anywhere in this codebase —
+Younger Futhark is the Viking Age script and the only one Hermóðr renders.) Player
 names, medal names, the server address, and any number/date the model returns are
 backtick-wrapped by the model and left untouched by the transliterator, along with URLs,
 Discord mentions, and anything else with a digit in it (IPs, ports, timestamps). Asking for
