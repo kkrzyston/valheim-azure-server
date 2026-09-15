@@ -226,9 +226,19 @@ bot says so to the player each time. If reports are not arriving, check that fir
 INCONCLUSIVE**. It leads with a coverage block — how much data there actually is, how old the
 newest sample is, which player counts are present — and refuses a positive verdict on thin or
 stale evidence, because three hours of month-old data otherwise reads exactly like thirty days of
-continuous data. **A CONFIRMED verdict needs at least two player counts**: R2 (does the plateau
-scale with n?) is the test that separates a per-peer budget from a single server-wide cap, and one
-point has no slope. It leads with six refutation conditions and stops at the first that fires: a
+continuous data. **A CONFIRMED verdict needs at least two player counts**, each with at least
+half an hour of plateau of its own: R2 (does the plateau scale with n?) is the test that separates
+a per-peer budget from a single server-wide cap, and one point has no slope no matter how many
+hours went into it.
+
+It also separates instrument error from measurement before computing anything. A sample above
+either the link capacity or ten times the 99.9th percentile for its player count is discarded as
+an artifact -- a 15 MB/s reading on a host whose observed maximum is 276 KB/s is not a refutation,
+it is a reading the machine cannot have produced, and R1 ending the investigation on one such row
+would be a category error. The count, the bound and examples are always printed, never silently
+swallowed, and above 1% artifacts the instrument rather than the hypothesis becomes the finding.
+R1 correspondingly fires on three samples anywhere or two consecutive ones, since a sustained
+overshoot is a measurement and a lone spike is not. It leads with six refutation conditions and stops at the first that fires: a
 single second above the arithmetic ceiling, a plateau that does not scale with player count, lag
 reports while egress is well below the ceiling, small packets inside plateaus, a non-empty socket
 send queue, or A2S latency spikes at low egress. Its strongest positive test compares raid
