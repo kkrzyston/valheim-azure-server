@@ -69,28 +69,51 @@ SATURATED_FRACTION = 0.85       # a window counts as "near the ceiling" above th
 
 
 def load(path):
+    """Returns (rows, load_stats). load_stats separately counts lines that failed json.loads
+    from lines that parsed but were missing rx/tx/p/t, plus the total non-blank lines read --
+    a bare `continue` on either failure would silently thin the sample with no way for a caller
+    to tell a quiet collector from a quietly-corrupted one."""
     rows = []
+    total_lines = 0
+    parse_failures = 0
+    missing_fields = 0
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            total_lines += 1
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
+                parse_failures += 1
                 continue
             if "rx" not in d or "tx" not in d or d.get("p") is None or d.get("t") is None:
+                missing_fields += 1
                 continue
             rows.append(d)
     rows.sort(key=lambda d: d["t"])
-    return rows
+    load_stats = {
+        "total_lines": total_lines,
+        "parse_failures": parse_failures,
+        "missing_fields": missing_fields,
+    }
+    return rows, load_stats
 
 
 def diffed_rates(rows):
     """Cumulative rx/tx counters -> per-interval bytes/sec. Each output row is the interval
-    ENDING at rows[i]['t']. A non-monotonic counter or an overlong gap yields rate=None."""
+    ENDING at rows[i]['t']. A non-monotonic counter or an overlong gap yields rate=None.
+
+    Returns (out, excluded) -- excluded counts intervals that produced no rate because of a gap
+    over MAX_GAP_S or a non-monotonic counter (NOT counting the unavoidable first row, which has
+    no previous sample to diff against and isn't an "interval" at all). Refusing to fabricate a
+    rate across a gap or a counter reset is correct and unchanged; what was missing is a tally,
+    so a systemic NIC counter reset shows up as its own line in the report instead of quietly
+    presenting as "not enough join/leave events."""
     out = []
     prev = None
+    excluded = 0
     for d in rows:
         rate = None
         if prev is not None:
@@ -99,9 +122,11 @@ def diffed_rates(rows):
             dtx = d["tx"] - prev["tx"]
             if 0 < dt <= MAX_GAP_S and drx >= 0 and dtx >= 0:
                 rate = {"rx_bps": drx / dt, "tx_bps": dtx / dt, "dt": dt}
+            else:
+                excluded += 1
         out.append({"t": d["t"], "p": d["p"], "rate": rate})
         prev = d
-    return out
+    return out, excluded
 
 
 def find_transitions(rows):
@@ -159,9 +184,12 @@ def correlation(xs, ys):
     return cov / (sx * sy)
 
 
-def analyze(raw, out=sys.stdout):
+def analyze(raw, out=sys.stdout, load_stats=None):
     """Runs the full report against already-loaded, sorted sample rows. Returns the verdict
-    string (also used by --selftest) and prints the narrative to `out`."""
+    string (also used by --selftest) and prints the narrative to `out`. `load_stats`, when
+    given (main() passes it; --selftest's synthetic worlds don't have a file to load from and
+    omit it), surfaces how many lines load() had to drop and why, so a reader can compute the
+    drop fraction instead of only ever seeing the surviving row count."""
     def p(*a):
         print(*a, file=out)
 
@@ -171,9 +199,18 @@ def analyze(raw, out=sys.stdout):
 
     t0, t1 = raw[0]["t"], raw[-1]["t"]
     span_days = (t1 - t0) / 86400
-    p(f"# Data span: {span_days:.2f} days ({len(raw)} rows with rx/tx) -- t0={t0} t1={t1}")
+    if load_stats is not None:
+        p(f"# Data span: {span_days:.2f} days ({len(raw)} usable rows of "
+          f"{load_stats['total_lines']} lines read -- {load_stats['parse_failures']} lines "
+          f"unparseable, {load_stats['missing_fields']} missing rx/tx, dropped) "
+          f"-- t0={t0} t1={t1}")
+    else:
+        p(f"# Data span: {span_days:.2f} days ({len(raw)} rows with rx/tx) -- t0={t0} t1={t1}")
 
-    rate_rows = diffed_rates(raw)
+    rate_rows, excluded_intervals = diffed_rates(raw)
+    total_intervals = max(len(raw) - 1, 0)
+    p(f"# {excluded_intervals}/{total_intervals} intervals excluded (gap > {MAX_GAP_S}s or "
+      f"non-monotonic counter) -- never bridged or estimated")
     global_max_tx = max((r["rate"]["tx_bps"] for r in rate_rows if r["rate"]), default=0.0)
     p(f"# Global max tx rate in this file: {global_max_tx/1024:.2f} KB/s "
       f"({100*global_max_tx/CEILING_BPS:.1f}% of the assumed {CEILING_BPS/1024:.0f} KB/s ceiling)")
@@ -292,25 +329,42 @@ def selftest():
     traffic -- they are unit tests for the arithmetic."""
     ok = True
 
-    # World A: GLOBAL cap of 200000 B/s, saturated the whole time. 3 players before, 4 after.
-    # Demand is held flat (rx constant) so this is a "controlled, near-ceiling" transition.
+    # World A: a REAL lock on the settle/window logic, not just "did it crash." Total tx is
+    # pinned at a fixed cap (270 KiB/s, the observed ceiling) throughout, regardless of player
+    # count -- the textbook GLOBAL signature: the same shared budget just gets redivided among
+    # however many peers are connected. rx (demand) is held perfectly flat across both
+    # transitions, so this is deliberately the "controlled, near-ceiling" case with nothing else
+    # that could produce the GLOBAL verdict except the windowing/settle machinery correctly
+    # picking out the right before/after samples around each transition. Two transitions --
+    # a join (3->4) and a mirroring leave (4->3), each 60s-cadence samples like the real 60s
+    # collector -- are required because the verdict logic itself needs both a join and a leave
+    # sample to call GLOBAL (see analyze()).  The exact timings below are chosen so that, given
+    # SETTLE_S/WINDOW_S/MIN_SAMPLES_PER_SIDE as currently defined, each side's window has exactly
+    # MIN_SAMPLES_PER_SIDE clean samples -- change any of those constants, the settle gap, or the
+    # window's inclusion/contamination logic, and this synthetic run stops landing on GLOBAL.
+    cap = 270 * 1024  # == CEILING_BPS
+    rx_rate = 5000
+    STEP = 60
+    # (t, p) pairs. p flips 3->4 at t=360 (join transition) and 4->3 at t=1080 (leave transition).
+    schedule = (
+        [(t, 3) for t in range(0, 360, STEP)]        # t = 0..300, p=3
+        + [(t, 4) for t in range(360, 1080, STEP)]    # t = 360..1020, p=4
+        + [(t, 3) for t in range(1080, 1440, STEP)]   # t = 1080..1380, p=3
+    )
     rows = []
-    t = 1000
     rx = 0
     tx = 0
-    cap = 200_000
-    for i in range(6):
-        p_count = 3 if i < 3 else 4
+    prev_t = None
+    for t, p_count in schedule:
+        if prev_t is not None:
+            dt = t - prev_t
+            rx += rx_rate * dt
+            tx += cap * dt  # pinned at the cap regardless of player count -> GLOBAL signature
         rows.append({"t": t, "p": p_count, "rx": rx, "tx": tx})
-        t += 60
-        rx += 5000 * 60
-        tx += cap * 60  # pinned at the cap regardless of player count -> GLOBAL signature
+        prev_t = t
     result = analyze(rows, out=open("nul" if sys.platform == "win32" else "/dev/null", "w"))
-    # With SETTLE/WINDOW sized for real data this tiny synthetic run won't produce usable
-    # windows (too few samples) -- so this checks the loader/diff path doesn't crash on a
-    # minimal, well-formed input rather than checking the verdict itself.
-    if result not in ("INCONCLUSIVE", "GLOBAL", "PER-PEER"):
-        print(f"SELFTEST FAIL: world A returned unexpected value {result!r}")
+    if result != "GLOBAL":
+        print(f"SELFTEST FAIL: world A expected verdict GLOBAL, got {result!r}")
         ok = False
 
     # World B: contamination guard. Two transitions 65s apart (p: 2 -> 3 -> 2) must not let the
@@ -322,7 +376,7 @@ def selftest():
         {"t": 185, "p": 2, "rx": 9000, "tx": 12000},
         {"t": 245, "p": 2, "rx": 12000, "tx": 15000},
     ]
-    rates = diffed_rates(rows2)
+    rates, _excluded = diffed_rates(rows2)
     trs = find_transitions(rows2)
     # transition at t=120 (2->3): its "after" window is (120+90, 120+90+240] = (210, 450].
     # The very next sample is at t=185 (p back to 2) which is BEFORE the settle boundary, so a
@@ -345,8 +399,8 @@ def main():
     if args.selftest:
         sys.exit(0 if selftest() else 1)
 
-    raw = load(args.path)
-    analyze(raw)
+    raw, load_stats = load(args.path)
+    analyze(raw, load_stats=load_stats)
 
 
 if __name__ == "__main__":
