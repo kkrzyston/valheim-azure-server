@@ -48,7 +48,7 @@ Inputs (all read-only, none modified):
 
   python3 valheim-egress-report.py                  full report over everything on disk
   python3 valheim-egress-report.py --days 7         only the last 7 days
-  python3 valheim-egress-report.py --selftest       seventeen synthetic worlds with known answers
+  python3 valheim-egress-report.py --selftest       eighteen synthetic worlds with known answers
 
 A NOTE ON WHAT THE BYTES ARE. nftables counters at the filter hooks count what the kernel sees at
 layer 3: IP header + UDP header + payload, 28 bytes per packet. They do NOT include the 14-byte
@@ -569,13 +569,15 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
     out(f"--- matched windows: raid vs non-raid, same player count AND same inbound rate "
         f"({args.raid_window:g}s after onset) ---")
     raids = [e["t"] for e in events if e.get("kind") == "raid"]
+
+    def in_raid(t):
+        return any(rt <= t < rt + args.raid_window for rt in raids)
+
     matched_ok, matched_tested = [], []
     if not raids:
         out("  no raid markers in events.jsonl for this window -- this test could not run.")
         blocked.append("the matched raid/non-raid comparison (no raids recorded)")
     else:
-        def in_raid(t):
-            return any(rt <= t < rt + args.raid_window for rt in raids)
         out(f"  {len(raids)} raid(s) in range")
         # MATCHED ON INBOUND, NOT ON EGRESS. Selecting the control set by egress would guarantee
         # the answer: it picks non-raid seconds that already have the same egress as the raid, so
@@ -668,6 +670,59 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
         else:
             caveats.append("R3 -- no lag report could be matched to egress samples")
 
+    # ---- receive queue: evidence about a DIFFERENT hypothesis ---------------------------------
+    # Deliberately outside the CONFIRMED/REFUTED ladder. This is not evidence for or against the
+    # send-budget hypothesis; it is evidence about the rival one the rest of this instrument
+    # cannot see at all. Valheim drains its UDP socket from the Unity main thread, so a main loop
+    # stalling on ZDO churn -- which is what happens when players cluster, which is when they say
+    # it lags -- stops calling recvfrom and the kernel's receive buffer fills. If that is what is
+    # happening, it matters far more than anything above, and folding it into the verdict would
+    # bury it.
+    out("")
+    out("--- receive queue: is the game's main loop keeping up? (reported, NOT part of the verdict) ---")
+    rq_all = [r for r in rows if isinstance(r.get("rq"), int) and not isinstance(r.get("rq"), bool)]
+    if not rq_all:
+        out("  no rq readings in this data (samples written before the probe recorded it).")
+    else:
+        rq_p = [r["rq"] for r in allp if isinstance(r.get("rq"), int)]
+        nz = [r for r in rq_all if r["rq"] > 0]
+        if rq_p:
+            out(f"  inside plateaus: peak {max(rq_p):,} B, p99 {pct(rq_p, 0.99):,.0f} B, "
+                f"non-zero in {sum(1 for v in rq_p if v > 0)/len(rq_p):.2%} of samples")
+        else:
+            out("  inside plateaus: no readings")
+        if raids:
+            rr = [r["rq"] for r in rq_all if in_raid(r["t"])]
+            qq = [r["rq"] for r in rq_all if not in_raid(r["t"])]
+            out(f"  raid windows:    peak {max(rr):,} B (p99 {pct(rr, 0.99):,.0f}) "
+                f"vs non-raid peak {max(qq):,} B (p99 {pct(qq, 0.99):,.0f})" if rr and qq
+                else "  raid windows:    not enough readings on both sides")
+        for e in reports:
+            near = [r["rq"] for r in rq_all if abs(r["t"] - e["t"]) <= args.report_window]
+            if near:
+                out(f"  around {datetime.fromtimestamp(e['t']):%Y-%m-%d %H:%M} "
+                    f"{e.get('name','?')}: peak {max(near):,} B")
+        if nz:
+            worst = max(nz, key=lambda r: r["rq"])
+            out("")
+            out(f"  ** THE RECEIVE QUEUE WAS NON-EMPTY in {len(nz):,} of {len(rq_all):,} samples, "
+                f"peak {worst['rq']:,} B at "
+                f"{datetime.fromtimestamp(worst['t']):%Y-%m-%d %H:%M:%S} (n={worst['n']}, egress "
+                f"{frac_of_ceiling(worst)*100:.0f}% of ceiling).")
+            out("  ** That is direct evidence the server was not reading its socket -- i.e. the main")
+            out("  ** loop stalled. It is about a different hypothesis than everything above, and if")
+            out("  ** it recurs it reframes the investigation: instrument tick duration, not egress.")
+        else:
+            out("  the receive queue never left zero in this data.")
+        # The asymmetry, stated as plainly as R5's, because a zero here is the reading most likely
+        # to be over-read.
+        out("")
+        out("  NOTE ON WHAT A ZERO MEANS: non-zero rq is strong evidence of a main-loop stall. rq")
+        out("  staying at zero is WEAK evidence against one. Steam's networking layer may drain the")
+        out("  socket on its own thread and buffer internally, in which case a stall never reaches")
+        out("  the kernel queue at all and this column would read zero throughout. Do not read a")
+        out("  flat zero here as the main loop being exonerated.")
+
     # ---- verdict -------------------------------------------------------------------------------
     # Each gate is conditional on ITS OWN evidence. A positive verdict may only be reached when
     # every test it would then assert in prose actually ran and actually passed.
@@ -716,8 +771,15 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
             f"(limit {args.r2_tol:.0%}), so it does scale with player count")
         out(f"  * raids at n={sorted(matched_ok)}, matched on inbound rate, do not move egress: "
             f"demand rose and supply did not")
+        implied = mean([v / (1 + args.hdr / pay) for v in per_player.values()])
+        out(f"  * the measured plateau implies a per-peer budget of about {implied:,.0f} B/s "
+            f"({implied/args.budget:.2f}x the {args.budget:,.0f} assumed)")
+        if not 0.9 <= implied / args.budget <= 1.1:
+            out(f"    -- note that is NOT the assumed constant. The SHAPE fits a per-peer budget; "
+                f"the SIZE does not match {args.budget:,.0f} B/s, so re-run with --budget "
+                f"{implied:,.0f} before quoting either number.")
         out("")
-        out(f"That is consistent with a per-peer send budget near {args.budget:,.0f} B/s -- but")
+        out(f"That is consistent with a per-peer send budget near {implied:,.0f} B/s -- but")
         out("'consistent with' is not 'established'. A single global cap divided by the player")
         out("count can fit the same numbers whenever the player counts sampled are few or close")
         out("together, and on the operator's 30-day data the observed maxima exceed n x 61440 by")
@@ -765,7 +827,7 @@ def synth(kind, args, seed=7, hours=7):
             d = demand * rnd.uniform(0.96, 1.04)
             want = ceil_ * d * 1.6          # at d>=0.63 the world wants more than the budget allows
             rxb = int(n * 900 * d)
-            sq, rtt = 0, round(rnd.uniform(11.0, 13.0), 1)
+            sq, rq, rtt = 0, 0, round(rnd.uniform(11.0, 13.0), 1)
             pay = payload
             if kind == "budget":
                 txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
@@ -795,6 +857,17 @@ def synth(kind, args, seed=7, hours=7):
                 txb = int(ceil_ * (0.95 if raid else 0.55) * rnd.uniform(0.997, 1.0))
             elif kind == "thin_raid" or kind == "artifact":
                 txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+            elif kind == "mainloop":
+                # The rival hypothesis made visible. Egress sits well BELOW the modelled ceiling
+                # and is perfectly flat, so every egress test above is satisfied -- and meanwhile
+                # the receive queue climbs through every raid, which is the server failing to read
+                # its own socket because the main thread is stalled. Nothing here fires a
+                # refutation, and that is the point: the verdict says one thing and the receive
+                # queue says the investigation is aimed at the wrong component.
+                txb = int(ceil_ * (0.55 if busy else 0.30) * rnd.uniform(0.997, 1.0))
+                # climbs only WITHIN the raid window, so the raid/non-raid contrast in the
+                # report is the one the world is meant to demonstrate
+                rq = int(20000 + s * 60) if (raid and s < args.raid_window) else 0
             elif kind == "overshoot":
                 # A GENUINE refutation: egress sits 30% above the modelled ceiling for minutes at
                 # a time. Sustained, so the artifact filter cannot touch it (it raises the very
@@ -823,7 +896,7 @@ def synth(kind, args, seed=7, hours=7):
             txp = max(1, round(txb / (pay + hdr)))
             rec = {"t": round(t, 1), "dt": 1.0, "txb": txb, "txp": txp, "rxb": rxb,
                    "rxp": max(1, round(rxb / (120 + hdr))), "sz": round(txb / txp, 1),
-                   "n": n, "na": 1, "np": n, "sq": sq}
+                   "n": n, "na": 1, "np": n, "sq": sq, "rq": rq}
             if s % 5 == 0:
                 rec["rtt"] = rtt
             rows.append(rec)
@@ -882,6 +955,9 @@ WORLDS = [
     # One impossible row must NOT overturn ten hours of clean data -- and must be reported, not
     # quietly swallowed. Both halves are asserted: the verdict, and the line that says so.
     ("artifact",      "CONFIRMED",    None, "discarded        1 sample(s) as physically implausible"),
+    # The rival hypothesis: every egress test passes, and the receive queue says look elsewhere.
+    # Asserts the signal is SURFACED, not that it changes the verdict -- it deliberately does not.
+    ("mainloop",      "CONFIRMED",    None, "THE RECEIVE QUEUE WAS NON-EMPTY"),
     ("single_n",      "INCONCLUSIVE", None, "one point has no slope"),
     ("empty",         "INCONCLUSIVE", None, None),
     ("noisy",         "INCONCLUSIVE", None, None),

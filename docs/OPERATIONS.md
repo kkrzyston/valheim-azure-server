@@ -231,6 +231,17 @@ half an hour of plateau of its own: R2 (does the plateau scale with n?) is the t
 a per-peer budget from a single server-wide cap, and one point has no slope no matter how many
 hours went into it.
 
+It also reports the game socket's **receive-queue depth** (`rq`), which is read for free from the
+same `/proc/net/udp` line as the send queue and is deliberately kept *outside* the
+CONFIRMED/REFUTED ladder, because it is evidence about a different hypothesis. Valheim drains its
+UDP socket from the Unity main thread, so a main loop stalling on ZDO churn — the thing that
+happens when players cluster, and the thing no other part of this instrument can see without
+BepInEx — stops calling `recvfrom` and the kernel's receive buffer fills. A rising `rq` during a
+clustered fight would reframe the whole investigation toward tick duration. The asymmetry is
+printed with the numbers and matters: non-zero `rq` is strong evidence of a stall, but `rq` at
+zero is **weak** evidence against one, since Steam's networking layer may drain the socket on its
+own thread and buffer internally.
+
 It also separates instrument error from measurement before computing anything. A sample above
 either the link capacity or ten times the 99.9th percentile for its player count is discarded as
 an artifact -- a 15 MB/s reading on a host whose observed maximum is 276 KB/s is not a refutation,

@@ -37,6 +37,13 @@ than written:
        has an n that is too low, which reads as a false ceiling breach, so it is dropped.
   sq   tx_queue on the game socket, from /proc/net/udp. If the kernel were applying the
        backpressure this would be non-zero.
+  rq   rx_queue on the same socket, from the adjacent column of the same line -- free. This one
+       is about a DIFFERENT hypothesis. Valheim's server drains its UDP socket from the Unity
+       main thread, so if the main loop stalls on ZDO churn (the thing that happens when players
+       cluster, and the thing this instrument otherwise cannot see at all) recvfrom is not called
+       and the kernel's receive buffer fills. A rising rq during a clustered fight is direct
+       evidence of a main-loop stall, with no mod required. The converse does NOT hold -- see the
+       report's own note.
   qtb  bytes on the Steam query port during dt -- counted separately precisely so that it is NOT
        in txb, since the modelled ceiling describes per-peer game traffic and nothing else.
   v6   present only when IPv6 game traffic was seen. The peer set is IPv4-only, so a v6 player
@@ -237,30 +244,36 @@ def repair_table():
 
 
 # ---------------------------------------------------------------- socket send queue
-_UDP_RE = re.compile(r"^\s*\d+:\s+[0-9A-Fa-f]+:([0-9A-Fa-f]{4})\s+\S+\s+\S+\s+([0-9A-Fa-f]+):")
+_UDP_RE = re.compile(r"^\s*\d+:\s+[0-9A-Fa-f]+:([0-9A-Fa-f]{4})\s+\S+\s+\S+\s+"
+                     r"([0-9A-Fa-f]+):([0-9A-Fa-f]+)")
 
 
 def parse_udp_queue(text, port):
-    """Sum of tx_queue across every UDP socket bound to `port`, from the /proc/net/udp table.
+    """(tx_queue, rx_queue) summed across every UDP socket bound to `port`, from /proc/net/udp.
     Columns: sl, local_address(hex ip:hex port), rem_address, st, tx_queue:rx_queue, ...
 
-    The control for "is the kernel the bottleneck?". Returns None when nothing is bound to the
-    port, so an unreadable measurement never masquerades as a measured zero."""
-    total, found = 0, False
+    Both halves of that one field, because they answer different questions for the same zero
+    cost: tx_queue is "is the kernel refusing to take more from the application?", rx_queue is
+    "is the application failing to take what the kernel already has?".
+
+    Returns None when nothing is bound to the port, so an unreadable measurement never
+    masquerades as a measured zero."""
+    tx, rx, found = 0, 0, False
     for line in text.splitlines():
         m = _UDP_RE.match(line)
         if not m or int(m.group(1), 16) != port:
             continue
         found = True
-        total += int(m.group(2), 16)
-    return total if found else None
+        tx += int(m.group(2), 16)
+        rx += int(m.group(3), 16)
+    return (tx, rx) if found else None
 
 
-def read_send_queue(port, paths=("/proc/net/udp", "/proc/net/udp6")):
-    """(value, reason). An I/O error and "the game is not listening" are different facts and get
-    different reasons -- reading them both as "no socket bound" would let a /proc mount problem
-    look like a dead game server."""
-    total, found, errs = 0, False, []
+def read_socket_queues(port, paths=("/proc/net/udp", "/proc/net/udp6")):
+    """((tx, rx), reason), or ((None, None), reason). An I/O error and "the game is not
+    listening" are different facts and get different reasons -- reading them both as "no socket
+    bound" would let a /proc mount problem look like a dead game server."""
+    tx, rx, found, errs = 0, 0, False, []
     for path in paths:
         try:
             with open(path) as f:
@@ -269,13 +282,14 @@ def read_send_queue(port, paths=("/proc/net/udp", "/proc/net/udp6")):
             errs.append(f"{path}: {e!r}")
             continue
         if v is not None:
-            total += v
+            tx += v[0]
+            rx += v[1]
             found = True
     if found:
-        return total, "ok"
+        return (tx, rx), "ok"
     if len(errs) == len(paths):
-        return None, "unreadable: " + "; ".join(errs)[:200]
-    return None, f"no UDP socket bound to port {port}"
+        return (None, None), "unreadable: " + "; ".join(errs)[:200]
+    return (None, None), f"no UDP socket bound to port {port}"
 
 
 # ---------------------------------------------------------------- A2S: round trip AND player count
@@ -376,7 +390,7 @@ def choose_n(a2s_n, a2s_age, status_n, status_age):
 
 
 # ---------------------------------------------------------------- the sample
-def build_record(t, dt, prev, cur, n, na, npeers, sq, rtt, query_tx=None, v6=None):
+def build_record(t, dt, prev, cur, n, na, npeers, sq, rtt, query_tx=None, v6=None, rq=None):
     """(record, None) or (None, reason).
 
     Every rejection here is a row NOT written, and that is the point: a hole is honest and the
@@ -401,6 +415,8 @@ def build_record(t, dt, prev, cur, n, na, npeers, sq, rtt, query_tx=None, v6=Non
         rec["np"] = npeers
     if sq is not None:
         rec["sq"] = sq
+    if rq is not None:
+        rec["rq"] = rq
     if query_tx:
         rec["qtb"] = query_tx
     if v6:
@@ -621,11 +637,11 @@ def run():
 
             eff_n, eff_age, _src = choose_n(a2s_n, (wall - a2s_at) if a2s_at else None,
                                             status_n, status_age)
-            sq, sq_why = read_send_queue(GAME_PORT)
+            (sq, rq), sq_why = read_socket_queues(GAME_PORT)
             if sq is None:
-                warn("sq", f"no socket send queue reading: {sq_why}")
+                warn("sq", f"no socket queue readings: {sq_why}")
             else:
-                recovered("sq", "the game socket's send queue is readable again")
+                recovered("sq", "the game socket's queues are readable again")
 
             if prev is None:
                 prev, prev_mono, prev_q, prev_v6 = cur, mono, q, v6   # baseline only
@@ -633,7 +649,7 @@ def run():
                 d_v6 = v6 - prev_v6
                 rec, why_drop = build_record(wall, mono - prev_mono, prev, cur, eff_n, eff_age,
                                              npeers, sq, rtt, query_tx=max(0, q - prev_q),
-                                             v6=max(0, d_v6))
+                                             v6=max(0, d_v6), rq=rq)
                 prev, prev_mono, prev_q, prev_v6 = cur, mono, q, v6
                 if d_v6 > 0:
                     warn("v6", f"{d_v6} bytes of IPv6 game traffic seen. The peer set is IPv4-only, "
@@ -718,23 +734,25 @@ def selftest(keep=False):
         check("a non-numeric counter is skipped, not crashed",
               parse_table({"nftables": [{"counter": {"name": "game_tx", "bytes": "lots", "packets": 1}}]})[0] == {})
 
-        print("socket send queue")
+        print("socket queues (send AND receive)")
         proc = (" sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
-                " 123: 00000000:0998 00000000:0000 07 0000002A:00000000 00:00000000 00000000 0 0 20114 2 0 0\n"
+                " 123: 00000000:0998 00000000:0000 07 0000002A:000001F4 00:00000000 00000000 0 0 20114 2 0 0\n"
                 " 124: 00000000:0999 00000000:0000 07 00000000:00000000 00:00000000 00000000 0 0 20115 2 0 0\n")
-        check("tx_queue for the game port", parse_udp_queue(proc, 0x0998) == 42, parse_udp_queue(proc, 0x0998))
-        check("a quiet port reads zero, not None", parse_udp_queue(proc, 0x0999) == 0)
+        check("tx_queue for the game port", parse_udp_queue(proc, 0x0998)[0] == 42, parse_udp_queue(proc, 0x0998))
+        check("rx_queue from the adjacent column", parse_udp_queue(proc, 0x0998)[1] == 500,
+              parse_udp_queue(proc, 0x0998))
+        check("a quiet port reads zero, not None", parse_udp_queue(proc, 0x0999) == (0, 0))
         check("an unbound port reads None", parse_udp_queue(proc, 9999) is None)
         good = os.path.join(d, "udp")
         with open(good, "w") as f:
             f.write(proc)
-        check("a readable table yields the value", read_send_queue(0x0998, (good,)) == (42, "ok"))
-        v, why = read_send_queue(0x0998, (os.path.join(d, "nope"),))
+        check("a readable table yields both queues", read_socket_queues(0x0998, (good,)) == ((42, 500), "ok"))
+        (tx_, rx_), why = read_socket_queues(0x0998, (os.path.join(d, "nope"),))
         check("an I/O failure says 'unreadable', not 'no socket bound'",
-              v is None and why.startswith("unreadable"), why)
-        v, why = read_send_queue(9999, (good,))
+              tx_ is None and rx_ is None and why.startswith("unreadable"), why)
+        (tx_, rx_), why = read_socket_queues(9999, (good,))
         check("a readable table with no match says 'no socket bound'",
-              v is None and "no UDP socket" in why, why)
+              tx_ is None and rx_ is None and "no UDP socket" in why, why)
 
         print("player-count gate")
         now = time.time()
@@ -778,13 +796,19 @@ def selftest(keep=False):
 
         print("records, and the rows refused")
         base, later = (1000, 10, 500, 5), (1061440, 52, 3000, 45)
-        r, _ = build_record(1770000000.04, 1.0, base, later, 3, 2, 3, 0, (12.5, "ok"), query_tx=900, v6=0)
+        r, _ = build_record(1770000000.04, 1.0, base, later, 3, 2, 3, 0, (12.5, "ok"), query_tx=900,
+                            v6=0, rq=4096)
         check("byte and packet deltas", r and (r["txb"], r["txp"], r["rxb"], r["rxp"]) == (1060440, 42, 2500, 40), r)
         check("mean packet size is recorded", r and r["sz"] == round(1060440 / 42, 1))
         check("dt is recorded, not assumed", r and r["dt"] == 1.0)
         check("player-count age and peer count are recorded", r and r["na"] == 2 and r["np"] == 3)
         check("query-port bytes are kept out of txb but still recorded", r and r["qtb"] == 900)
         check("rtt carried", r and r["rtt"] == 12.5)
+        check("receive-queue depth is recorded next to the send queue", r and r["rq"] == 4096, r)
+        check("a zero receive queue is recorded, not omitted",
+              build_record(1.0, 1.0, base, later, 3, 2, 3, 0, None, rq=0)[0]["rq"] == 0)
+        check("an unreadable receive queue is omitted, never written as zero",
+              "rq" not in build_record(1.0, 1.0, base, later, 3, 2, 3, 0, None, rq=None)[0])
         check("no v6 key when there is no v6 traffic", r and "v6" not in r)
         check("v6 traffic is recorded when present",
               build_record(1.0, 1.0, base, later, 3, 2, 3, 0, None, v6=500)[0]["v6"] == 500)
@@ -899,9 +923,9 @@ def main():
         ms, pc, st = a2s_probe(("127.0.0.1", QUERY_PORT))
         if st != "ok":
             print(f"note: A2S probe {st}")
-        sq, sq_why = read_send_queue(GAME_PORT)
+        (sq, rq), sq_why = read_socket_queues(GAME_PORT)
         if sq is None:
-            print(f"note: no send-queue reading -- {sq_why}")
+            print(f"note: no socket queue readings -- {sq_why}")
         eff_n, eff_age, src = choose_n(pc, 0.0 if pc is not None else None,
                                        players, (wall - generated) if generated else None)
         print(f"note: player count {eff_n} from {src}, {eff_age}s old" if eff_n is not None
@@ -912,7 +936,7 @@ def main():
             (second["game_tx"][0], second["game_tx"][1], second["game_rx"][0], second["game_rx"][1]),
             eff_n, eff_age, len(peers), sq, (ms, st),
             query_tx=second.get("query_tx", (0, 0))[0] - first.get("query_tx", (0, 0))[0],
-            v6=second.get("game_tx6", (0, 0))[0] - first.get("game_tx6", (0, 0))[0])
+            v6=second.get("game_tx6", (0, 0))[0] - first.get("game_tx6", (0, 0))[0], rq=rq)
         print(json.dumps(rec, separators=(",", ":")) if rec else f"sample refused: {drop}")
         return 0
     try:
