@@ -61,6 +61,52 @@ DB_PATH_DEFAULT = os.path.join(WIKI_ROOT, "wiki.db")
 # values rank better in SQLite; ORDER BY rank ASC puts the best match first.
 _BM25_WEIGHTS = (10.0, 5.0, 1.0)  # title, heading, text
 
+# ---------------------------------------------------------------- curated-source ranking boost
+# A hand-curated fact (source == "curated", from valheim-curated-numbers.jsonl, merged in by the
+# ingest) was cross-verified word-for-word identical on BOTH wikis before being included -- it is
+# the highest-confidence record in the index, and PLAN-v6 wants it to win a tie or near-tie
+# against the wiki text it was derived from. But "curated wins" must mean "wins among comparable
+# matches", never "wins regardless of relevance": a curated record that only weakly, incidentally
+# matches a query must not leapfrog a wiki record that is strongly on-topic for that same query.
+#
+# Mechanism: _rank_with_curated_boost() below re-sorts an already-bm25-ranked candidate pool.
+# rows arrive sorted ascending by raw bm25 (more negative == better match; see _BM25_WEIGHTS'
+# comment), so the first row's rank is already the best (most negative) raw score in the pool --
+# call it best_rank. A curated row is only boosted if its OWN raw rank is already within
+# _CURATED_COMPARABLE_RATIO of best_rank (i.e. it is genuinely "in contention" for the top spot,
+# not just present); a curated row that fails that comparability test is left at its natural,
+# unboosted position.
+#
+# Two mechanisms considered and rejected:
+#   - A FIXED rank offset (`rank - N`) moves a weak match (rank near 0) by exactly the same
+#     absolute amount as a strong one (rank far below 0). Any N large enough to matter for a
+#     genuinely weak curated hit is also large enough to vault it over a strongly-matching,
+#     unrelated wiki hit -- there is no single N that is "enough" for one case and "not too much"
+#     for the other, because the two cases need opposite answers to the same arithmetic.
+#   - A flat MULTIPLIER on every curated row's raw bm25 (`rank * B`) was measured against the
+#     real index (see the curated-boost selftest section) and found unsafe on its own: BM25 term-
+#     frequency saturation compresses the gap between a "barely matches" row and a "matches very
+#     strongly" row into less than a 2x difference in observed magnitude, so a multiplier large
+#     enough to reliably promote a comparably-strong curated row (~1.3x+) can also be large enough
+#     to invert a weak-vs-strong pair. A multiplier is only safe when it is gated behind a
+#     comparability check first -- which is exactly what the ratio test below does, using the
+#     multiplier only to break the tie once comparability is already established.
+# Combining a comparability GATE with a multiplier applied only after the gate passes gets both
+# properties at once: comparable matches reliably re-order (boost factor chosen, with margin,
+# above 1 / _CURATED_COMPARABLE_RATIO so a row right at the threshold still clears the current
+# best), and a non-comparable (weak) curated match is never touched, so it cannot invert a
+# genuinely stronger, unrelated wiki match. See cmd_selftest() for both directions locked with
+# real bm25 scores from a real (temporary) FTS5 index, not hand-typed numbers.
+_CURATED_SOURCE = "curated"
+_CURATED_COMPARABLE_RATIO = 0.8  # curated must already be >= 80% as strong as the current best
+_CURATED_BOOST_FACTOR = 1.5      # > 1 / 0.8 = 1.25, so a row right at the threshold still wins
+
+# _search_impl() fetches this many candidates (by raw bm25) before boosting and truncating to the
+# caller's k, so a comparably-strong curated row sitting just outside a naive top-k window still
+# gets a chance to be found and promoted, without scanning the whole corpus for a broad query.
+_CANDIDATE_POOL_MULTIPLIER = 5
+_CANDIDATE_POOL_MIN = 20
+
 # Anti-DoS caps on untrusted query text -- a Discord message body, of arbitrary length and
 # content, reaches _build_match_expression() on every question.
 _MAX_QUERY_CHARS = 2000
@@ -255,7 +301,11 @@ def search(query, k=3, max_chars=4000):
     """Return up to k section records, highest-ranked first, whose combined `text` fields
     total <= max_chars. Each record:
         {"title": str, "heading": str, "text": str,
-         "source": "weirdgloop" | "fandom", "revid": int, "url": str}
+         "source": "weirdgloop" | "fandom" | "curated", "revid": int, "url": str}
+    Ranking is bm25() with a source-aware boost for "curated" records that are comparably
+    strong matches -- see the module-level comment above _CURATED_SOURCE for the mechanism and
+    why a comparability gate, not a blind boost, is what keeps a weak curated match from
+    outranking a strong, unrelated wiki match.
     Returns [] when the index is missing, unreadable, or nothing matches. Never raises.
 
     "Missing" and "nothing matches" are both legitimate, silent [] outcomes -- but "unreadable"
@@ -276,6 +326,36 @@ def search(query, k=3, max_chars=4000):
         return []
 
 
+def _rank_with_curated_boost(rows):
+    """Re-order a bm25-ranked candidate pool so a comparably-strong "curated" row moves ahead of
+    the row(s) it is comparable to, without ever promoting a weakly-matching curated row past a
+    strongly-matching one. See the module-level comment above _CURATED_SOURCE for the mechanism
+    and why it takes this shape; see cmd_selftest() for both directions locked with real bm25
+    scores.
+
+    `rows` must already be sorted ascending by raw bm25 (each row's LAST element -- SQL's
+    `ORDER BY rank` already guarantees this), so rows[0]'s rank is the best (most negative) raw
+    score anywhere in the pool -- no extra query needed to find it. Returns a new list; never
+    raises and never changes which rows are present, only their order (sorted() is stable, so a
+    row that doesn't qualify for a boost keeps its original raw-bm25 relative position)."""
+    if not rows:
+        return rows
+    best_rank = rows[0][-1]
+
+    def sort_key(row):
+        rank = row[-1]
+        source = row[3]
+        if (
+            source == _CURATED_SOURCE
+            and best_rank < 0
+            and rank <= best_rank * _CURATED_COMPARABLE_RATIO
+        ):
+            return rank * _CURATED_BOOST_FACTOR
+        return rank
+
+    return sorted(rows, key=sort_key)
+
+
 def _search_impl(query, k, max_chars):
     if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
         k = 3
@@ -291,6 +371,10 @@ def _search_impl(query, k, max_chars):
         return []
 
     weight_title, weight_heading, weight_text = _BM25_WEIGHTS
+    # Fetch a modestly larger candidate pool than k (see _CANDIDATE_POOL_MULTIPLIER/_MIN's
+    # comment) so the curated boost below has room to promote a comparably-strong curated row
+    # that raw bm25 alone would have placed just outside the caller's requested k.
+    candidate_limit = max(k * _CANDIDATE_POOL_MULTIPLIER, _CANDIDATE_POOL_MIN)
     sql = (
         "SELECT title, heading, text, source, revid, url, "
         "bm25(sections, ?, ?, ?) AS rank "
@@ -299,8 +383,10 @@ def _search_impl(query, k, max_chars):
     )
     with _cache_lock:  # serialize access to the shared connection across caller threads
         rows = conn.execute(
-            sql, (weight_title, weight_heading, weight_text, match_expr, k)
+            sql, (weight_title, weight_heading, weight_text, match_expr, candidate_limit)
         ).fetchall()
+
+    rows = _rank_with_curated_boost(rows)[:k]
 
     results = []
     total = 0
@@ -731,6 +817,183 @@ def cmd_selftest():
           f"disagreement -- this is C3: it used to silently keep only ['fandom']: "
           f"{kept_sources!r}")
     all_ok = all_ok and dedupe_ok
+
+    print("\n--- _dedupe(): curated records pass through untouched, never collapsed ---")
+    # A previous agent reported "_dedupe() already passes non-fandom/weirdgloop sources through
+    # untouched" -- verified directly here rather than taken on trust, then pinned with an
+    # assertion so a future change to the by_source/others split can't silently start treating a
+    # third source as fandom/weirdgloop-shaped.
+    curated_passthrough_records = [
+        # Two curated records sharing a (title, heading) with EACH OTHER -- dedupe must not
+        # collapse them just because they share a key, the way it collapses a matching
+        # fandom/weirdgloop pair.
+        {"title": "Bonemass", "heading": "Curated: Boss Stats",
+         "text": "Bonemass: weak to Blunt and Frost.",
+         "source": "curated", "revid": 501, "url": "https://example.invalid/curated/bonemass-a"},
+        {"title": "Bonemass", "heading": "Curated: Boss Stats",
+         "text": "Bonemass: weak to Blunt and Frost (duplicate curated entry).",
+         "source": "curated", "revid": 502, "url": "https://example.invalid/curated/bonemass-b"},
+        # A curated record sharing a (title, heading) with a fandom/weirdgloop pair that WOULD
+        # otherwise collapse (identical text) -- the curated record must neither be swept into,
+        # nor block, that pair's own collapse-if-identical rule.
+        {"title": "Fenring", "heading": "Weaknesses",
+         "text": "Fenring is weak to fire.",
+         "source": "fandom", "revid": 601, "url": "https://example.invalid/fandom/fenring"},
+        {"title": "Fenring", "heading": "Weaknesses",
+         "text": "Fenring is weak to fire.",
+         "source": "weirdgloop", "revid": 602, "url": "https://example.invalid/weirdgloop/fenring"},
+        {"title": "Fenring", "heading": "Weaknesses",
+         "text": "Fenring (curated): weak to fire.",
+         "source": "curated", "revid": 603, "url": "https://example.invalid/curated/fenring"},
+    ]
+    curated_kept = _dedupe(curated_passthrough_records)
+    curated_kept_revids = sorted(r["revid"] for r in curated_kept)
+    # Expected: both duplicate curated Bonemass entries survive (501, 502); the identical
+    # fandom/weirdgloop Fenring pair collapses to the fandom copy per _dedupe()'s existing
+    # "identical enough -- keep the commercial-clean licence" rule (602 dropped, 601 kept); the
+    # curated Fenring entry survives untouched alongside that pair (603).
+    curated_passthrough_ok = curated_kept_revids == [501, 502, 601, 603]
+    print(f"{'PASS' if curated_passthrough_ok else 'FAIL'} curated records survive _dedupe() "
+          f"untouched -- never collapsed against each other or folded into the fandom/weirdgloop "
+          f"pairing logic, even sharing a (title, heading) key with either: kept revids="
+          f"{curated_kept_revids!r} (want [501, 502, 601, 603])")
+    all_ok = all_ok and curated_passthrough_ok
+
+    curated_sources_ok = all(
+        r["source"] == "curated" for r in curated_kept if r["revid"] in (501, 502, 603)
+    )
+    print(f"{'PASS' if curated_sources_ok else 'FAIL'} the surviving curated records keep "
+          f"source == 'curated' through _dedupe() (never relabelled): {curated_sources_ok}")
+    all_ok = all_ok and curated_sources_ok
+
+    print("\n--- _rank_with_curated_boost(): comparable curated wins, weak curated never inverts ---")
+    comparable_rows = [
+        ("Bonemass", "Weaknesses", "wiki text", "weirdgloop", 1, "url-a", -10.0),
+        ("Bonemass", "Curated: Boss Stats", "curated text", "curated", 2, "url-b", -9.5),
+    ]
+    boosted_comparable = _rank_with_curated_boost(comparable_rows)
+    comparable_ok = boosted_comparable[0][3] == "curated"
+    print(f"{'PASS' if comparable_ok else 'FAIL'} a curated row within "
+          f"_CURATED_COMPARABLE_RATIO of the best raw bm25 (-9.5 vs best -10.0, ratio 0.95) is "
+          f"promoted ahead of it: order={[r[3] for r in boosted_comparable]!r}")
+    all_ok = all_ok and comparable_ok
+
+    weak_vs_strong_rows = [
+        ("Boar", "Weaknesses", "wiki text", "fandom", 3, "url-c", -10.0),
+        ("Blueberries", "Curated: Food Stats", "curated text", "curated", 4, "url-d", -1.0),
+    ]
+    boosted_weak = _rank_with_curated_boost(weak_vs_strong_rows)
+    weak_ok = boosted_weak[0][3] == "fandom"
+    print(f"{'PASS' if weak_ok else 'FAIL'} a curated row far below the comparability ratio "
+          f"(-1.0 vs best -10.0, ratio 0.10) is NOT promoted past a strongly-matching, "
+          f"unrelated wiki row: order={[r[3] for r in boosted_weak]!r}")
+    all_ok = all_ok and weak_ok
+
+    print("\n--- curated boost + provenance, end-to-end through a REAL FTS5 index ---")
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-curated-") as tmp_dir:
+        records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+        curated_db = os.path.join(tmp_dir, "wiki.db")
+        e2e_records = [
+            {"title": "Bonemass", "heading": "Weaknesses",
+             "text": "Bonemass is weak to Blunt and Frost damage, and resistant to Slash damage.",
+             "source": "weirdgloop", "revid": 701,
+             "url": "https://example.invalid/weirdgloop/bonemass", "timestamp": ""},
+            {"title": "Bonemass", "heading": "Curated: Boss Stats",
+             "text": "Bonemass (3rd boss): weak to Blunt and Frost; resistant to Slash; "
+                     "immune to Poison.",
+             "source": "curated", "revid": 702,
+             "url": "https://example.invalid/curated/bonemass", "timestamp": "",
+             "provenance": {"wikis": ["fandom", "weirdgloop"],
+                            "marker": "PROVENANCE_SHOULD_NOT_LEAK"}},
+            {"title": "Boar", "heading": "Weaknesses",
+             "text": "Boar boar boar is a creature found in the Meadows. Boar boar meat boar "
+                     "boar boar tameable boar.",
+             "source": "fandom", "revid": 703,
+             "url": "https://example.invalid/fandom/boar", "timestamp": ""},
+            {"title": "Blueberries", "heading": "Curated: Food Stats",
+             "text": "Blueberries: 8 health, 25 stamina, 600s duration.",
+             "source": "curated", "revid": 704,
+             "url": "https://example.invalid/curated/blueberries", "timestamp": ""},
+        ]
+        with open(records_path, "w", encoding="utf-8") as fh:
+            for rec in e2e_records:
+                fh.write(json.dumps(rec) + "\n")
+
+        # The 'provenance' field is extra to the schema _load_records() checks for -- confirm it
+        # loads cleanly (not skipped as "missing a required field") and survives into memory for
+        # _dedupe(), before build_index() ever gets to (correctly) leave it out of the DB.
+        loaded_records, load_skipped = _load_records(records_path)
+        bonemass_curated_loaded = next(
+            (r for r in loaded_records if r.get("revid") == 702), None
+        )
+        provenance_load_ok = (
+            load_skipped == 0
+            and len(loaded_records) == 4
+            and bonemass_curated_loaded is not None
+            and "provenance" in bonemass_curated_loaded
+        )
+        print(f"{'PASS' if provenance_load_ok else 'FAIL'} a record carrying an extra "
+              f"'provenance' field loads cleanly (0 skipped) and keeps the field in memory: "
+              f"skipped={load_skipped}, loaded={len(loaded_records)}")
+        all_ok = all_ok and provenance_load_ok
+
+        build_index(records_path=records_path, db_path=curated_db)
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = curated_db
+            _reset_cache_for_tests()
+
+            comparable_result = search("bonemass weakness", k=2)
+            comparable_e2e_ok = (
+                len(comparable_result) == 2 and comparable_result[0]["source"] == "curated"
+            )
+            print(f"{'PASS' if comparable_e2e_ok else 'FAIL'} REAL index: the curated Bonemass "
+                  f"record outranks the comparably-matching weirdgloop record: "
+                  f"{[r['source'] for r in comparable_result]!r}")
+            all_ok = all_ok and comparable_e2e_ok
+
+            weak_vs_strong_result = search("boar stamina", k=2)
+            weak_e2e_ok = (
+                len(weak_vs_strong_result) == 2
+                and weak_vs_strong_result[0]["source"] == "fandom"
+            )
+            print(f"{'PASS' if weak_e2e_ok else 'FAIL'} REAL index: a curated record that only "
+                  f"weakly matches ('stamina') does NOT outrank a strongly-matching, unrelated "
+                  f"fandom record ('boar' repeated): "
+                  f"{[r['source'] for r in weak_vs_strong_result]!r}")
+            all_ok = all_ok and weak_e2e_ok
+
+            curated_only_result = search("blueberries", k=1)
+            roundtrip_ok = (
+                len(curated_only_result) == 1 and curated_only_result[0]["source"] == "curated"
+            )
+            print(f"{'PASS' if roundtrip_ok else 'FAIL'} source == 'curated' round-trips through "
+                  f"build_index()/search() unchanged: {curated_only_result!r}")
+            all_ok = all_ok and roundtrip_ok
+
+            bonemass_curated_served = next(
+                (r for r in comparable_result if r["source"] == "curated"), None
+            )
+            no_leak_ok = (
+                bonemass_curated_served is not None
+                and "provenance" not in bonemass_curated_served
+                and "PROVENANCE_SHOULD_NOT_LEAK" not in bonemass_curated_served["text"]
+            )
+            served_keys = (
+                sorted(bonemass_curated_served.keys())
+                if bonemass_curated_served is not None else None
+            )
+            served_text = (
+                bonemass_curated_served["text"] if bonemass_curated_served is not None else None
+            )
+            print(f"{'PASS' if no_leak_ok else 'FAIL'} the curated record's 'provenance' field "
+                  f"does not leak into the served record or its text: "
+                  f"keys={served_keys!r} text={served_text!r}")
+            all_ok = all_ok and no_leak_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
 
     print("\n--- search(): never raises -- missing db, empty query, no-match, FTS5 metachars ---")
     original_db_path = DB_PATH_DEFAULT
