@@ -222,10 +222,10 @@ _STOPWORDS = frozenset({
 #     this group still would never have matched the corpus's "resistant".
 #   - drops/drop/loot: "Drops" is the corpus's own section-heading and prose vocabulary (see
 #     _RELATION_KEYWORDS' "drop"/"drops" canonicalization used elsewhere in this module for the
-#     same convention); "loot" is the common player-side word the corpus does not use.
-#   - spawn/spawns/found/location: creature pages describe where something appears as "found in
-#     the X biome" (see _sections_materially_differ()'s own worked example), never "spawns in" --
-#     "spawn" is what a player asks, "found"/"location" is the corpus's actual word.
+#     same convention); "loot" is the common player-side word the corpus does not use. Verified
+#     safe under title-priority too: "what drops from a Troll" already worked correctly on the
+#     live index before OR after that fix, because "troll" -- an original term -- is a title match
+#     no generic page can outrank.
 #   - craft/crafted/crafting/recipe: every curated crafting record says "crafted ... at a Forge"
 #     (verb), never the noun "recipe" a player is at least as likely to ask for.
 #   - tame/tameable: the curated Boar record literally says "(Meadows, tameable)" -- the one-word
@@ -237,6 +237,23 @@ _STOPWORDS = frozenset({
 # level" verbatim, matching the most natural way to ask about it). Neither has an observed
 # corpus-vocabulary gap, and adding a synonym with nothing real to bridge only spends
 # _MAX_SYNONYM_EXPANSIONS' budget for no benefit.
+#
+# DROPPED after live evidence, not kept out of sunk cost: spawn/spawns/found/location. This one
+# shipped in the previous round and broke "where do Greydwarfs spawn" on the live index (returned
+# a nonsense, unrelated page). Title-priority (below) does NOT rescue it, and the reason is a
+# SEPARATE, unrelated tokenization gap this synonym group cannot fix: FTS5's default tokenizer
+# does not stem, so the plural "greydwarfs" a player typed never matches the corpus's singular
+# title "Greydwarf" -- there is no original-term title hit for title-priority to find in the first
+# place, for either side of that mismatch. With no title anchor available, "spawn" expanding to
+# "found"/"location" just hands a bare, extremely generic pair of words to bm25, and whichever
+# unrelated page happens to be dense in "found"/"location" prose (a real one on the live index; a
+# constructed "Forge of Potential" analog in this module's own selftest) wins by sheer text
+# volume. Confirmed directly (see cmd_selftest()): with the group removed, that same query returns
+# [] -- an honest "no game knowledge for this phrasing" -- instead of a confidently wrong page.
+# Per this module's own standing design principle (a wrong answer stated confidently is worse than
+# an honest empty one -- see _sections_materially_differ()'s docstring), [] is the better outcome,
+# and the plural/singular gap itself is future work for a real fix (e.g. a light singularization
+# step, or an ALIASES-style plural table), not something this synonym mechanism should paper over.
 _SYNONYM_GROUPS = (
     frozenset({"health", "hp", "hitpoints"}),
     frozenset({"damage", "dmg"}),
@@ -244,7 +261,6 @@ _SYNONYM_GROUPS = (
     frozenset({"weak", "weakness"}),
     frozenset({"resistance", "resist", "resistant"}),
     frozenset({"drops", "drop", "loot"}),
-    frozenset({"spawn", "spawns", "found", "location"}),
     frozenset({"craft", "crafted", "crafting", "recipe"}),
     frozenset({"tame", "tameable"}),
 )
@@ -290,15 +306,24 @@ def _strip_stopwords(terms):
     return filtered if filtered else terms
 
 
-def _build_match_expression(query):
-    """Turn arbitrary, untrusted query text into a safe FTS5 MATCH expression, or None if
-    there is nothing searchable in it. Never raises -- any input that isn't a usable string
-    (None, bytes, an int, ...) is treated as empty rather than erroring.
+def _original_terms(query):
+    """Return the ORIGINAL terms for `query`: what the user actually typed, or the canonical form
+    of a known nickname they typed (ALIASES -- e.g. "fenrir" resolving to "Fenring" counts as
+    original, since that mapping exists specifically to let a nickname find its real entity by
+    name), lowercased and with _STOPWORDS filtered out (falling back to the unfiltered set if
+    every term were a stopword, exactly like _strip_stopwords() everywhere else in this module).
+    Deliberately does NOT include anything from _expand_synonyms() -- those terms are invented on
+    the querier's behalf, not typed or aliased, which is exactly the distinction
+    _rank_by_title_priority() exists to act on. See its module-level comment for why that
+    distinction matters and what incident it responds to.
 
-    See the module docstring's anti-injection note for the two-layer defense this implements.
-    """
+    This is the first half of _build_match_expression()'s own pipeline (tokenize, then alias-
+    expand, then stopword-strip) factored out so _search_impl() can get the SAME terms
+    _build_match_expression() used, without a second, drifting copy of that logic. Never raises;
+    returns [] for unusable input, mirroring _build_match_expression()'s own None contract at the
+    point where its caller must stop."""
     if not isinstance(query, str):
-        return None
+        return []
 
     query = query[:_MAX_QUERY_CHARS]
     lowered = query.lower()
@@ -312,20 +337,29 @@ def _build_match_expression(query):
             terms.extend(t.lower() for t in _TOKEN_RE.findall(canonical))
 
     if not terms:
+        return []
+
+    return _strip_stopwords(terms)
+
+
+def _build_match_expression(query):
+    """Turn arbitrary, untrusted query text into a safe FTS5 MATCH expression, or None if
+    there is nothing searchable in it. Never raises -- any input that isn't a usable string
+    (None, bytes, an int, ...) is treated as empty rather than erroring.
+
+    See the module docstring's anti-injection note for the two-layer defense this implements.
+    """
+    original_terms = _original_terms(query)
+    if not original_terms:
         return None
 
-    # Synonym expansion AFTER alias expansion (so e.g. an ALIASES-added "resistance" from "frost
-    # resistance" also pulls in "resistant" -- see _SYNONYM_GROUPS' comment) and BEFORE stopword
-    # stripping (moot either way today: every synonym is a content word, never a _STOPWORDS
-    # member, so the two passes cannot interact).
-    terms = _expand_synonyms(terms)
-
-    # Strip English filler AFTER alias/synonym expansion (so their added terms are also subject
-    # to it -- moot today since none of them tokenize to a stopword, but harmless either way) and
-    # BEFORE truncating to _MAX_TERMS, so the budget of terms that actually reach FTS5 is spent on
-    # entity words first, not used up on "does"/"have"/"a". _strip_stopwords() guarantees this can
-    # never turn a non-empty `terms` into an empty one.
-    terms = _strip_stopwords(terms)
+    # Synonym expansion AFTER original terms are settled (so e.g. an ALIASES-added "resistance"
+    # from "frost resistance" also pulls in "resistant" -- see _SYNONYM_GROUPS' comment), then
+    # stopword-stripped again -- moot today since every synonym is a content word, never a
+    # _STOPWORDS member, but harmless either way -- and BEFORE truncating to _MAX_TERMS, so the
+    # budget of terms that actually reach FTS5 is spent on entity words first, not used up on
+    # "does"/"have"/"a". _strip_stopwords() guarantees this can never turn a non-empty list empty.
+    terms = _strip_stopwords(_expand_synonyms(original_terms))
 
     quoted = []
     for t in terms[:_MAX_TERMS]:
@@ -510,6 +544,46 @@ def _rank_with_curated_boost(rows):
     return sorted(rows, key=sort_key)
 
 
+# ---------------------------------------------------------------- title-priority re-rank
+# Second live-index incident, found by redeploying the synonym fix above: expanding "weak" into
+# "weakness" (and, separately, "spawn" into "found"/"location") let a GENERIC page that is *about*
+# the expanded concept -- a "Resistance" page dense with weak/weakness/resistant prose explaining
+# the mechanic in general -- accumulate a raw bm25 score strong enough to displace the SPECIFIC
+# entity the user actually asked about ("what is Fenring weak to" returning the Resistance page
+# instead of Fenring; "Bonemass weakness" returning Resistance instead of curated Bonemass). BM25
+# and _rank_with_curated_boost above are both working exactly as designed on the terms they are
+# given -- the problem is which terms those are: a word this module INVENTED via _expand_synonyms
+# is not the same quality of evidence as a word the user actually typed (or aliased, via a known
+# nickname -- see _original_terms()'s own comment for why an ALIASES-derived term still counts as
+# "typed").
+#
+# The fix: a document whose TITLE contains an original term is trusted over one that doesn't,
+# full stop -- not as a tiebreaker nudge but as a dominant sort key, ahead of raw bm25 magnitude
+# entirely. "Fenring" is a title AND a term the user typed; "Resistance" matches nothing the user
+# typed, no matter how much of the expanded vocabulary its own prose happens to be dense with.
+def _rank_by_title_priority(rows, original_terms):
+    """Re-order an already curated-boost-ranked candidate pool so every row whose TITLE contains
+    at least one term from `original_terms` outranks every row that doesn't -- regardless of
+    either row's bm25 magnitude. See the module comment above for the incident this responds to.
+
+    A stable sort: within "has a title hit" and "doesn't", rows keep exactly the relative order
+    _rank_with_curated_boost() already gave them, so the curated-boost comparability gate and its
+    own tests are entirely unaffected by this pass -- this only moves a boundary between two
+    groups, it never re-derives an order within either one. Never raises; returns a new list,
+    never drops, adds, or duplicates a row. A row/title that is empty or unparseable simply never
+    qualifies for the priority tier -- it is not an error, just no evidence in its favor."""
+    if not rows or not original_terms:
+        return rows
+    original_set = set(original_terms)
+
+    def has_title_hit(row):
+        title = row[0] or ""
+        title_tokens = {t.lower() for t in _TOKEN_RE.findall(title)}
+        return bool(title_tokens & original_set)
+
+    return sorted(rows, key=lambda row: 0 if has_title_hit(row) else 1)
+
+
 def _search_impl(query, k, max_chars):
     if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
         k = 3
@@ -519,6 +593,11 @@ def _search_impl(query, k, max_chars):
     match_expr = _build_match_expression(query)
     if match_expr is None:
         return []
+    # Recomputed rather than threaded through _build_match_expression()'s return value, so that
+    # function's public contract (a MATCH-expression string or None) stays exactly what every
+    # existing direct caller/test already expects -- see _original_terms()'s own docstring for why
+    # this is cheap, pure re-tokenization rather than a second, drifting implementation.
+    original_terms = _original_terms(query)
 
     conn = _get_connection(DB_PATH_DEFAULT)
     if conn is None:
@@ -540,7 +619,8 @@ def _search_impl(query, k, max_chars):
             sql, (weight_title, weight_heading, weight_text, match_expr, candidate_limit)
         ).fetchall()
 
-    rows = _rank_with_curated_boost(rows)[:k]
+    rows = _rank_with_curated_boost(rows)
+    rows = _rank_by_title_priority(rows, original_terms)[:k]
 
     results = []
     total = 0
@@ -1215,7 +1295,7 @@ def cmd_selftest():
           f"{_expand_synonyms(['boar', 'health'])!r}")
     all_ok = all_ok and or_not_and_ok
 
-    cap_probe_terms = ["health", "damage", "armor", "weak", "resistance", "drops", "spawn",
+    cap_probe_terms = ["health", "damage", "armor", "weak", "resistance", "drops",
                        "craft", "tame"]
     cap_probe_expanded = _expand_synonyms(cap_probe_terms)
     cap_added = len(cap_probe_expanded) - len(cap_probe_terms)
@@ -1224,13 +1304,13 @@ def cmd_selftest():
     # it would pass no matter how large that constant were sabotaged to. Pinned instead against a
     # literal 6 (today's actual designed cap) and against the true uncapped total, computed
     # independently straight from _SYNONYM_GROUPS' real membership (one probe term per group,
-    # touching all nine groups defined above): 2+1+1+1+2+2+3+3+1 = 16 possible new terms with no
+    # touching all eight groups defined above): 2+1+1+1+2+2+3+1 = 13 possible new terms with no
     # cap at all, so a correctly-capped result must land strictly below that.
     uncapped_total = sum(
         len(group - set(cap_probe_terms)) for group in _SYNONYM_GROUPS
         if set(cap_probe_terms) & group
     )
-    cap_ok = cap_added == 6 and uncapped_total == 16 and cap_added < uncapped_total
+    cap_ok = cap_added == 6 and uncapped_total == 13 and cap_added < uncapped_total
     print(f"{'PASS' if cap_ok else 'FAIL'} a query touching every synonym group at once gains "
           f"exactly the pinned cap of 6 new terms, strictly fewer than the {uncapped_total} an "
           f"uncapped expansion would add (one probe term per group): added={cap_added} "
@@ -1243,6 +1323,40 @@ def cmd_selftest():
           f"terms untouched (no group contains a non-English word): "
           f"{old_norse_synonym_untouched!r} (want unchanged {old_norse_terms!r})")
     all_ok = all_ok and old_norse_synonym_ok
+
+    print("\n--- _rank_by_title_priority(): an original term beats an invented one ---")
+    # Second live incident: expanding "weak" into "weakness" let a generic "Resistance" page --
+    # dense with weak/weakness/resistant prose but matching NOTHING the user actually typed --
+    # outscore "Fenring" (a title AND a term straight from the query) on raw bm25 alone. See
+    # _rank_by_title_priority()'s own module comment for the full mechanism.
+    fenring_row = ("Fenring", "Weaknesses", "text", "fandom", 1, "url", -3.0)
+    resistance_row = ("Resistance", "Overview", "text", "fandom", 2, "url", -9.0)
+    # Resistance's raw bm25 (-9.0) is far stronger than Fenring's (-3.0) -- exactly the shape of
+    # the live incident -- yet title-priority must still put the original-term title match first.
+    title_priority_result = _rank_by_title_priority([resistance_row, fenring_row], ["fenring", "weak"])
+    title_priority_ok = title_priority_result[0][0] == "Fenring"
+    print(f"{'PASS' if title_priority_ok else 'FAIL'} a document whose TITLE contains an "
+          f"original query term ('Fenring') outranks a document with a far stronger raw bm25 "
+          f"that only matches invented/expanded terms: "
+          f"{[r[0] for r in title_priority_result]!r}")
+    all_ok = all_ok and title_priority_ok
+
+    no_original_hit_rows = [resistance_row, ("Nothing Relevant", "X", "text", "fandom", 3, "url", -1.0)]
+    unaffected_result = _rank_by_title_priority(no_original_hit_rows, ["fenring", "weak"])
+    unaffected_ok = [r[0] for r in unaffected_result] == [r[0] for r in no_original_hit_rows]
+    print(f"{'PASS' if unaffected_ok else 'FAIL'} when NO row's title contains an original term, "
+          f"the pre-existing (curated-boost-adjusted) order is left completely alone -- this "
+          f"pass only ever moves a title-hit row up, never reshuffles ties among non-hits: "
+          f"{[r[0] for r in unaffected_result]!r}")
+    all_ok = all_ok and unaffected_ok
+
+    original_terms_fenring = _original_terms("what is Fenring weak to")
+    original_terms_ok = original_terms_fenring == ["fenring", "weak"]
+    print(f"{'PASS' if original_terms_ok else 'FAIL'} _original_terms() excludes _expand_synonyms' "
+          f"inventions ('weakness') while _build_match_expression's own MATCH terms still include "
+          f"them for recall: original={original_terms_fenring!r}, "
+          f"match={_build_match_expression('what is Fenring weak to')!r}")
+    all_ok = all_ok and original_terms_ok
 
     print("\n--- _STOPWORDS checked against the actual corpus -- never swallows a real entity ---")
     # This codifies the manual check performed before choosing _STOPWORDS (see its module-level
@@ -1409,6 +1523,14 @@ def cmd_selftest():
                   f"first: {star_level_result!r}")
             all_ok = all_ok and star_level_ok
 
+            hitpoints_bare_result = top_source_title("Boar hitpoints")
+            hitpoints_bare_ok = hitpoints_bare_result == ("curated", "Boar")
+            print(f"{'PASS' if hitpoints_bare_ok else 'FAIL'} REAL index: 'Boar hitpoints' -- "
+                  f"the exact phrasing confirmed FIXED on the live index by the synonym "
+                  f"expansion -- still returns curated Boar first here too: "
+                  f"{hitpoints_bare_result!r}")
+            all_ok = all_ok and hitpoints_bare_ok
+
             # NOTE on the bare query 'Boar': tokenizes to ["boar"] alone -- no _STOPWORDS member
             # and no _SYNONYM_GROUPS member, so neither fix can change _build_match_expression's
             # output for it (confirmed: sabotaging either _strip_stopwords or _expand_synonyms
@@ -1432,6 +1554,150 @@ def cmd_selftest():
                   f"matches nothing and neither fix touches non-English tokens) still returns "
                   f"curated Boar first: {old_norse_result!r}")
             all_ok = all_ok and old_norse_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
+
+    print("\n--- title-priority fix, end-to-end through a REAL FTS5 index with realistic decoys ---")
+    # Reproduces the SECOND live-deployment incident, found by redeploying the synonym fix above:
+    # "what is Fenring weak to" and "Bonemass weakness" both regressed to a generic "Resistance"
+    # page once "weak" started expanding to "weakness" -- the Resistance page's prose is dense
+    # with the whole weak/weakness/resistant vocabulary (it is, after all, ABOUT that mechanic),
+    # so it out-scored the specific entity page/record on raw bm25 alone. "Fenring", "Resistance",
+    # "Bonemass" (curated AND weirdgloop, so the curated-boost comparability gate is exercised
+    # here too), "Troll", "Greydwarf", and a "Forge of Potential" decoy analogous to the live
+    # index's actual wrong result are all present as real competition -- plus "Trophies" and
+    # "Black Forest" pages that incidentally mention several of these creatures' names, without
+    # which "Fenring"/"Bonemass" would be so rare in this tiny fixture that they beat "Resistance"
+    # on raw bm25 alone even withOUT the fix, proving nothing (the real, ~5,911-section index does
+    # not have this artifact -- creature names are incidentally mentioned all over it already).
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-titlepriority-") as tmp_dir:
+        records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+        priority_db = os.path.join(tmp_dir, "wiki.db")
+        priority_records = [
+            {"title": "Fenring", "heading": "Weaknesses",
+             "text": "Fenring is weak to fire and pierce damage. It is resistant to blunt "
+                     "attacks.",
+             "source": "fandom", "revid": 2001,
+             "url": "https://example.invalid/fandom/fenring", "timestamp": ""},
+            {"title": "Bonemass", "heading": "Curated: Boss Stats",
+             "text": "Bonemass (3rd boss, altar in the Swamp): 5000 HP. Weak to Blunt and "
+                     "Frost; resistant to Slash; very resistant to Fire and Pierce; immune to "
+                     "Poison and Stagger.",
+             "source": "curated", "revid": 2002,
+             "url": "https://example.invalid/curated/bonemass", "timestamp": ""},
+            {"title": "Bonemass", "heading": "Weaknesses",
+             "text": "Bonemass is weak to Blunt and Frost damage, and resistant to Slash "
+                     "damage.",
+             "source": "weirdgloop", "revid": 2004,
+             "url": "https://example.invalid/weirdgloop/bonemass", "timestamp": ""},
+            # Generic mechanics page: dense with weak/weakness/resistant/resistance/immune, but
+            # matches NONE of "fenring"/"bonemass" -- the real decoy that displaced both live.
+            {"title": "Resistance", "heading": "Overview",
+             "text": "Resistance and weakness are core combat mechanics. A creature that is "
+                     "weak to a damage type takes extra damage from it, while a creature that "
+                     "is resistant takes less. Every creature has a resistance and a weakness "
+                     "profile: some are weak to Fire, some are resistant to Frost, some are "
+                     "weak to Poison, some are resistant to Blunt, and so on. Understanding "
+                     "weakness and resistance is key to combat. A creature immune to a damage "
+                     "type takes no damage at all, the strongest form of resistance.",
+             "source": "fandom", "revid": 2003,
+             "url": "https://example.invalid/fandom/resistance", "timestamp": ""},
+            {"title": "Troll", "heading": "Drops",
+             "text": "Troll drops Troll Hide and Coins. A 2-star Troll has a higher drop "
+                     "chance.",
+             "source": "fandom", "revid": 3001,
+             "url": "https://example.invalid/fandom/troll", "timestamp": ""},
+            {"title": "Greydwarf", "heading": "Overview",
+             "text": "The Greydwarf is a creature found in the Black Forest biome, near "
+                     "Greydwarf nests.",
+             "source": "fandom", "revid": 4001,
+             "url": "https://example.invalid/fandom/greydwarf", "timestamp": ""},
+            # Generic "found"/"location"-dense decoy, analogous to the live index's actual wrong
+            # result for the Greydwarf query -- present so dropping the spawn/found/location
+            # group (see _SYNONYM_GROUPS' comment) is proven by an honest [] below, not assumed.
+            {"title": "Forge of Potential", "heading": "Location",
+             "text": "The Forge of Potential is found in the Mistlands, its exact location "
+                     "marked on the map.",
+             "source": "fandom", "revid": 4002,
+             "url": "https://example.invalid/fandom/forge-of-potential", "timestamp": ""},
+            {"title": "Hive", "heading": "Overview",
+             "text": "The Hive is a Mistlands structure inhabited by Seekers.",
+             "source": "fandom", "revid": 5001,
+             "url": "https://example.invalid/fandom/hive", "timestamp": ""},
+            # Incidental mentions of the entity names above, so their title-field IDF isn't
+            # artificially inflated by being rare-to-the-point-of-uniqueness in this tiny
+            # fixture -- exactly the "fixture too small to reproduce the real competition"
+            # failure mode this session's own instructions warn about.
+            {"title": "Trophies", "heading": "Overview",
+             "text": "Boss and creature trophies can be hung on trophy poles: Fenring Trophy, "
+                     "Bonemass Trophy, Troll Trophy, Greydwarf Trophy, Eikthyr Trophy, Elder "
+                     "Trophy, Moder Trophy, Yagluth Trophy.",
+             "source": "fandom", "revid": 6001,
+             "url": "https://example.invalid/fandom/trophies", "timestamp": ""},
+            {"title": "Black Forest", "heading": "Creatures",
+             "text": "Creatures found in the Black Forest biome include Greydwarf, Greyling, "
+                     "Troll, Fenring, Skeleton, and Rancid Remains.",
+             "source": "fandom", "revid": 6002,
+             "url": "https://example.invalid/fandom/black-forest", "timestamp": ""},
+        ]
+        with open(records_path, "w", encoding="utf-8") as fh:
+            for rec in priority_records:
+                fh.write(json.dumps(rec) + "\n")
+        build_index(records_path=records_path, db_path=priority_db)
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = priority_db
+            _reset_cache_for_tests()
+
+            def top_source_title2(query):
+                r = search(query, k=1)
+                return (r[0]["source"], r[0]["title"]) if r else None
+
+            fallback_result = top_source_title2("what is it")
+            fallback_ok = fallback_result is not None
+            print(f"{'PASS' if fallback_ok else 'FAIL'} REAL index: 'what is it' (all-stopword "
+                  f"fallback) still returns SOME result rather than an empty/error against a "
+                  f"healthy, non-empty index: {fallback_result!r}")
+            all_ok = all_ok and fallback_ok
+
+            troll_result = top_source_title2("what drops from a Troll")
+            troll_ok = troll_result == ("fandom", "Troll")
+            print(f"{'PASS' if troll_ok else 'FAIL'} REAL index: 'what drops from a Troll' "
+                  f"(already correct before this fix, and confirmed still correct on the live "
+                  f"index after it) still returns the Troll page first: {troll_result!r}")
+            all_ok = all_ok and troll_ok
+
+            fenring_result = top_source_title2("what is Fenring weak to")
+            fenring_ok = fenring_result == ("fandom", "Fenring")
+            print(f"{'PASS' if fenring_ok else 'FAIL'} REAL index: 'what is Fenring weak to' -- "
+                  f"REGRESSED on the live index to the generic Resistance page -- now returns "
+                  f"the Fenring page first again: {fenring_result!r}")
+            all_ok = all_ok and fenring_ok
+
+            bonemass_result = top_source_title2("Bonemass weakness")
+            bonemass_ok = bonemass_result is not None and bonemass_result[1] == "Bonemass"
+            print(f"{'PASS' if bonemass_ok else 'FAIL'} REAL index: 'Bonemass weakness' -- also "
+                  f"wrongly returned Resistance on the live index -- now returns a Bonemass "
+                  f"record first (curated or weirdgloop, not the generic Resistance page): "
+                  f"{bonemass_result!r}")
+            all_ok = all_ok and bonemass_ok
+
+            # 'where do Greydwarfs spawn': the plural "greydwarfs" a player typed never matches
+            # the corpus's singular title "Greydwarf" (FTS5 does not stem) -- an unrelated gap
+            # title-priority cannot fix, because there is no original-term title hit on EITHER
+            # side for it to find. With the spawn/found/location group dropped (see
+            # _SYNONYM_GROUPS' comment), this now honestly returns [] instead of the live index's
+            # actual wrong answer, an unrelated "Forge of Potential"-style page.
+            greydwarf_result = search("where do Greydwarfs spawn", k=1)
+            greydwarf_ok = greydwarf_result == []
+            print(f"{'PASS' if greydwarf_ok else 'FAIL'} REAL index: 'where do Greydwarfs "
+                  f"spawn' -- NONSENSE on the live index ('Forge of Potential') -- now returns "
+                  f"an honest [] rather than a confidently wrong page (see _SYNONYM_GROUPS' "
+                  f"comment on why spawn/found/location was dropped, not patched): "
+                  f"{greydwarf_result!r}")
+            all_ok = all_ok and greydwarf_ok
         finally:
             DB_PATH_DEFAULT = original_db_path
             _reset_cache_for_tests()
