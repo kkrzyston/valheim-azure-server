@@ -157,7 +157,8 @@ meaningful extra cloud charge.
 |---|---|
 | Collector health | `systemctl status valheim-status.timer valheim-status.service` |
 | Run collector by hand | `sudo systemctl start valheim-status.service` |
-| Egress probe health | `systemctl status valheim-egress`; `sudo valheim-meter-nft.sh show` — the counters climb while players are online and stand still when nobody is |
+| Egress probe health | `systemctl status valheim-egress`; `sudo valheim-meter-nft.sh show` — the counters climb while players are online and stand still when nobody is. The probe logs a heartbeat hourly, so if the journal is silent it is not running |
+| Rebuild the meter table | `sudo valheim-meter-nft.sh ensure` (creates it only if missing or incomplete; `install` forces a rebuild and resets the counters) |
 | One live egress sample | `sudo valheim-egress-probe.py --once` |
 | Read the egress data | `sudo valheim-egress-report.py` (or `--days 7`) |
 | Web server health | `systemctl status caddy`; `sudo journalctl -u caddy -n 50` |
@@ -195,9 +196,17 @@ what happens to a packet; the worst a bug there can do is produce a wrong number
 `peers` set replaced the once-a-minute `tcpdump` the collector used to run on the game's own
 receive path, which is why `nftables` is now an installed package and `tcpdump` is not.
 
-It writes `/var/lib/valheim-status/egress-YYYY-MM-DD.jsonl` — per second: bytes and packets both
-ways, **mean packet size**, player count, the game socket's `tx_queue`, and an A2S round trip
-every fifth sample. Whole days are unlinked after seven. It only runs while players are online
+It writes `/var/lib/valheim-status/egress-YYYY-MM-DD.jsonl` — per interval: bytes and packets
+both ways, **mean packet size**, player count, the game socket's `tx_queue`, and an A2S round trip
+every fifth sample. Two of those fields are about the probe rather than the server, and both earn
+their place: `dt` is the interval the row **actually** spans (a stalled loop would otherwise record
+a 60-second gap as one second reading 15 MB/s — a single such row is enough to print a false
+REFUTED), and `na`/`np` say how old the player count was and how many addresses were really
+sending, because `status.json` can be a minute behind and a join it has not noticed makes a
+saturated server look like it broke its own ceiling. Rows that fail either check are dropped
+rather than written: a hole is honest, a fabricated rate is indistinguishable from a real one.
+Whole days are unlinked after `EGRESS_RETAIN_DAYS` (35 by default — retention shorter than the
+experiment destroys its early weeks). It only runs while players are online
 (gated on the collector's `status.json`, so deciding whether to measure costs nothing), buffers in
 memory and writes once every 15 s, and runs at `Nice=10`/`IOWeight=50` so the game always wins.
 
@@ -208,8 +217,18 @@ collector rewrites that file wholesale every minute — so `!lag` drops a file i
 `/var/lib/valheim-status/lagreports` (mode 1730, same one-writer pattern as the restart spool)
 and the collector drains it on its next run.
 
+`!lag` needs one thing to work that is easy to break: `valheim-bot.service` must list
+`/var/lib/valheim-status/lagreports` under `ReadWritePaths=`. That directory sits inside a
+`ReadOnlyPaths=` entry, so without the more specific grant every report fails with EROFS and the
+bot says so to the player each time. If reports are not arriving, check that first.
+
 `valheim-egress-report.py` reads all of it offline and prints **CONFIRMED / REFUTED /
-INCONCLUSIVE**. It leads with six refutation conditions and stops at the first that fires: a
+INCONCLUSIVE**. It leads with a coverage block — how much data there actually is, how old the
+newest sample is, which player counts are present — and refuses a positive verdict on thin or
+stale evidence, because three hours of month-old data otherwise reads exactly like thirty days of
+continuous data. **A CONFIRMED verdict needs at least two player counts**: R2 (does the plateau
+scale with n?) is the test that separates a per-peer budget from a single server-wide cap, and one
+point has no slope. It leads with six refutation conditions and stops at the first that fires: a
 single second above the arithmetic ceiling, a plateau that does not scale with player count, lag
 reports while egress is well below the ceiling, small packets inside plateaus, a non-empty socket
 send queue, or A2S latency spikes at low egress. Its strongest positive test compares raid
