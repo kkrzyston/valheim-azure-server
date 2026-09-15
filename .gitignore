@@ -45,3 +45,6 @@ __pycache__/
 # Your own deployment's literal secret values, for scripts/scan-secrets.sh.
 # Never commit this file.
 .secret-patterns
+
+# Subagent progress checkpoints -- session scratch, not a shared artifact.
+.telemetry/

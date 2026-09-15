@@ -14,7 +14,7 @@ only when the world file changes), deaths, raids, outdated clients, newcomers, r
 history, uptime %, NIC throughput, pairwise "together" time, heat map, records, Steam news (1 h cache),
 Discord counts (10 min cache). Network calls have 5 s timeouts and never abort the run.
 """
-import json, os, re, socket, struct, subprocess, time, shutil, glob, zlib, urllib.request
+import json, os, re, socket, struct, subprocess, sys, time, shutil, glob, zlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, date, timedelta
 try:
@@ -41,6 +41,12 @@ BACKUP_DIR = "/home/valheim/backups"
 AUTOUPDATE_LOG = "/var/log/valheim-autoupdate.log"
 A2S_ADDR = ("127.0.0.1", 2457)
 MAX_EVENTS_IN_STATUS = 60
+# Hard cap on how many addresses get ICMP-pinged per run. The game port faces the internet, so
+# the nftables `peers` set holds anyone who sent it a packet recently -- players, but also every
+# scanner that pokes UDP 2456 once. Each address costs up to three pings at 0.2 s spacing; a few
+# hundred of them would push this once-a-minute collector past its own 60 s period, and the
+# medals engine and the dashboard would start reading a status.json that never finishes updating.
+MAX_PING_TARGETS = 16
 RETAIN_SECONDS = 30 * 86400
 NIC = "eth0"
 NEWS_CACHE = f"{LIB}/news.json"
@@ -384,15 +390,50 @@ if live_count is not None and live_count == 0 and state["online"]:
     state["online"] = {}
 
 # ---------------------------------------------------------------- player ping (server -> player, ICMP)
-# Players connect directly to UDP 2456, so a short capture reveals their addresses. Each is pinged
-# from the VM; routers that drop ICMP show as no reply. Addresses never leave this machine.
+# Players connect directly to the game port, so whoever is sending to it is a player. Each address
+# is pinged from the VM; routers that drop ICMP show as no reply. Addresses never leave this machine.
+#
+# This used to be `tcpdump -i any -c 80 'udp and dst port 2456'` for three seconds, once a minute,
+# every minute that anyone was online -- an AF_PACKET tap copying packets out of the game's hot
+# receive path purely to learn a handful of addresses we already had a cheaper way to know. The
+# `peers` set in the `inet valheim_meter` nftables table (see valheim-meter-nft.sh) collects the
+# same addresses in the packet path itself, with a 15-minute element timeout so it prunes itself.
+# Reading it is one short-lived `nft` call against an in-kernel set.
+def _nft_set_elements(blob):
+    """Addresses out of `nft -j list set ...`. Elements of a set with `flags timeout` come back as
+    {"elem": {"val": "1.2.3.4", "timeout": 900, "expires": 812}} rather than a bare string, and an
+    empty set has no "elem" key at all -- handle both shapes."""
+    out = set()
+    for node in blob.get("nftables", []):
+        s = node.get("set") if isinstance(node, dict) else None
+        if not isinstance(s, dict):
+            continue
+        for e in s.get("elem", []):
+            if isinstance(e, dict):
+                e = e.get("elem", e)
+                e = e.get("val") if isinstance(e, dict) else e
+            if isinstance(e, str):
+                out.add(e)
+    return out
+
+
 def peer_ips():
     try:
-        out = subprocess.run(["timeout", "3", "tcpdump", "-nn", "-q", "-i", "any", "-c", "80", "udp and dst port 2456"],
-                             capture_output=True, text=True, timeout=10).stdout
-    except Exception:
+        out = subprocess.run(["nft", "-j", "list", "set", "inet", "valheim_meter", "peers"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            raise RuntimeError((out.stderr or "").strip()[:200] or f"nft exit {out.returncode}")
+        return _nft_set_elements(json.loads(out.stdout)) - {"127.0.0.1"}
+    except Exception as e:
+        # Not silent, but not once a minute forever either: losing the peer set costs the dashboard
+        # its per-player ping column, which is worth a line in the journal -- and worth exactly one
+        # line an hour while it stays broken. The usual cause is that valheim-egress.service (whose
+        # ExecStartPre= installs the table) has not run, or something flushed the table.
+        if now - state.get("peer_src_warn", 0) > 3600:
+            state["peer_src_warn"] = now
+            print(f"peer_ips: cannot read the nftables peers set ({e}); per-player ping is off. "
+                  "Check: systemctl status valheim-egress; valheim-meter-nft.sh show", file=sys.stderr)
         return set()
-    return set(re.findall(r"IP (\d+\.\d+\.\d+\.\d+)\.\d+ > ", out)) - {"127.0.0.1"}
 
 def icmp_ping(ip):
     try:
@@ -408,6 +449,18 @@ if state["online"]:
     seen = state.setdefault("peer_seen", {})
     for ip in ips:
         seen.setdefault(ip, now)
+    if not ips:
+        # Players online and nobody in the peer set is positive evidence that peer discovery is
+        # broken -- it is not "no addresses to ping", it is "the ping column is silently gone".
+        # Rate-limited to one line an hour, like the read failure above.
+        if now - state.get("peer_empty_warn", 0) > 3600:
+            state["peer_empty_warn"] = now
+            print(f"peer_ips: {len(state['online'])} player(s) online but the nftables peers set is "
+                  "empty; per-player ping is off. Check: valheim-meter-nft.sh show", file=sys.stderr)
+    elif len(ips) > MAX_PING_TARGETS:
+        # Almost certainly scanners rather than players. Keep the most recently seen, since those
+        # are the ones a live player is refreshing every few milliseconds.
+        ips = set(sorted(ips, key=lambda ip: seen[ip], reverse=True)[:MAX_PING_TARGETS])
     for ip in list(seen):
         if ip not in ips and now - seen[ip] > 900 and ip not in state.get("ip_of", {}).values():
             del seen[ip]
@@ -416,9 +469,16 @@ if state["online"]:
     for sid in list(ip_of):
         if sid not in state["online"]:
             del ip_of[sid]
-    # pair still-unmapped players with unclaimed addresses in the order they appeared
-    unmapped = sorted([sid for sid in state["online"] if sid not in ip_of], key=lambda k: state["online"][k]["since"])
-    unclaimed = sorted([ip for ip in ips if ip not in ip_of.values()], key=lambda ip: seen[ip])
+    # Pair still-unmapped players with unclaimed addresses, NEWEST FIRST on both sides. The peer
+    # set keeps an address for a couple of minutes after its player leaves, so an oldest-first
+    # pairing handed a departed player's stale address to the next person who joined -- and then
+    # showed that person a ping to a machine that had left. Newest-first pairs the most recent
+    # joiner with the most recently seen address, and when the lists are different lengths the
+    # zip drops the OLDEST addresses, which are the ones most likely to be stale.
+    unmapped = sorted([sid for sid in state["online"] if sid not in ip_of],
+                      key=lambda k: state["online"][k]["since"], reverse=True)
+    unclaimed = sorted([ip for ip in ips if ip not in ip_of.values()],
+                       key=lambda ip: seen[ip], reverse=True)
     for sid, ip in zip(unmapped, unclaimed):
         ip_of[sid] = ip
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -741,6 +801,115 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------------- lag reports (from Hermodr)
+# Hermodr's `!lag` drops one small JSON file per player report into a spool it can write but not
+# read back (mode 1730, group valheim-bot -- the same one-writer pattern as the restart spool).
+# We are root and the only writer of events.jsonl, so draining it here is what keeps a report
+# from being lost to append_and_trim()'s read-modify-rename once a minute.
+LAG_SPOOL = f"{LIB}/lagreports"
+
+
+def drain_lag_reports():
+    """(entries, taken_paths). The caller MUST unlink taken_paths only after append_and_trim()
+    has returned, i.e. after events.jsonl has actually been replaced on disk.
+
+    The old version unlinked each file the moment it had parsed it, which put the only copy of a
+    player's report in a Python list for the rest of the run. Any crash between there and the
+    rename -- and this script does a lot of work in between, including network calls -- lost it
+    permanently. Every other artifact here can be regenerated from the journal or the world file;
+    a human being saying "it was unplayable at 21:40" cannot. So this mirrors the restart spool:
+    rename to .taken, hand back the paths, and let the caller unlink once the data is committed.
+
+    A .taken file left behind by a crash is swept back on the next run. That can re-deliver a
+    report the previous run had already committed, so drained stems are remembered in state.json
+    and skipped -- a duplicate would be harmless but a phantom second report is still a lie."""
+    entries, taken = [], []
+    drained = state.setdefault("lag_drained", [])
+    try:
+        names = sorted(os.listdir(LAG_SPOOL))
+    except FileNotFoundError:
+        return entries, taken
+    except Exception as e:
+        print(f"drain_lag_reports: cannot list {LAG_SPOOL}: {e!r}", file=sys.stderr)
+        return entries, taken
+
+    for name in names:
+        p = os.path.join(LAG_SPOOL, name)
+        # A .taken from a run that died mid-drain: put it back in play.
+        if name.endswith(".taken"):
+            try:
+                os.rename(p, p[: -len(".taken")])
+                print(f"drain_lag_reports: recovered {name} left behind by an interrupted run",
+                      file=sys.stderr)
+            except Exception as e:
+                print(f"drain_lag_reports: could not recover {name}: {e!r}", file=sys.stderr)
+            continue
+        # A .tmp is either a report being written right now or an orphan from a bot that died
+        # mid-write. The bot cannot list this directory (mode 1730) so it can never clean up
+        # after itself; we can. An hour is far longer than the write takes.
+        if name.endswith(".tmp"):
+            try:
+                if now - os.path.getmtime(p) > 3600:
+                    os.unlink(p)
+                    print(f"drain_lag_reports: removed orphaned {name}", file=sys.stderr)
+            except Exception:
+                pass
+            continue
+        if not name.endswith(".json"):
+            continue
+
+        stem = name[: -len(".json")]
+        try:
+            with open(p) as f:
+                rec = json.load(f)
+            t, who = rec.get("t"), rec.get("name")
+            if isinstance(t, bool) or not isinstance(t, (int, float)) or not isinstance(who, str)                     or not who.strip():
+                raise ValueError(f"expected numeric t and a name, got {rec!r}"[:200])
+        except Exception as e:
+            # Loud, then dropped. A malformed file left in place would be re-read and re-reported
+            # every single minute forever; deleting it silently would lose a player's report with
+            # no trace of why. Say what was wrong, then move on.
+            print(f"drain_lag_reports: discarding unusable {name}: {e!r}", file=sys.stderr)
+            try:
+                os.unlink(p)
+            except Exception as e2:
+                print(f"drain_lag_reports: could not unlink {name}: {e2!r}", file=sys.stderr)
+            continue
+
+        try:
+            os.rename(p, p + ".taken")
+        except Exception as e:
+            print(f"drain_lag_reports: could not claim {name}: {e!r}", file=sys.stderr)
+            continue
+        taken.append(p + ".taken")
+        if stem in drained:
+            print(f"drain_lag_reports: {name} was already committed by an earlier run; "
+                  "not recording it twice", file=sys.stderr)
+            continue
+        drained.append(stem)
+        # The name is a Discord display name -- arbitrary user-controlled text. Length-capped and
+        # stripped of control characters here, before it enters events.jsonl, which is never
+        # trimmed. (index.html escapes it again at render time.)
+        # isprintable() rather than a control-character regex: it also strips the zero-width and
+        # bidirectional-override characters a naive control class lets through, which can make a
+        # name render as something other than what was typed.
+        who = "".join(c for c in who if c.isprintable()).strip()[:48]
+        entries.append({"t": float(t), "kind": "lagreport", "name": who or "someone"})
+    del drained[:-200]
+    return entries, taken
+
+
+def commit_lag_reports(taken):
+    """Called only after events.jsonl has been rewritten. Until this runs, every report is still
+    on disk and a crash costs nothing but a duplicate-suppressed re-read."""
+    for p in taken:
+        try:
+            os.unlink(p)
+        except Exception as e:
+            print(f"commit_lag_reports: could not unlink {os.path.basename(p)}: {e!r} -- it will "
+                  "be swept back next run and suppressed as already committed", file=sys.stderr)
+
+
 # ---------------------------------------------------------------- persist events + samples
 def append_and_trim(path, new_items, keep_after):
     items = []
@@ -771,8 +940,12 @@ sample = {"t": int(now), "p": players_now, "c": cpu_pct, "m": round(100 * (1 - m
           "o": 1 if server_online else 0, "rx": rx_bytes, "tx": tx_bytes, "w": world_bytes}
 if pg:
     sample["pg"] = pg
+lag_entries, lag_taken = drain_lag_reports()
+events.extend(lag_entries)
 samples = append_and_trim(f"{LIB}/samples.jsonl", [sample], now - RETAIN_SECONDS)
 all_events = append_and_trim(f"{LIB}/events.jsonl", events, 0)
+# events.jsonl is on disk now, so the spool copies are finally redundant.
+commit_lag_reports(lag_taken)
 
 # all-time tallies per player (sessions, seconds, deaths), fed by leave/death events; never trimmed
 totals = state.setdefault("totals", {})

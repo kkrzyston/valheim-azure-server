@@ -1,0 +1,72 @@
+[Unit]
+Description=Valheim dashboard: 1 Hz game egress probe (lag investigation)
+Documentation=file:/usr/local/sbin/valheim-egress-probe.py
+After=network-online.target
+# A start limit, deliberately, where most units here set StartLimitIntervalSec=0. A probe that
+# crash-loops forever is not resilient: it burns a restart every RestartSec and -- until
+# ExecStartPre= became `ensure` -- it also flushed the collector's peer set on each one, blanking
+# the dashboard's ping column intermittently while logging nothing at all (the read succeeded;
+# the set was merely empty). `ensure` removed that collateral damage; this bounds the loop
+# itself. Ten failures in five minutes and systemd stops and marks the unit failed, which is
+# loud. This is instrumentation: a probe stopped in a visible failed state is strictly better
+# than one thrashing unnoticed for a month.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# VALHEIM_GAME_PORT / VALHEIM_QUERY_PORT and every EGRESS_* override have a working default
+# baked into the script and the helper; this is the same optional-overrides file the rest of the
+# dashboard reads. Loaded by PID 1 before this unit's own sandboxing applies.
+EnvironmentFile=-/etc/valheim-server.env
+EnvironmentFile=-/etc/valheim-alert.env
+
+# `ensure`, NOT `install`. The table is created here rather than left to nftables.service, so it
+# comes back after a reboot on its own -- but `install` is a delete-and-recreate, and running it
+# on every start meant a crash-looping probe zeroed the counters and emptied the collector's
+# `peers` set every few seconds. `ensure` rebuilds only when the table is missing or incomplete.
+# The probe reads counters as deltas, so it never needed them to start at zero.
+#
+# It is deliberately NOT removed on stop: valheim-status-collect.py reads the same table's
+# `peers` set for the dashboard's per-player ping, and tearing it down here would silently take
+# that column with it. Leave this unit enabled, or run `valheim-meter-nft.sh ensure` by hand.
+ExecStartPre=/usr/local/sbin/valheim-meter-nft.sh ensure
+ExecStart=/usr/bin/python3 /usr/local/sbin/valheim-egress-probe.py
+Restart=always
+RestartSec=10
+
+# This is instrumentation, and it must never be the reason the thing it measures gets slower.
+# The game server is at default priority; the probe yields to it for both CPU and disk, and it
+# writes once every 15 s rather than once a second. When nobody is online it does nothing at all.
+Nice=10
+IOWeight=50
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/valheim-status
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryMax=128M
+TasksMax=32
+
+# DELIBERATELY ABSENT, and each for a reason -- do not "finish the hardening" without testing:
+#   ProtectKernelModules=yes  -- `nft` asks the kernel to autoload nf_tables/nft_counter on a
+#                                fresh boot, which needs CAP_SYS_MODULE. With this set, the very
+#                                first ExecStartPre after a reboot fails and the unit restart-
+#                                loops with a misleading "No such file or directory" from nft.
+#   CapabilityBoundingSet=     -- same reason: nft needs CAP_NET_ADMIN and, on a cold boot,
+#                                CAP_SYS_MODULE. Narrowing this is only safe after a reboot test.
+#   SystemCallFilter=          -- this repo has already shipped one unit whose syscall filter
+#                                quietly broke it in production (see valheim-restartd.service's
+#                                chown history). A diagnostic that dies on an unlisted syscall
+#                                costs an experiment, not a security incident.
+
+[Install]
+WantedBy=multi-user.target
