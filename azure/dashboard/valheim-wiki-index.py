@@ -148,6 +148,48 @@ ALIASES = {
 # ---------------------------------------------------------------- query sanitization
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
+# Low-signal English interrogatives/auxiliaries/articles/prepositions. A natural-language
+# question like "how much health does a Boar have" tokenizes to 7 OR'd terms, but only "health"
+# and "boar" say anything about what the user wants -- the other five are grammatical scaffolding
+# that also happens to appear constantly in ordinary wiki prose. Because _build_match_expression
+# ORs every term and bm25() sums a document's per-term contributions, a long, wordy, UNRELATED
+# page (a generic "Health" article, a "Poison > Stacking" section) that racks up many incidental
+# matches on "does"/"have"/"a"/"the" can out-score a short, precisely-relevant page that matches
+# only the one or two real entity terms. Dropping this scaffolding before the query ever reaches
+# FTS5 lets the entity terms carry the full weight of the match, instead of being diluted 2-of-7.
+#
+# Verified against the actual corpus before being committed to, per PLAN-v6's rule that a
+# stopword-looking word must not be assumed safe to drop just because it looks like filler: every
+# word below was checked with a direct MediaWiki `action=query&titles=...` exact-title lookup
+# against BOTH source wikis (valheim.fandom.com and valheim.weirdgloop.org, checked 2026-09-14)
+# and confirmed to NOT be a real page title on either -- none of them is a Valheim entity this
+# bot needs to be able to find by name. See cmd_selftest() for that same check kept as a live
+# regression: every curated title and ALIASES canonical value is re-tokenized and checked against
+# this set on every test run, so a future edit can't silently add a real entity's name here
+# without a test failing.
+#
+# Deliberately English-only and exact-token-membership-based (never substring/regex removal on
+# the raw query text) so Old Norse and any other non-English phrasing is untouched by
+# construction -- a token like "heilsa" or "hvat" simply never appears in this set, and there is
+# no code path here that could partially mangle a non-Latin or accented token.
+_STOPWORDS = frozenset({
+    "how", "much", "many", "what", "which", "where", "when",
+    "does", "do", "did", "is", "are", "was", "were", "have", "has", "had",
+    "the", "a", "an", "of", "for", "in", "on", "to", "it",
+})
+
+
+def _strip_stopwords(terms):
+    """Drop _STOPWORDS members from `terms` so the remaining entity words carry the query's full
+    weight -- but NEVER return an empty list. If every term is a stopword (e.g. a query that is
+    itself just filler, like "what is it"), stripping would throw away the entire query and leave
+    nothing for FTS5 to match; the caller is better served by falling back to the original,
+    unfiltered terms (a broad, noisy match) than by _build_match_expression treating the query as
+    empty and returning no results at all. Order is preserved; duplicates are left exactly as
+    _build_match_expression already handled them before this function existed."""
+    filtered = [t for t in terms if t not in _STOPWORDS]
+    return filtered if filtered else terms
+
 
 def _build_match_expression(query):
     """Turn arbitrary, untrusted query text into a safe FTS5 MATCH expression, or None if
@@ -172,6 +214,13 @@ def _build_match_expression(query):
 
     if not terms:
         return None
+
+    # Strip English filler AFTER alias expansion (so an alias's canonical terms are also subject
+    # to it -- moot today since no ALIASES value tokenizes to a stopword, but harmless either
+    # way) and BEFORE truncating to _MAX_TERMS, so the budget of terms that actually reach FTS5
+    # is spent on entity words first, not used up on "does"/"have"/"a". _strip_stopwords()
+    # guarantees this can never turn a non-empty `terms` into an empty one.
+    terms = _strip_stopwords(terms)
 
     quoted = []
     for t in terms[:_MAX_TERMS]:
@@ -991,6 +1040,230 @@ def cmd_selftest():
                   f"does not leak into the served record or its text: "
                   f"keys={served_keys!r} text={served_text!r}")
             all_ok = all_ok and no_leak_ok
+        finally:
+            DB_PATH_DEFAULT = original_db_path
+            _reset_cache_for_tests()
+
+    print("\n--- English stopword stripping: the 'how much health does a Boar have' fix ---")
+    # _strip_stopwords() unit-level checks -- see its own docstring and _STOPWORDS' module-level
+    # comment for the corpus verification and the mechanism this locks in.
+    filler_query_terms = [t.lower() for t in _TOKEN_RE.findall(
+        "how much health does a Boar have"
+    )]
+    filler_stripped = _strip_stopwords(filler_query_terms)
+    filler_stripped_ok = filler_stripped == ["health", "boar"]
+    print(f"{'PASS' if filler_stripped_ok else 'FAIL'} interrogatives/auxiliaries/articles are "
+          f"dropped from the real failing query, leaving only the entity terms: "
+          f"{filler_stripped!r} (want ['health', 'boar'])")
+    all_ok = all_ok and filler_stripped_ok
+
+    all_stopword_terms = [t.lower() for t in _TOKEN_RE.findall("what is it")]
+    all_stopword_stripped = _strip_stopwords(all_stopword_terms)
+    never_empty_ok = (
+        all_stopword_stripped == all_stopword_terms and len(all_stopword_stripped) > 0
+    )
+    print(f"{'PASS' if never_empty_ok else 'FAIL'} an all-stopword query ('what is it') falls "
+          f"back to the ORIGINAL terms instead of being stripped to nothing: "
+          f"{all_stopword_stripped!r}")
+    all_ok = all_ok and never_empty_ok
+
+    all_stopword_match_expr = _build_match_expression("what is it")
+    all_stopword_match_expr_ok = bool(all_stopword_match_expr)
+    print(f"{'PASS' if all_stopword_match_expr_ok else 'FAIL'} _build_match_expression('what is "
+          f"it') still produces a searchable MATCH expression instead of None -- the query is "
+          f"never dropped to nothing: {all_stopword_match_expr!r}")
+    all_ok = all_ok and all_stopword_match_expr_ok
+
+    try:
+        all_stopword_search_result = search("what is it")
+        all_stopword_search_ok = isinstance(all_stopword_search_result, list)
+    except Exception as exc:
+        all_stopword_search_result = exc
+        all_stopword_search_ok = False
+    print(f"{'PASS' if all_stopword_search_ok else 'FAIL'} search('what is it') does not raise "
+          f"even though every one of its terms is a stopword: {all_stopword_search_result!r}")
+    all_ok = all_ok and all_stopword_search_ok
+
+    old_norse_terms = [t.lower() for t in _TOKEN_RE.findall("hvat er heilsa Boar")]
+    old_norse_stripped = _strip_stopwords(old_norse_terms)
+    old_norse_untouched_ok = old_norse_stripped == old_norse_terms
+    print(f"{'PASS' if old_norse_untouched_ok else 'FAIL'} Old Norse query terms are untouched "
+          f"by the (English-only) stopword set -- this phrasing already worked before the fix "
+          f"and must keep working: {old_norse_stripped!r} (want unchanged {old_norse_terms!r})")
+    all_ok = all_ok and old_norse_untouched_ok
+
+    print("\n--- _STOPWORDS checked against the actual corpus -- never swallows a real entity ---")
+    # This codifies the manual check performed before choosing _STOPWORDS (see its module-level
+    # comment): every candidate word was looked up as an exact page title against BOTH live wikis
+    # via MediaWiki's `action=query&titles=`, confirming none is a real entity. That was a
+    # point-in-time check against a live service this test suite cannot re-run offline, so this
+    # regression test instead locks the same property against everything checked into THIS repo
+    # that names a real entity: every curated title (valheim-curated-numbers.jsonl) and every
+    # ALIASES canonical value.
+    #
+    # The bar is "would this entity's name be fully erased", not "does any one token overlap" --
+    # a multi-word name with ONE stopword-ish token (e.g. ALIASES' "The Elder", tokens ["the",
+    # "elder"]) is unaffected by stripping "the": "elder" alone still finds it, so that overlap is
+    # harmless by design (_strip_stopwords only ever REMOVES stopword tokens, it never touches a
+    # non-stopword one). The only real danger is an entity name whose tokens are ALL stopwords --
+    # then a query mentioning it alongside other real content would have every trace of that
+    # name's own words stripped out from under it.
+    entity_names = []
+    curated_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "valheim-curated-numbers.jsonl"
+    )
+    try:
+        with open(curated_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                entity_names.append(rec.get("title", ""))
+    except FileNotFoundError:
+        pass  # not guaranteed present in every environment this module runs in -- ALIASES
+              # alone below still gives this check real content to compare against
+    entity_names.extend(ALIASES.values())
+
+    def _fully_stopword_names(stopwords, names):
+        swallowed = []
+        for name in names:
+            name_tokens = [t.lower() for t in _TOKEN_RE.findall(name)]
+            if name_tokens and all(t in stopwords for t in name_tokens):
+                swallowed.append(name)
+        return sorted(set(swallowed))
+
+    swallowed_entities = _fully_stopword_names(_STOPWORDS, entity_names)
+    corpus_collision_ok = not swallowed_entities
+    print(f"{'PASS' if corpus_collision_ok else 'FAIL'} no real curated title or ALIASES "
+          f"canonical value is made ENTIRELY of _STOPWORDS tokens (which would erase it "
+          f"completely from any query): swallowed={swallowed_entities!r}")
+    all_ok = all_ok and corpus_collision_ok
+
+    # Prove that check isn't vacuous: it must actually catch a real-entity collision if one is
+    # introduced. Simulated with "boar" -- the entity this entire bug report is about -- added to
+    # a LOCAL COPY of _STOPWORDS (never mutating the real module state other tests rely on). Once
+    # "boar" is (wrongly) a stopword, the single-token curated title "Boar" becomes entirely
+    # stopwords and must be flagged.
+    sabotaged_stopwords = _STOPWORDS | {"boar"}
+    sabotaged_swallowed = _fully_stopword_names(sabotaged_stopwords, entity_names)
+    collision_check_catches_real_entity_ok = sabotaged_swallowed == ["Boar"]
+    print(f"{'PASS' if collision_check_catches_real_entity_ok else 'FAIL'} the check actually "
+          f"detects it if a real entity name is added to the stopword set -- this is not a "
+          f"vacuous lock: simulated by adding 'boar' to a COPY of _STOPWORDS, "
+          f"swallowed={sabotaged_swallowed!r}")
+    all_ok = all_ok and collision_check_catches_real_entity_ok
+
+    print("\n--- English stopword fix, end-to-end through a REAL FTS5 index with realistic "
+          "decoys ---")
+    # Reproduces the actual live-deployment defect: a curated Boar record with the real HP
+    # numbers exists and is reachable, but loses to food items ("Boar Jerky", "Boar Meat") and to
+    # a generic "Health" page once a natural-language question brings enough English filler words
+    # into the query for their sheer incidental prose-matching volume to outscore the short,
+    # precisely-relevant curated record. The fandom "Boar" creature page and a "Poison >
+    # Stacking" page are included as further decoys -- with this exact fixture, sabotaging the
+    # fix (making _strip_stopwords a no-op) reproduces the exact observed wrong top result,
+    # "[fandom] Poison > Stacking", for the first query below.
+    with tempfile.TemporaryDirectory(prefix="wiki-index-selftest-stopwords-") as tmp_dir:
+        records_path = os.path.join(tmp_dir, "wiki-records.jsonl")
+        stopword_db = os.path.join(tmp_dir, "wiki.db")
+        boar_records = [
+            {"title": "Boar", "heading": "Curated: Creature Stats",
+             "text": "Boar: 1-star 10 health, 2-star 20 health, 3-star 40 health. Deals 10 "
+                     "blunt damage.",
+             "source": "curated", "revid": 1001,
+             "url": "https://example.invalid/curated/boar", "timestamp": ""},
+            {"title": "Boar", "heading": "Overview",
+             "text": "The Boar is a passive creature found in the Meadows biome. It can be "
+                     "tamed and bred using Barley and Mushrooms. Wild Boars will attack if "
+                     "provoked.",
+             "source": "fandom", "revid": 1002,
+             "url": "https://example.invalid/fandom/boar", "timestamp": ""},
+            {"title": "Boar Jerky", "heading": "Food",
+             "text": "Boar Jerky is a food item made from Boar Meat. It restores 25 health "
+                     "and 60 stamina over a duration of 1200 seconds. Boar Jerky is crafted at "
+                     "a Cooking Station using Boar Meat and salt.",
+             "source": "fandom", "revid": 1003,
+             "url": "https://example.invalid/fandom/boar-jerky", "timestamp": ""},
+            {"title": "Boar Meat", "heading": "Raw Material",
+             "text": "Boar Meat is a raw material dropped by killing a Boar. It can be cooked "
+                     "over a campfire or used to craft Boar Jerky and other Boar meat dishes.",
+             "source": "fandom", "revid": 1004,
+             "url": "https://example.invalid/fandom/boar-meat", "timestamp": ""},
+            {"title": "Health", "heading": "Overview",
+             "text": "Health is a core survival stat. A player's health does decrease when "
+                     "they take damage and does regenerate over time. How much health a "
+                     "player has depends on food eaten. Health does not regenerate while a "
+                     "player has negative stamina.",
+             "source": "fandom", "revid": 1005,
+             "url": "https://example.invalid/fandom/health", "timestamp": ""},
+            {"title": "Poison", "heading": "Stacking",
+             "text": "Poison damage does stack when a player is hit multiple times. How much "
+                     "poison a creature has applied does increase over time and does not "
+                     "reset until it has worn off completely.",
+             "source": "fandom", "revid": 1006,
+             "url": "https://example.invalid/fandom/poison-stacking", "timestamp": ""},
+        ]
+        with open(records_path, "w", encoding="utf-8") as fh:
+            for rec in boar_records:
+                fh.write(json.dumps(rec) + "\n")
+        build_index(records_path=records_path, db_path=stopword_db)
+
+        original_db_path = DB_PATH_DEFAULT
+        try:
+            DB_PATH_DEFAULT = stopword_db
+            _reset_cache_for_tests()
+
+            def top_source_title(query):
+                r = search(query, k=1)
+                return (r[0]["source"], r[0]["title"]) if r else None
+
+            filler_query_result = top_source_title("how much health does a Boar have")
+            filler_query_ok = filler_query_result == ("curated", "Boar")
+            print(f"{'PASS' if filler_query_ok else 'FAIL'} REAL index: 'how much health does "
+                  f"a Boar have' -- the main reported failure -- now returns the curated Boar "
+                  f"record first instead of a food item or the generic Health page: "
+                  f"{filler_query_result!r}")
+            all_ok = all_ok and filler_query_ok
+
+            star_level_result = top_source_title("Boar hitpoints star level")
+            star_level_ok = star_level_result == ("curated", "Boar")
+            print(f"{'PASS' if star_level_ok else 'FAIL'} REAL index: 'Boar hitpoints star "
+                  f"level' (already correct pre-fix) still returns curated Boar first: "
+                  f"{star_level_result!r}")
+            all_ok = all_ok and star_level_ok
+
+            bare_boar_result = top_source_title("Boar")
+            bare_boar_ok = bare_boar_result == ("curated", "Boar")
+            print(f"{'PASS' if bare_boar_ok else 'FAIL'} REAL index: the bare query 'Boar' "
+                  f"(already correct pre-fix) still returns curated Boar first: "
+                  f"{bare_boar_result!r}")
+            all_ok = all_ok and bare_boar_ok
+
+            old_norse_result = top_source_title("hvat er heilsa Boar")
+            old_norse_ok = old_norse_result == ("curated", "Boar")
+            print(f"{'PASS' if old_norse_ok else 'FAIL'} REAL index: the Old Norse phrasing "
+                  f"'hvat er heilsa Boar' (already correct pre-fix, because its filler matches "
+                  f"nothing) still returns curated Boar first: {old_norse_result!r}")
+            all_ok = all_ok and old_norse_ok
+
+            # NOTE on 'Boar health': tokenizes to ["boar", "health"] -- ZERO stopwords, so
+            # _build_match_expression("Boar health") is byte-identical with or without this fix
+            # (confirmed by temporarily making _strip_stopwords a no-op against this exact
+            # fixture: the result did not change). It is asserted below as a regression check on
+            # the current, already-correct ranking in THIS fixture (curated Boar's short
+            # title/text wins the bm25 + curated-boost comparison against the longer food-item
+            # decoys) -- NOT as a lock on the stopword fix, because no stopword-only change CAN
+            # affect a query that contains no stopwords. See this session's report for why the
+            # live 5,911-section index's "WRONG ORDER" result for this exact query is a separate
+            # ranking issue that stopword stripping does not address.
+            boar_health_result = top_source_title("Boar health")
+            boar_health_ok = boar_health_result == ("curated", "Boar")
+            print(f"{'PASS' if boar_health_ok else 'FAIL'} REAL index: 'Boar health' returns "
+                  f"curated Boar first in this fixture -- NOT a lock on the stopword fix (this "
+                  f"query has no stopwords to strip; see the comment above): "
+                  f"{boar_health_result!r}")
+            all_ok = all_ok and boar_health_ok
         finally:
             DB_PATH_DEFAULT = original_db_path
             _reset_cache_for_tests()
