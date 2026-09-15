@@ -308,6 +308,14 @@ def split_artifacts(rows, link_bps, mult, hi=0.999):
     return clean, arts, bound_by_n
 
 
+def plateau_seconds(rows):
+    """Seconds of plateau, not a count of rows. Rows can span slightly different intervals and a
+    row is only written for an interval the probe could vouch for, so "how long was it pinned"
+    and "how many rows are there" are not the same question -- and the first is the one the
+    evidence floor is about."""
+    return sum(r["_dt"] for r in rows)
+
+
 def measured_payload(rows, hdr=HDR):
     """Mean payload bytes per packet, or None when there is nothing to measure -- which happens
     for real: build_record legitimately emits txp=0 for a silent second, and a whole window of
@@ -376,9 +384,6 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
         blocked.append(f"the newest sample is {dur(newest_age)} old (limit {args.max_stale:g}h) -- "
                        f"this is a report about the past, not about the server as it is now; "
                        f"check that valheim-egress.service is still running")
-    if sampled < args.min_samples:
-        blocked.append(f"only {dur(sampled)} of measured time (need {dur(args.min_samples)}); "
-                       f"keep the probe running through more busy evenings")
     if skipped and skipped > args.max_skip * (skipped + len(rows)):
         blocked.append(f"{skipped/(skipped+len(rows)):.1%} of lines were unreadable (limit "
                        f"{args.max_skip:.0%}) -- fix that before trusting any of the rest")
@@ -421,16 +426,25 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
         f"percentile, in runs of >={args.min_run}) ---")
     out(f"{'n':>3} {'samples':>8} {'plateau':>8} {'median':>12} {'p99.5':>12} {'plateau mean':>13} "
         f"{'CV':>7} {'per player':>11} {'pkt size':>9} {'predicted':>12}")
-    per_player = {}
+    # THE EVIDENCE FLOOR IS PER PLAYER COUNT, NOT A GLOBAL TOTAL. Everything a positive verdict
+    # asserts is a statement about how the plateau CHANGES with n, so six hours of measurement all
+    # at n=3 is not six hours of evidence for it -- it is one point, and one point has no slope.
+    # A player count qualifies only once it has --min-plateau-sec of plateau time of its own, and
+    # a verdict needs --min-counts of them. Qualifying counts are marked * in the table.
+    plateau_secs, per_player = {}, {}
+    for n in sorted(pl):
+        plateau_secs[n] = plateau_seconds(pl[n]["plateau"])
+    qualified = {n: v for n, v in plateau_secs.items() if v >= args.min_plateau_sec}
     for n in sorted(pl):
         d = pl[n]
         p = d["plateau"]
         pb = [r["_tx"] for r in p]
         pmean = mean(pb) if pb else float("nan")
         predicted = predicted_ceiling(n, args.budget, pay, args.hdr, args.k)
-        if len(pb) >= args.min_plateau:
+        if n in qualified:
             per_player[n] = pmean / n
-        out(f"{n:>3} {len(d['all']):>8,} {len(p):>8,} "
+        out(f"{n:>3} {len(d['all']):>8,} "
+            f"{(dur(plateau_secs[n]) + ('*' if n in qualified else '')):>8} "
             f"{human(statistics.median([r['_tx'] for r in d['all']])):>12} "
             f"{human(d['edge']):>12} {human(pmean):>13} "
             f"{cv(pb)*100 if pb else float('nan'):>6.2f}% "
@@ -474,8 +488,10 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
                          f"varies {spread:.0%} across n={sorted(per_player)}. A per-peer budget "
                          f"cannot do that; a single global cap does exactly that.")
     else:
-        out(f"R2  NOT TESTABLE: needs >={args.min_plateau} plateau samples at two or more player "
-            f"counts; only {sorted(per_player) or 'none'} qualify. One point has no slope.")
+        out(f"R2  NOT TESTABLE: needs {dur(args.min_plateau_sec)} of plateau at each of "
+            f"{args.min_counts}+ player counts; only {sorted(per_player) or 'none'} qualify "
+            f"(have: {', '.join('n=%d %s' % (n, dur(v)) for n, v in sorted(plateau_secs.items())) or 'nothing'}). "
+            f"One point has no slope.")
         blocked.append("R2 -- per-player scaling was never tested: fewer than two player counts "
                        "have enough plateau data, and one point has no slope. This is the test "
                        "that separates a per-peer budget from a single global cap, so without it "
@@ -655,16 +671,22 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
     # ---- verdict -------------------------------------------------------------------------------
     # Each gate is conditional on ITS OWN evidence. A positive verdict may only be reached when
     # every test it would then assert in prose actually ran and actually passed.
-    cvs = {n: cv([r["_tx"] for r in pl[n]["plateau"]])
-           for n in pl if len(pl[n]["plateau"]) >= args.min_plateau}
+    cvs = {n: cv([r["_tx"] for r in pl[n]["plateau"]]) for n in qualified}
     flat = {n: v for n, v in cvs.items() if v == v and v <= args.cv_max}
     if not fired:
-        if len(flat) < 2:
+        if len(qualified) < args.min_counts:
             blocked.append(
-                f"a flat plateau at two or more player counts is required and "
+                f"the evidence floor is per player count and only {sorted(qualified) or 'none'} "
+                f"cleared it -- {dur(args.min_plateau_sec)} of plateau at each of "
+                f"{args.min_counts}+ counts is required, and the data has "
+                f"{', '.join('n=%d %s' % (n, dur(v)) for n, v in sorted(plateau_secs.items())) or 'nothing'}. "
+                f"A verdict here is a claim about how the plateau changes with n, so hours spent "
+                f"at a single count are not evidence for it")
+        elif len(flat) < args.min_counts:
+            blocked.append(
+                f"a flat plateau at {args.min_counts}+ player counts is required and "
                 f"{sorted(flat) if flat else 'none'} qualified "
-                + (f"(best CV {min(cvs.values()):.2%}, needs <={args.cv_max:.1%})" if cvs else
-                   f"(no player count reached {args.min_plateau} plateau samples)"))
+                f"(best CV {min(cvs.values()):.2%}, needs <={args.cv_max:.1%})")
         if not matched_ok:
             blocked.append("the matched raid/non-raid comparison never came out indistinguishable, "
                            "so the plateau is not yet shown to be a supply limit rather than a "
@@ -911,13 +933,13 @@ def build_parser():
     ap.add_argument("--hdr", type=float, default=HDR, help="header bytes/packet (28 = IP+UDP, as nftables counts; 42 adds Ethernet)")
     ap.add_argument("--k", type=float, default=0.0, help="non-ZDO per-peer traffic, B/s (0 keeps the ceiling a lower bound)")
     # how much evidence is enough
-    ap.add_argument("--min-samples", type=float, default=6 * 3600, help="seconds of measured time before any verdict is offered")
     ap.add_argument("--max-stale", type=float, default=48, help="hours: refuse a verdict if the newest sample is older")
     ap.add_argument("--max-skip", type=float, default=0.02, help="fraction of unreadable lines that blocks a positive verdict")
     # plateau definition
     ap.add_argument("--plateau-frac", type=float, default=0.95, help="fraction of the p99.5 edge that counts as plateau")
     ap.add_argument("--min-run", type=int, default=3, help="consecutive samples needed to call it a plateau, not a burst")
-    ap.add_argument("--min-plateau", type=int, default=1800, help="plateau samples needed before a player count is used")
+    ap.add_argument("--min-plateau-sec", type=float, default=1800, help="seconds of plateau a single player count needs before it counts as evidence -- the floor is per count, because the verdict is a claim about how the plateau changes with n")
+    ap.add_argument("--min-counts", type=int, default=2, help="how many player counts must clear that floor before any positive verdict")
     ap.add_argument("--cv-max", type=float, default=0.02, help="CV a plateau must be under to count as flat")
     # refutation thresholds
     ap.add_argument("--r1-slack", type=float, default=0.05, help="R1: fraction above the ceiling that still counts as noise")
