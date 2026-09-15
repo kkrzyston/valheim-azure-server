@@ -48,7 +48,7 @@ Inputs (all read-only, none modified):
 
   python3 valheim-egress-report.py                  full report over everything on disk
   python3 valheim-egress-report.py --days 7         only the last 7 days
-  python3 valheim-egress-report.py --selftest       fifteen synthetic worlds with known answers
+  python3 valheim-egress-report.py --selftest       seventeen synthetic worlds with known answers
 
 A NOTE ON WHAT THE BYTES ARE. nftables counters at the filter hooks count what the kernel sees at
 layer 3: IP header + UDP header + payload, 28 bytes per packet. They do NOT include the 14-byte
@@ -266,6 +266,48 @@ def plateaus(rows, frac=0.95, min_run=3, hi_pct=0.995):
     return out
 
 
+def split_artifacts(rows, link_bps, mult, hi=0.999):
+    """(clean, artifacts, bound_by_n). Separate instrument error from measurement.
+
+    THIS IS NOT "DISCARD INCONVENIENT DATA". R1 exists to end the investigation on a sample above
+    the ceiling, and that is correct science -- a budget you exceed is not a budget. But it is
+    only correct when applied to a MEASUREMENT. A row reporting 15 MB/s on a host whose thirty-day
+    observed maximum is 276 KB/s is not a clean overshoot of a hypothesis; it is a reading the
+    machine cannot physically have produced, and promoting it to decisive evidence throws away ten
+    hours of good data on the strength of one bad row. The probe now guards against writing such a
+    row -- but "the other component guards against it" is exactly the reasoning that produced half
+    the defects found in review, so the analysis guards too.
+
+    Two independent bounds; a row is an artifact if it exceeds EITHER:
+
+      * link capacity. Physically impossible, full stop.
+      * `mult` times the 99.9th percentile for that player count. Absurd relative to everything
+        else ever measured here. A percentile, so a handful of artifacts cannot inflate the bound
+        meant to catch them -- and a GENUINE sustained overshoot raises that percentile itself, so
+        it can never be caught by this bound. That asymmetry is the design: lone spikes are
+        excluded, sustained excess is not.
+
+    The second bound does the real work. A 15 MB/s row is well under a gigabit link, so the
+    physical bound alone would miss it; it is ~50x the 99.9th percentile, so the relative one
+    catches it. Both are needed.
+
+    Nothing is dropped silently -- the caller prints the count, the bound and examples. Quietly
+    deleting samples that disagree with the hypothesis would be a worse bias than the bug."""
+    by_n = {}
+    for r in rows:
+        by_n.setdefault(r["n"], []).append(r)
+    clean, arts, bound_by_n = [], [], {}
+    for n, rs in by_n.items():
+        edge = pct([r["_tx"] for r in rs], hi)
+        bound = min(link_bps, mult * edge) if edge == edge and edge > 0 else link_bps
+        bound_by_n[n] = bound
+        for r in rs:
+            (arts if r["_tx"] > bound else clean).append(r)
+    clean.sort(key=lambda r: r["t"])
+    arts.sort(key=lambda r: r["t"])
+    return clean, arts, bound_by_n
+
+
 def measured_payload(rows, hdr=HDR):
     """Mean payload bytes per packet, or None when there is nothing to measure -- which happens
     for real: build_record legitimately emits txp=0 for a silent second, and a whole window of
@@ -341,6 +383,29 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
         blocked.append(f"{skipped/(skipped+len(rows)):.1%} of lines were unreadable (limit "
                        f"{args.max_skip:.0%}) -- fix that before trusting any of the rest")
 
+    # Instrument error is separated from measurement BEFORE any statistic is computed, so that an
+    # impossible row cannot set a percentile, define a plateau edge, or fire a refutation.
+    link_bps = args.link_mbit * 1e6 / 8.0
+    rows, artifacts, bound_by_n = split_artifacts(rows, link_bps, args.artifact_mult)
+    out(f"discarded        {len(artifacts):,} sample(s) as physically implausible (above the "
+        f"lesser of {human(link_bps)} link capacity and {args.artifact_mult:g}x the 99.9th "
+        f"percentile for that player count)")
+    for r in artifacts[:5]:
+        out(f"                 {datetime.fromtimestamp(r['t']):%Y-%m-%d %H:%M:%S} n={r['n']} "
+            f"{r['_tx']:,.0f} B/s over dt={r['_dt']:g}s -- the bound was "
+            f"{bound_by_n.get(r['n'], float('nan')):,.0f} B/s")
+    if len(artifacts) > 5:
+        out(f"                 ...and {len(artifacts)-5:,} more")
+    if artifacts and len(artifacts) > args.max_artifact * (len(rows) + len(artifacts)):
+        blocked.append(f"{len(artifacts)/(len(rows)+len(artifacts)):.1%} of samples were physically "
+                       f"implausible (limit {args.max_artifact:.1%}). That is an instrument fault, "
+                       f"not a finding -- fix the probe before reading anything below")
+    if not rows:
+        out("")
+        out("VERDICT: INCONCLUSIVE -- every sample was discarded as an artifact.")
+        return "INCONCLUSIVE", [], ["every sample was an artifact"]
+    out("")
+
     pay = args.payload if args.payload else measured_payload(rows, args.hdr)
     if pay is None:
         pay = DEFAULT_PAYLOAD
@@ -379,12 +444,22 @@ def analyse(rows, samples, events, args, skipped=0, out=print):
             and r["_tx"] > predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k) * lim]
     worst = max((r["_tx"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k)
                  for r in rows if r["n"] > 0), default=float("nan"))
-    out(f"R1  samples above the ceiling x{lim:.2f}: {len(over):,} of {len(rows):,}   "
+    # The longest CONSECUTIVE overshoot is the statistic a lone artifact cannot manufacture:
+    # producing it takes two or more bad rows back to back, and the probe re-baselines its
+    # counters after any interval it could not trust, so it cannot emit two in a row.
+    over_t = {r["t"] for r in over}
+    run = best = 0
+    for r in rows:
+        run = run + 1 if r["t"] in over_t else 0
+        best = max(best, run)
+    out(f"R1  samples above the ceiling x{lim:.2f}: {len(over):,} of {len(rows):,}, longest "
+        f"consecutive run {best} (fires at {args.r1_min} total, or {args.r1_run} consecutive)   "
         f"(the highest sample reached {worst*100:.1f}% of its predicted ceiling)")
-    if len(over) >= args.r1_min:
+    if len(over) >= args.r1_min or best >= args.r1_run:
         ex = max(over, key=lambda r: r["_tx"] / predicted_ceiling(r["n"], args.budget, pay, args.hdr, args.k))
-        fired.append(f"R1: {len(over)} sample(s) exceeded the ceiling, worst {ex['_tx']:,.0f} B/s at "
-                     f"n={ex['n']} ({datetime.fromtimestamp(ex['t']):%Y-%m-%d %H:%M:%S}). "
+        fired.append(f"R1: {len(over)} sample(s) exceeded the ceiling, longest run {best} "
+                     f"consecutive, worst {ex['_tx']:,.0f} B/s at n={ex['n']} "
+                     f"({datetime.fromtimestamp(ex['t']):%Y-%m-%d %H:%M:%S}). "
                      f"A budget you exceed is not a budget.")
 
     # ---- R2: does the plateau scale with n? ----------------------------------------------------
@@ -696,8 +771,14 @@ def synth(kind, args, seed=7, hours=7):
                 # a clean plateau, but raids really do buy more bytes -- the matched test must
                 # notice, and must not be satisfied by a p-value that is always 1.0
                 txb = int(ceil_ * (0.95 if raid else 0.55) * rnd.uniform(0.997, 1.0))
-            elif kind == "thin_raid":
+            elif kind == "thin_raid" or kind == "artifact":
                 txb = int(min(want, ceil_ * rnd.uniform(0.997, 1.0)))
+            elif kind == "overshoot":
+                # A GENUINE refutation: egress sits 30% above the modelled ceiling for minutes at
+                # a time. Sustained, so the artifact filter cannot touch it (it raises the very
+                # percentile that filter is derived from) and R1 must still fire. Without this
+                # world, "stop R1 firing on one bad row" could be satisfied by breaking R1.
+                txb = int(ceil_ * (1.30 if busy else 0.45) * rnd.uniform(0.99, 1.01))
             elif kind == "circular_trap":
                 # Demand and egress DECOUPLE here, which is the point. Raids are entity churn
                 # with little player input (low inbound, high egress); "peak" blocks are players
@@ -747,6 +828,12 @@ def synth(kind, args, seed=7, hours=7):
             if all(r["n"] == win[0]["n"] for r in win) and                     statistics.median([r["txb"] for r in win]) > ceil_ * 0.85:
                 events.append({"t": rows[i]["t"], "kind": "lagreport", "name": "Bjorn"})
                 break
+    if kind == "artifact":
+        # One poisoned row in ten hours of clean multi-count data: a 60 s stall recorded as one
+        # second. This is the exact shape that used to print REFUTED and abandon the hypothesis.
+        # Note it is well UNDER a gigabit link -- only the distribution-relative bound catches it.
+        rows[len(rows) // 2]["txb"] = 15_000_000
+        rows[len(rows) // 2]["txp"] = 12000
     if kind == "stale":
         shift = 40 * 86400
         for r in rows:
@@ -760,22 +847,27 @@ def synth(kind, args, seed=7, hours=7):
     return normalize(rows), samples, events
 
 
+# (world, expected verdict, refutation condition that must have fired, text the report must print)
 WORLDS = [
-    ("budget",        "CONFIRMED",    None),
-    ("demand",        "REFUTED",      "R1"),
-    ("global",        "REFUTED",      "R2"),
-    ("laggy",         "REFUTED",      "R3"),
-    ("smallpkt",      "REFUTED",      "R4"),
-    ("queued",        "REFUTED",      "R5"),
-    ("spiky",         "REFUTED",      "R6"),
-    ("single_n",      "INCONCLUSIVE", None),
-    ("empty",         "INCONCLUSIVE", None),
-    ("noisy",         "INCONCLUSIVE", None),
-    ("bursty",        "INCONCLUSIVE", None),
-    ("stale",         "INCONCLUSIVE", None),
-    ("raidmoves",     "INCONCLUSIVE", None),
-    ("thin_raid",     "INCONCLUSIVE", None),
-    ("circular_trap", "INCONCLUSIVE", None),
+    ("budget",        "CONFIRMED",    None, None),
+    ("demand",        "REFUTED",      "R1", None),
+    ("overshoot",     "REFUTED",      "R1", None),
+    ("global",        "REFUTED",      "R2", None),
+    ("laggy",         "REFUTED",      "R3", None),
+    ("smallpkt",      "REFUTED",      "R4", None),
+    ("queued",        "REFUTED",      "R5", None),
+    ("spiky",         "REFUTED",      "R6", None),
+    # One impossible row must NOT overturn ten hours of clean data -- and must be reported, not
+    # quietly swallowed. Both halves are asserted: the verdict, and the line that says so.
+    ("artifact",      "CONFIRMED",    None, "discarded        1 sample(s) as physically implausible"),
+    ("single_n",      "INCONCLUSIVE", None, "one point has no slope"),
+    ("empty",         "INCONCLUSIVE", None, None),
+    ("noisy",         "INCONCLUSIVE", None, None),
+    ("bursty",        "INCONCLUSIVE", None, None),
+    ("stale",         "INCONCLUSIVE", None, None),
+    ("raidmoves",     "INCONCLUSIVE", None, None),
+    ("thin_raid",     "INCONCLUSIVE", None, None),
+    ("circular_trap", "INCONCLUSIVE", None, None),
 ]
 
 
@@ -785,15 +877,17 @@ def selftest(verbose=False):
     to any defect."""
     args = build_parser().parse_args([])
     ok = True
-    for kind, want, want_rule in WORLDS:
+    for kind, want, want_rule, must_say in WORLDS:
         lines = []
         rows, samples, events = synth(kind, args)
         verdict, fired, blocked = analyse(rows, samples, events, args, out=lines.append)
         rules = [f.split(":")[0] for f in fired]
-        good = verdict == want and (want_rule is None or want_rule in rules)
+        said = must_say is None or any(must_say in l for l in lines)
+        good = verdict == want and (want_rule is None or want_rule in rules) and said
         print(("  ok   " if good else "  FAIL ") + f"{kind:<14} -> {verdict}"
               + (f" [{', '.join(rules)}]" if rules else "")
-              + (f"   (expected {want}" + (f" via {want_rule}" if want_rule else "") + ")"
+              + (f"   (expected {want}" + (f" via {want_rule}" if want_rule else "")
+                 + ("" if said else f"; missing output {must_say!r}") + ")"
                  if not good else ""))
         if not good or verbose:
             ok = ok and good
@@ -827,7 +921,11 @@ def build_parser():
     ap.add_argument("--cv-max", type=float, default=0.02, help="CV a plateau must be under to count as flat")
     # refutation thresholds
     ap.add_argument("--r1-slack", type=float, default=0.05, help="R1: fraction above the ceiling that still counts as noise")
-    ap.add_argument("--r1-min", type=int, default=1, help="R1: how many over-ceiling samples fire it")
+    ap.add_argument("--r1-min", type=int, default=3, help="R1: over-ceiling samples anywhere that fire it (1 lets a single instrument artifact end the investigation)")
+    ap.add_argument("--r1-run", type=int, default=2, help="R1: CONSECUTIVE over-ceiling samples that fire it -- sustained overshoot is a measurement, a lone spike is not")
+    ap.add_argument("--link-mbit", type=float, default=1000, help="sanity bound on physically possible egress, megabits/s. Not a NIC spec: the observed maximum is ~2.2 Mbit/s, so this is ~450x headroom")
+    ap.add_argument("--artifact-mult", type=float, default=10, help="a sample above this many times the 99.9th percentile for its player count is instrument error, not measurement")
+    ap.add_argument("--max-artifact", type=float, default=0.01, help="artifact fraction above which the instrument, not the hypothesis, is the finding")
     ap.add_argument("--r2-tol", type=float, default=0.20, help="R2: allowed spread in per-player plateau across n")
     ap.add_argument("--r4-min", type=float, default=600, help="R4: minimum plausible mean payload, bytes")
     ap.add_argument("--r5-frac", type=float, default=0.01, help="R5: fraction of plateau samples with a non-empty send queue")
